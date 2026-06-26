@@ -1,3 +1,4 @@
+
 use core::slice;
 use std::collections::VecDeque;
 use std::ops::Deref;
@@ -917,9 +918,9 @@ impl<T, E> Future for SimpleFuture<T, E> {
   type Output = Result<T, E>;
 
   fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-    println!("Poll");
+    //println!("Poll");
     let mut state = self.state.lock().unwrap();
-    println!("Poll lock");
+    //println!("Poll lock");
     match state.result.take() {
       Some(result) => {
         std::task::Poll::Ready(result)
@@ -1243,12 +1244,12 @@ impl<T: Deref<Target = String>> Deref for StrDeref<T> {
 
 pub struct SliceDeref<T: Deref<Target = Vec<f64>>> {
   inner: T,
-  begin: usize,
-  end: usize
+  begin: Option<usize>,
+  end: Option<usize>
 }
 
 impl<T: Deref<Target = Vec<f64>>> SliceDeref<T> {
-  pub fn new(inner: T, begin: usize, end: usize) -> SliceDeref<T> {
+  pub fn new(inner: T, begin: Option<usize>, end: Option<usize>) -> SliceDeref<T> {
     SliceDeref { inner, begin, end }
   }
 }
@@ -1257,7 +1258,20 @@ impl<T: Deref<Target = Vec<f64>>> Deref for SliceDeref<T> {
     type Target = [f64];
 
     fn deref(&self) -> &Self::Target {
-        &self.inner.as_slice()[self.begin..self.end]
+        match (self.begin, self.end) {
+            (None, None) => {
+                self.inner.as_slice()
+            },
+            (Some(begin), None) => {
+                &self.inner.as_slice()[begin..]
+            },
+            (Some(begin), Some(end)) => {
+                &self.inner.as_slice()[begin..end]
+            },
+            (None, Some(end)) => {
+                &self.inner.as_slice()[..end]
+            },
+        }
     }
 }
 
@@ -1316,35 +1330,79 @@ pub trait AnalogNode {
       }
 }
 
-pub trait DontWrap {
-  fn wrap_analog(&self, _: &mut ThalamusNode) {}
+#[derive(Debug, PartialEq)]
+pub enum ImageFormat {
+    Gray,
+    RGB,
+    YUYV422,
+    YUV420P,
+    YUVJ420P,
 }
 
-impl <T: crate::api::Node> DontWrap for &T {}
+pub trait ImageNode {
+  fn plane(
+          &self,
+          channel: i32,
+      ) -> impl Deref<Target = [u8]>;
+  fn num_planes(&self) -> u64;
+  fn format(&self) -> ImageFormat;
+  fn width(&self) -> u64;
+  fn height(&self) -> u64;
+  fn frame_interval(&self) -> Duration;
+  fn has_image_data(&self) -> bool{ true }
+}
+
+pub trait DontWrapAnalog {
+  fn wrap_analog(&self, _: &mut ThalamusNode) {}
+}
+impl <T: crate::api::Node> DontWrapAnalog for &T {}
 
 pub trait WrapAnalog {
   fn wrap_analog(&self, c_node: &mut ThalamusNode);
 }
-
 impl<T: crate::api::AnalogNode> WrapAnalog for T {
   fn wrap_analog(&self, c_node: &mut ThalamusNode) {
     println!("WrapAnalog");
     c_node.analog = Box::into_raw(Box::new(ThalamusAnalogNode::new()));
     unsafe {
-      (*c_node.analog).data = Some(c_node_data::<T>);
+      (*c_node.analog).data = Some(c_node_analog_data::<T>);
       (*c_node.analog).short_data = None;
       (*c_node.analog).int_data = None;
       (*c_node.analog).ulong_data = None;
-      (*c_node.analog).num_channels = Some(c_node_num_channels::<T>);
-      (*c_node.analog).sample_interval_ns = Some(c_node_sample_interval_ns::<T>);
-      (*c_node.analog).name = Some(c_node_name::<T>);
-      (*c_node.analog).has_analog_data = Some(c_node_has_analog_data::<T>);
-      (*c_node.analog).is_short_data = Some(c_node_is_short_data::<T>);
-      (*c_node.analog).is_int_data = Some(c_node_is_int_data::<T>);
-      (*c_node.analog).is_ulong_data = Some(c_node_is_ulong_data::<T>);
-      (*c_node.analog).is_transformed = Some(c_node_is_transformed::<T>);
-      (*c_node.analog).scale = Some(c_node_scale::<T>);
-      (*c_node.analog).offset = Some(c_node_offset::<T>);
+      (*c_node.analog).num_channels = Some(c_node_analog_num_channels::<T>);
+      (*c_node.analog).sample_interval_ns = Some(c_node_analog_sample_interval_ns::<T>);
+      (*c_node.analog).name = Some(c_node_analog_name::<T>);
+      (*c_node.analog).has_analog_data = Some(c_node_analog_has_analog_data::<T>);
+      (*c_node.analog).is_short_data = Some(c_node_analog_is_short_data::<T>);
+      (*c_node.analog).is_int_data = Some(c_node_analog_is_int_data::<T>);
+      (*c_node.analog).is_ulong_data = Some(c_node_analog_is_ulong_data::<T>);
+      (*c_node.analog).is_transformed = Some(c_node_analog_is_transformed::<T>);
+      (*c_node.analog).scale = Some(c_node_analog_scale::<T>);
+      (*c_node.analog).offset = Some(c_node_analog_offset::<T>);
+    }
+  }
+}
+
+pub trait DontWrapImage {
+  fn wrap_image(&self, _: &mut ThalamusNode) {}
+}
+impl <T: crate::api::Node> DontWrapImage for &T {}
+
+pub trait WrapImage {
+  fn wrap_image(&self, c_node: &mut ThalamusNode);
+}
+impl<T: crate::api::ImageNode> WrapImage for T {
+  fn wrap_image(&self, c_node: &mut ThalamusNode) {
+    println!("WrapImage");
+    c_node.image = Box::into_raw(Box::new(ThalamusImageNode::new()));
+    unsafe {
+      (*c_node.image).plane = Some(c_node_image_plane::<T>);
+      (*c_node.image).num_planes = Some(c_node_image_num_planes::<T>);
+      (*c_node.image).format = Some(c_node_image_format::<T>);
+      (*c_node.image).width = Some(c_node_image_width::<T>);
+      (*c_node.image).height = Some(c_node_image_height::<T>);
+      (*c_node.image).frame_interval_ns = Some(c_node_image_frame_interval_ns::<T>);
+      (*c_node.image).has_image_data = Some(c_node_image_has_image_data::<T>);
     }
   }
 }
@@ -1364,12 +1422,13 @@ macro_rules! export_nodes {
     ( $(($name:literal, $type:ident)),* ) => {
 
 #[allow(unused_imports)]
-use $crate::api::{DontWrap, WrapAnalog};
+use $crate::api::{DontWrapAnalog, WrapAnalog, DontWrapImage, WrapImage};
 
   $(
 impl WrappableNode for $type {
   fn wrap(&self, c_node: &mut ThalamusNode) {
     self.wrap_analog(c_node);
+    self.wrap_image(c_node);
   }
 }
   )*
@@ -1391,4 +1450,3 @@ pub extern "C" fn get_node_factories(api: *mut ThalamusAPIRaw) -> *const *const 
 
 }
 }
-
