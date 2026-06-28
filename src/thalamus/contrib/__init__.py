@@ -31,6 +31,7 @@ def widgets():
 def library():
   if platform.system() == 'Windows':
     return importlib.resources.files(__package__) / 'thalamus_contrib.dll'
+    #return pathlib.Path('C:/thalamus-contrib/rust/target/debug/thalamus_contrib.dll')
   elif platform.system() == 'Darwin':
     return importlib.resources.files(__package__) / 'libthalamus_contrib.dylib'
   else:

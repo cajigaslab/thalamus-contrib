@@ -37,6 +37,18 @@ path = "src/thalamus/contrib/__about__.py"
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
 
+[tool.hatch.build.targets.wheel]
+packages = ["src/thalamus"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "build",
+  "src/thalamus/contrib/*.so",
+  "src/thalamus/contrib/*.dll",
+  "src/thalamus/contrib/*.dylib",
+  "rust/target",
+]
+
 [tool.hatch.envs.types]
 extra-dependencies = [
   "mypy>=1.0.0",

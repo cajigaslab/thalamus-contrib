@@ -7,6 +7,7 @@ use futures::select;
 
 use crate::api::{
     State,
+    StateAction,
     OnDrop,
     ThalamusAPI,
     Node,
@@ -146,7 +147,7 @@ impl JoystickNodeInner {
     }
   }
 
-  fn on_change(self: Rc<Self>, _source: &State, _action: i32, key: StateValue, value: StateValue) {
+  fn on_change(self: Rc<Self>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
     println!("DemoNode::on_change {:?} {:?}", key, value);
     let StateValue::String(key_str) = key else {
       return
@@ -252,7 +253,7 @@ impl Node for JoystickNode {
     });
 
     let change_ref = Rc::downgrade(&inner);
-    let callback = move |source: &State, action: i32, key: StateValue, value: StateValue| {
+    let callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
       change_ref.upgrade().map(|val| {
         val.on_change(source, action, key, value);
       });

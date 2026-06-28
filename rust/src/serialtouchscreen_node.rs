@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::api::{
     State,
+    StateAction,
     OnDrop,
     ThalamusAPI,
     Node,
@@ -88,7 +89,7 @@ impl SerialTouchscreenNodeInner {
         }
     }
 
-    fn on_change(self: Rc<Self>, _source: &State, _action: i32, key: StateValue, value: StateValue) {
+    fn on_change(self: Rc<Self>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
         let StateValue::String(key_str) = key else { return };
 
         match key_str.as_str() {
@@ -161,7 +162,7 @@ impl Node for SerialTouchscreenNode {
         });
 
         let change_ref = Rc::downgrade(&inner);
-        let callback = move |source: &State, action: i32, key: StateValue, value: StateValue| {
+        let callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
             change_ref.upgrade().map(|val| {
                 val.on_change(source, action, key, value);
             });
