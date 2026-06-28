@@ -6,8 +6,8 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::api::{
-    ImageFormat, ImageNode, Node, NodeSelector, OnDrop, Request, Json, State, StateAction, StateKey, TaskScope, ThalamusAPI,
-    StateValue
+    ImageFormat, ImageNode, MainThreadOnly, MainThreadToken, Node, NodeSelector, OnDrop, Request,
+    Json, State, StateAction, StateKey, TaskScope, ThalamusAPI, StateValue
 };
 
 #[derive(Serialize, Clone)]
@@ -69,6 +69,7 @@ struct ArucoNodeInner {
   state: State,
   state_connection: Option<OnDrop>,
   api: ThalamusAPI,
+  token: MainThreadToken,
   time: Duration,
   task: Option<TaskScope>,
   frame: Vec<u8>,
@@ -155,6 +156,7 @@ impl ArucoNodeInner {
               let dis_config = self.distortion_config.clone();
               let weak = self.weak_self.clone();
               let api = self.api;
+              let token = self.token;
               self.get_node = Some(self.api.get_node(NodeSelector::Name(val), move |node| {
                 let dis_state = node.state();
                 let dis_config2 = dis_config.clone();
@@ -167,14 +169,23 @@ impl ArucoNodeInner {
 
                 let dis_config3 = dis_config.clone();
                 let weak2 = weak.clone();
-                let image_connection = node.subscribe(move |_frame_node| {
+                let image_connection = node.subscribe(move |frame_node| {
                   let dc = dis_config3.borrow();
                   let coefficients = dc.distortion_coefficients.clone();
                   let matrix = dc.camera_matrix.clone();
                   drop(dc);
+
                   let boards = weak2.upgrade().map(|inner| {
                     inner.borrow().board_map.values().cloned().collect::<Vec<_>>()
                   }).unwrap_or_default();
+
+                  let frame_data = frame_node.image()
+                    .map(|img| img.plane(0).to_vec())
+                    .unwrap_or_default();
+                  let time = frame_node.time();
+
+                  let weak_send = MainThreadOnly::new(weak2.clone(), token);
+
                   api.post_to_threadpool(move || {
                     let coef_text = serde_json::to_string_pretty(&coefficients).unwrap();
                     let matrix_text = serde_json::to_string_pretty(&matrix).unwrap();
@@ -184,6 +195,22 @@ impl ArucoNodeInner {
                     println!("{}", matrix_text);
                     println!("BOARDS");
                     println!("{}", boards_text);
+
+                    // Placeholder: actual aruco computation on frame_data goes here.
+                    let result_frame = frame_data;
+                    let result_time = time;
+
+                    api.post_to_main(move |token| {
+                      if let Some(inner_rc) = weak_send.get(token).upgrade() {
+                        let api = {
+                          let mut inner = inner_rc.borrow_mut();
+                          inner.frame = result_frame;
+                          inner.time = result_time;
+                          inner.api
+                        };
+                        api.ready(token);
+                      }
+                    });
                   });
                 });
 
@@ -248,11 +275,12 @@ impl Node for ArucoNode {
     handle.respond(&Json::from_string(self.inner.borrow().api, "{}"));
   }
 
-  fn new(api: ThalamusAPI, state: State) -> Self {
+  fn new(api: ThalamusAPI, state: State, token: MainThreadToken) -> Self {
     let inner = Rc::new(RefCell::new(ArucoNodeInner {
       state: state.clone(),
       state_connection: None,
       api,
+      token,
       time: Duration::from_millis(0),
       task: None,
       frame: vec![0],
@@ -273,7 +301,7 @@ impl Node for ArucoNode {
     inner.borrow_mut().weak_self = Rc::downgrade(&inner);
 
     let change_ref = Rc::downgrade(&inner);
-    let callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
+    let callback = move |source, action, key, value| {
       change_ref.upgrade().map(|val| {
         val.borrow_mut().on_change(source, action, key, value);
       });

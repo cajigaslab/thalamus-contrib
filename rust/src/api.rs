@@ -2,11 +2,13 @@
 use core::slice;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
+use std::marker::PhantomData;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::null;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::{os::raw::c_void, sync::OnceLock};
 use std::time::Duration;
@@ -18,6 +20,36 @@ pub use crate::ffi::{
   *
 };
 use crate::wakers::{self, RcWake};
+
+/// Zero-sized token proving the current call is on the main (io_context) thread.
+/// !Send so it cannot cross thread boundaries. Copy so it can be passed by value
+/// without lifetime annotations.
+#[derive(Copy, Clone)]
+pub struct MainThreadToken {
+  _not_send: PhantomData<*const ()>,
+}
+
+impl MainThreadToken {
+  /// For use in C entry points that are always invoked on the main thread
+  /// (e.g. node factory callbacks, post_callback). Not pub so callers outside
+  /// this crate cannot manufacture a token.
+  pub(crate) unsafe fn new_in_main_thread_callback() -> Self {
+    MainThreadToken { _not_send: PhantomData }
+  }
+}
+
+/// Wraps a !Send value so it can travel inside a Send closure, while ensuring
+/// it can only be accessed with a MainThreadToken (i.e., on the main thread).
+pub struct MainThreadOnly<T> {
+  value: T,
+}
+
+unsafe impl<T> Send for MainThreadOnly<T> {}
+
+impl<T> MainThreadOnly<T> {
+  pub fn new(value: T, _token: MainThreadToken) -> Self { Self { value } }
+  pub fn get(&self, _token: MainThreadToken) -> &T { &self.value }
+}
 
 struct PostArgs<T> {
   call: T
@@ -33,12 +65,23 @@ struct NodeReadyArgs<T> {
   callback: T
 }
 
-unsafe extern "C" fn post_callback<T: FnMut()>(data: *mut ::std::os::raw::c_void) {
-  let mut args = unsafe {
-    let raw_args = &mut*(data as *mut PostArgs<T>);
+unsafe extern "C" fn post_callback<T: FnOnce(MainThreadToken)>(data: *mut ::std::os::raw::c_void) {
+  let args = unsafe {
+    let raw_args = data as *mut PostArgs<T>;
     Box::from_raw(raw_args)
   };
-  (args.call)();
+  let token = unsafe { MainThreadToken::new_in_main_thread_callback() };
+  let PostArgs { call } = *args;
+  call(token);
+}
+
+unsafe extern "C" fn threadpool_callback<T: FnOnce()>(data: *mut ::std::os::raw::c_void) {
+  let args = unsafe {
+    let raw_args = data as *mut PostArgs<T>;
+    Box::from_raw(raw_args)
+  };
+  let PostArgs { call } = *args;
+  call();
 }
 
 pub struct ExtNode {
@@ -398,7 +441,7 @@ impl ThalamusAPI {
     }
   }
 
-  pub fn ready(&self) {
+  pub fn ready(&self, _token: MainThreadToken) {
     unsafe {
       let node_ready = (&*self.raw).node_ready;
       node_ready(self.node);
@@ -412,7 +455,7 @@ impl ThalamusAPI {
     }
   }
 
-  pub fn post<T: FnMut() + 'static>(&self, call: T) {
+  pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
     unsafe {
       let api = &*self.raw;
       let call_ptr = Box::into_raw(Box::new(PostArgs {
@@ -499,14 +542,14 @@ impl ThalamusAPI {
     OnDrop { action: Box::new(cleanup) }
   }
 
-  pub fn post_to_threadpool<T: FnMut() + Send + 'static>(&self, call: T) {
+  pub fn post_to_threadpool<T: FnOnce() + Send + 'static>(&self, call: T) {
     unsafe {
       let api = &*self.raw;
       let call_ptr = Box::into_raw(Box::new(PostArgs {
         call
       }));
       let void_ptr = call_ptr as *mut std::os::raw::c_void;
-      (api.threadpool_post)(Some(post_callback::<T>), void_ptr);
+      (api.threadpool_post)(Some(threadpool_callback::<T>), void_ptr);
 
       //let call_ref =  &*call_ptr;
       //let mut done = call_ref.mutex.lock().unwrap();
@@ -640,7 +683,7 @@ impl Future for SleeperFuture {
 impl SleeperWaker {
   pub fn wake_impl(&self, immediate: bool) {
     let state = self.state.clone();
-    let closure = move || { 
+    let closure = move |_token: MainThreadToken| {
       let future = {
         let mut lock = state.lock().unwrap();
         if lock.wakes >= 0 {
@@ -654,9 +697,10 @@ impl SleeperWaker {
       });
     };
     if immediate {
-      closure();
+      let token = unsafe { MainThreadToken::new_in_main_thread_callback() };
+      closure(token);
     } else {
-      self.api.post(closure);
+      self.api.post_to_main(closure);
     }
   }
 
@@ -810,7 +854,7 @@ impl SerialPort {
     let future = SimpleFuture::new();
     let state = future.state.clone();
     self.write_callback(data, move |error, size| {
-      resolve_simple_future(state.lock().unwrap(), size, error);
+      resolve_simple_future(&state, size, error);
     });
     future
   }
@@ -831,7 +875,7 @@ impl SerialPort {
     let future = SimpleFuture::new();
     let state = future.state.clone();
     self.read_callback(data, move |error, size| {
-      resolve_simple_future(state.lock().unwrap(), size, error);
+      resolve_simple_future(&state, size, error);
     });
     future
   }
@@ -852,7 +896,7 @@ impl SerialPort {
     let future = SimpleFuture::new();
     let state = future.state.clone();
     self.read_some_callback(data, move |error, size| {
-      resolve_simple_future(state.lock().unwrap(), size, error);
+      resolve_simple_future(&state, size, error);
     });
     future
   }
@@ -875,7 +919,7 @@ impl SerialPort {
     let future = SimpleFuture::new();
     let state = future.state.clone();
     self.read_until_callback(buffer, delimiter, move |error, size| {
-      resolve_simple_future(state.lock().unwrap(), size, error);
+      resolve_simple_future(&state, size, error);
     });
     future
   }
@@ -943,13 +987,12 @@ impl Drop for TaskScope {
   }
 }
 
-pub fn run_task<F>(future: F) -> TaskScope
-where
-  F: Future<Output = ()> + 'static
+pub fn run_task<F: Future<Output = ()> + 'static>(future: F) -> TaskScope
 {
   let task = Rc::new(Task {
     state: Mutex::new(TaskState {
-    future: Some(Box::pin(future)), poll: Poll::Pending})
+      future: Some(Box::pin(future)), poll: Poll::Pending
+    })
   });
 
   task.poll();
@@ -1103,7 +1146,7 @@ unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateValue, St
   let key = wrap_state(args.api, key_raw);
   let value = wrap_state(args.api, value_raw);
   let source = State::new(args.api, source_raw);
-  
+
   (args.callback)(source, action, key, value);
 }
 
@@ -1115,31 +1158,31 @@ pub struct SimpleFutureState<T, E> {
 }
 
 pub struct SimpleFuture<T, E> {
-  state: Arc<Mutex<SimpleFutureState<T, E>>>
+  state: Rc<RefCell<SimpleFutureState<T, E>>>
 }
 
 impl<T, E> SimpleFutureState<T, E> {
-  pub fn set(mut this: MutexGuard<Self>, result: Result<T, E>) {
-    this.result = Some(result);
-    this.done = true;
-    let waker = this.waker.take();
-    drop(this);
+  pub fn set(cell: &RefCell<Self>, result: Result<T, E>) {
+    let waker = {
+      let mut this = cell.borrow_mut();
+      this.result = Some(result);
+      this.done = true;
+      this.waker.take()
+    };
     waker.map(|w| w.wake_by_ref());
   }
 }
 
-fn resolve_simple_future<T>(this: MutexGuard<SimpleFutureState<T, ErrorCode>>, value: T, error: ErrorCode) {
+fn resolve_simple_future<T>(cell: &RefCell<SimpleFutureState<T, ErrorCode>>, value: T, error: ErrorCode) {
   let result = if error.code != 0 { Err(error) } else { Ok(value) };
-  SimpleFutureState::<T, ErrorCode>::set(this, result);
+  SimpleFutureState::<T, ErrorCode>::set(cell, result);
 }
 
 impl<T, E> Future for SimpleFuture<T, E> {
   type Output = Result<T, E>;
 
   fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-    //println!("Poll");
-    let mut state = self.state.lock().unwrap();
-    //println!("Poll lock");
+    let mut state = self.state.borrow_mut();
     match state.result.take() {
       Some(result) => {
         std::task::Poll::Ready(result)
@@ -1163,14 +1206,14 @@ impl<T, E> Future for SimpleFuture<T, E> {
 
 impl<T, E> FusedFuture for SimpleFuture<T, E> {
   fn is_terminated(&self) -> bool {
-    self.state.lock().unwrap().done
+    self.state.borrow().done
   }
 }
 
 impl<T, E> SimpleFuture<T, E> {
   pub fn new() -> SimpleFuture<T, E> {
     SimpleFuture::<T, E> {
-      state: Arc::new(Mutex::new(SimpleFutureState::<T, E> {done: false, waker: None, result: None}))
+      state: Rc::new(RefCell::new(SimpleFutureState::<T, E> {done: false, waker: None, result: None}))
     }
   }
 }
@@ -1550,7 +1593,7 @@ impl Timer {
     let future = SimpleFuture::new();
     let state = future.state.clone();
     self.sleep_callback(duration, move |error| {
-      resolve_simple_future(state.lock().unwrap(), (), error);
+      resolve_simple_future(&state, (), error);
     });
     future
   }
@@ -1568,7 +1611,7 @@ impl Drop for Timer {
 pub trait Node {
   fn time(&self) -> Duration;
   fn process(&self, handle: Request, request: Json);
-  fn new(api: ThalamusAPI, state: State) -> Self;
+  fn new(api: ThalamusAPI, state: State, token: MainThreadToken) -> Self;
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {

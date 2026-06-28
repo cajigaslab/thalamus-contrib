@@ -4,6 +4,7 @@ use std::{cell::RefCell, cell::Ref};
 use std::time::Duration;
 
 use crate::api::{
+    MainThreadToken,
     State,
     StateAction,
     OnDrop,
@@ -20,6 +21,7 @@ struct SerialTouchscreenNodeInner {
     state: State,
     state_connection: RefCell<Option<OnDrop>>,
     api: ThalamusAPI,
+    token: MainThreadToken,
     samples: RefCell<Vec<f64>>,
     time: RefCell<Duration>,
     port: RefCell<String>,
@@ -85,7 +87,7 @@ impl SerialTouchscreenNodeInner {
                 samples[0] = x;
                 samples[1] = y;
             }
-            this.api.ready();
+            this.api.ready(this.token);
         }
     }
 
@@ -150,11 +152,12 @@ impl Node for SerialTouchscreenNode {
         handle.respond(&Json::from_string(self.inner.api, "{}"));
     }
 
-    fn new(api: ThalamusAPI, state: State) -> Self {
+    fn new(api: ThalamusAPI, state: State, token: MainThreadToken) -> Self {
         let inner = Rc::new(SerialTouchscreenNodeInner {
             state: state.clone(),
             state_connection: RefCell::new(None),
             api,
+            token,
             samples: RefCell::new(vec![0.0, 0.0]),
             time: RefCell::new(Duration::from_millis(0)),
             port: RefCell::new("".to_string()),
@@ -162,7 +165,7 @@ impl Node for SerialTouchscreenNode {
         });
 
         let change_ref = Rc::downgrade(&inner);
-        let callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
+        let callback = move |source, action, key, value| {
             change_ref.upgrade().map(|val| {
                 val.on_change(source, action, key, value);
             });

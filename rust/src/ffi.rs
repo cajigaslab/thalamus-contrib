@@ -731,7 +731,8 @@ extern "C" fn create_node_template<T: crate::api::Node + WrappableNode>(factory:
   let c_node_ref = unsafe {&mut*c_node};
   let api = ThalamusAPI{raw: api_raw, node: c_node};
   
-  let result = Box::new(PluginImpl::<T>{api, node: T::new(api, crate::api::State::new(api, state))});
+  let token = unsafe { crate::api::MainThreadToken::new_in_main_thread_callback() };
+  let result = Box::new(PluginImpl::<T>{api, node: T::new(api, crate::api::State::new(api, state), token)});
 
   c_node_ref.time_ns = Some(c_node_time_ns::<T>);
   c_node_ref.process = Some(c_node_process::<T>);
