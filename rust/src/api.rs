@@ -12,7 +12,6 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::{os::raw::c_void, sync::OnceLock};
 use std::time::Duration;
-use std::ffi::{CStr, CString};
 
 use futures::future::FusedFuture;
 
@@ -819,8 +818,8 @@ impl SerialPort {
   pub fn open(&self, name: &str) -> Result<(), ErrorCode> {
     unsafe {
       let api = &*self.api.raw;
-      let c_str= CString::new(name).unwrap();
-      (api.serial_port_open)(self.port, c_str.as_ptr());
+      let name_span = ThalamusCharSpan { data: name.as_ptr() as *const i8, size: name.len() as u64, owns_data: 0 };
+      (api.serial_port_open)(self.port, &name_span as *const ThalamusCharSpan);
       match self.error() {
         None => Ok(()),
         Some(error) => Err(error)
@@ -909,9 +908,8 @@ impl SerialPort {
         callback
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
-      let delimiter_bytes = delimiter.as_bytes();
-      let delimiter_ptr = delimiter_bytes.as_ptr() as *const i8;
-      (api.serial_port_read_until)(self.port, buffer.buffer, delimiter_ptr, delimiter_bytes.len() as u64, Some(io_callback::<T>), args);
+      let delimiter_span = ThalamusCharSpan { data: delimiter.as_ptr() as *const i8, size: delimiter.len() as u64, owns_data: 0 };
+      (api.serial_port_read_until)(self.port, buffer.buffer, &delimiter_span as *const ThalamusCharSpan, Some(io_callback::<T>), args);
     }
   }
   pub fn read_until(&self, buffer: &StreamBuf, delimiter: &str) -> SimpleFuture<u64, ErrorCode> {
@@ -1122,8 +1120,9 @@ fn wrap_state(api:ThalamusAPI, arg: *mut ThalamusState) -> StateValue {
     } else if (raw.state_is_list)(arg) != 0 {
       StateValue::List(State::new(api, arg))
     } else if (raw.state_is_string)(arg) != 0 {
-      let ptr = ((&*raw).state_get_string)(arg);
-      let text = CStr::from_ptr(ptr).to_str().unwrap();
+      let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
+      ((&*raw).state_get_string)(&mut span, arg);
+      let text = std::str::from_utf8(std::slice::from_raw_parts(span.data as *const u8, span.size as usize)).unwrap();
       StateValue::String(text.to_string())
     } else {
       StateValue::Null
@@ -1412,9 +1411,9 @@ impl State {
         }
       },
       StateKey::String(key_raw) => {
-        let key = CString::new(key_raw).unwrap();
+        let span = ThalamusCharSpan { data: key_raw.as_ptr() as *const i8, size: key_raw.len() as u64, owns_data: 0 };
         unsafe {
-          ((&*self.api.raw).state_get_at_name)(self.state, key.as_ptr())
+          ((&*self.api.raw).state_get_at_name)(self.state, &span)
         }
       }
     };
@@ -1452,8 +1451,8 @@ impl State {
               (api.state_set_at_index_state)(self.state, key, value.state);
             },
             StateValue::String(rust_value) => {
-              let value = CString::new(rust_value).unwrap();
-              (api.state_set_at_index_string)(self.state, key, value.as_ptr());
+              let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const i8, size: rust_value.len() as u64, owns_data: 0 };
+              (api.state_set_at_index_string)(self.state, key, &value_span as *const ThalamusCharSpan);
             },
             StateValue::Null => {
               (api.state_set_at_index_null)(self.state, key);
@@ -1462,8 +1461,8 @@ impl State {
         }
       },
       StateKey::String(key_raw) => {
-        let key_str = CString::new(key_raw).unwrap();
-        let key = key_str.as_ptr();
+        let key_span = ThalamusCharSpan { data: key_raw.as_ptr() as *const i8, size: key_raw.len() as u64, owns_data: 0 };
+        let key = &key_span as *const ThalamusCharSpan;
         unsafe {
           match raw_value {
             StateValue::Bool(value) => {
@@ -1482,8 +1481,8 @@ impl State {
               (api.state_set_at_name_state)(self.state, key, value.state);
             },
             StateValue::String(rust_value) => {
-              let value = CString::new(rust_value).unwrap();
-              (api.state_set_at_name_string)(self.state, key, value.as_ptr());
+              let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const i8, size: rust_value.len() as u64, owns_data: 0 };
+              (api.state_set_at_name_string)(self.state, key, &value_span as *const ThalamusCharSpan);
             },
             StateValue::Null => {
               (api.state_set_at_name_null)(self.state, key);

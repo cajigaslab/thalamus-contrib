@@ -205,13 +205,13 @@ pub struct ThalamusAPIRaw {
     pub state_is_float: unsafe extern "C" fn(arg1: *mut ThalamusState) -> ::std::os::raw::c_char,
     pub state_is_null: unsafe extern "C" fn(arg1: *mut ThalamusState) -> ::std::os::raw::c_char,
     pub state_is_bool: unsafe extern "C" fn(arg1: *mut ThalamusState) -> ::std::os::raw::c_char,
-    pub state_get_string: unsafe extern "C" fn(arg1: *mut ThalamusState) -> *const ::std::os::raw::c_char,
+    pub state_get_string: unsafe extern "C" fn(out: *mut ThalamusCharSpan, arg1: *mut ThalamusState),
     pub state_get_int: unsafe extern "C" fn(arg1: *mut ThalamusState) -> i64,
     pub state_get_float: unsafe extern "C" fn(arg1: *mut ThalamusState) -> f64,
     pub state_get_bool: unsafe extern "C" fn(arg1: *mut ThalamusState) -> ::std::os::raw::c_char,
     pub state_get_at_name: unsafe extern "C" fn(
         arg1: *mut ThalamusState,
-        arg2: *const ::std::os::raw::c_char,
+        arg2: *const ThalamusCharSpan,
     ) -> *mut ThalamusState,
     pub state_get_at_index: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: u64) -> *mut ThalamusState,
     pub state_dec_ref: unsafe extern "C" fn(arg1: *mut ThalamusState),
@@ -236,15 +236,15 @@ pub struct ThalamusAPIRaw {
     pub error_code_operation_aborted: unsafe extern "C" fn() -> i32,
     pub state_recap: unsafe extern "C" fn(arg1: *mut ThalamusState),
 
-    pub state_set_at_name_state: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ::std::os::raw::c_char, arg3: *mut ThalamusState),
-    pub state_set_at_name_string: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ::std::os::raw::c_char, arg3: *const ::std::os::raw::c_char),
-    pub state_set_at_name_int: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ::std::os::raw::c_char, arg3: i64),
-    pub state_set_at_name_float: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ::std::os::raw::c_char, arg3: f64),
-    pub state_set_at_name_null: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ::std::os::raw::c_char),
-    pub state_set_at_name_bool: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ::std::os::raw::c_char, i8),
+    pub state_set_at_name_state: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ThalamusCharSpan, arg3: *mut ThalamusState),
+    pub state_set_at_name_string: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ThalamusCharSpan, arg3: *const ThalamusCharSpan),
+    pub state_set_at_name_int: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ThalamusCharSpan, arg3: i64),
+    pub state_set_at_name_float: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ThalamusCharSpan, arg3: f64),
+    pub state_set_at_name_null: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ThalamusCharSpan),
+    pub state_set_at_name_bool: unsafe extern "C" fn(arg1: *mut ThalamusState, arg2: *const ThalamusCharSpan, i8),
 //
     pub state_set_at_index_state: unsafe extern "C" fn(arg1: *mut ThalamusState, i64, arg3: *mut ThalamusState),
-    pub state_set_at_index_string: unsafe extern "C" fn(arg1: *mut ThalamusState, i64, arg3: *const ::std::os::raw::c_char),
+    pub state_set_at_index_string: unsafe extern "C" fn(arg1: *mut ThalamusState, i64, arg3: *const ThalamusCharSpan),
     pub state_set_at_index_int: unsafe extern "C" fn(arg1: *mut ThalamusState, i64, arg3: i64),
     pub state_set_at_index_float: unsafe extern "C" fn(arg1: *mut ThalamusState, i64, arg3: f64),
     pub state_set_at_index_null: unsafe extern "C" fn(arg1: *mut ThalamusState, i64),
@@ -252,9 +252,9 @@ pub struct ThalamusAPIRaw {
 
     pub io_context_post: unsafe extern "C" fn(arg1: IoContextPostCallback, data: *mut ::std::os::raw::c_void),
 
-    pub trace_event_begin: unsafe extern "C" fn(arg1: *const ::std::os::raw::c_char),
+    pub trace_event_begin: unsafe extern "C" fn(arg1: *const ThalamusCharSpan),
 
-    pub trace_event_begin_span: unsafe extern "C" fn(arg1: *mut ::std::os::raw::c_void, arg2: u64),
+    pub trace_event_begin_span: unsafe extern "C" fn(arg1: *const ThalamusCharSpan),
 
     pub trace_event_end: unsafe extern "C" fn(),
 
@@ -264,11 +264,11 @@ pub struct ThalamusAPIRaw {
 
     pub serial_set_baud_rate: unsafe extern "C" fn(*mut ThalamusSerialPort, u32),
 
-    pub serial_port_open: unsafe extern "C" fn(*mut ThalamusSerialPort, *const ::std::os::raw::c_char),
+    pub serial_port_open: unsafe extern "C" fn(*mut ThalamusSerialPort, *const ThalamusCharSpan),
 
     pub serial_port_error: unsafe extern "C" fn(*mut ThalamusSerialPort) -> *mut ThalamusErrorCode,
     
-    pub serial_port_read_until: unsafe extern "C" fn(*mut ThalamusSerialPort, *mut ThalamusStreamBuf, *const ::std::os::raw::c_char, u64, ThalamusIOCallback, *mut ::std::os::raw::c_void),
+    pub serial_port_read_until: unsafe extern "C" fn(*mut ThalamusSerialPort, *mut ThalamusStreamBuf, *const ThalamusCharSpan, ThalamusIOCallback, *mut ::std::os::raw::c_void),
 
     pub serial_port_read_some: unsafe extern "C" fn(*mut ThalamusSerialPort, *mut ThalamusMutableByteSpan, ThalamusIOCallback, *mut ::std::os::raw::c_void),
 
@@ -515,7 +515,7 @@ pub struct ThalamusTextNode {
 
 #[repr(C)]
 pub struct ThalamusNodeFactory {
-    type_: *const ::std::os::raw::c_char,
+    type_: ThalamusCharSpan,
     create: ::std::option::Option<
         unsafe extern "C" fn(
             factory: *mut ThalamusNodeFactory,
@@ -757,7 +757,7 @@ impl ThalamusNodeFactory {
     println!("ThalamusNodeFactory::new {}", name);
     let c_name = CString::new(name).unwrap();
     let result = Box::into_raw(Box::new(ThalamusNodeFactory {
-      type_: c_name.as_ptr(),
+      type_: ThalamusCharSpan { data: c_name.as_ptr(), size: name.len() as u64, owns_data: 0 },
       create: Some(create_node_template::<T>),
       destroy: Some(destroy_node_template::<T>),
       prepare: None,
