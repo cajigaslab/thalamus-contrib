@@ -8,6 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 futures = "0.3.32"
+libloading = "0.8"
 opencv = { version = "0.99.0", features = ["imgproc", "calib3d", "flann", "features2d", "stitching", "objdetect"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_core = "1.0.228"

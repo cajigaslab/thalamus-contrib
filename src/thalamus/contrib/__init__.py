@@ -26,6 +26,10 @@ def widgets():
       UserData(UserDataType.SPINBOX, 'Dead Zone', 3, []),
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
     ]),
+    'THORCAM': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.CHECK_BOX, 'View', False, []),
+    ]),
   }
 
 def library():

@@ -752,6 +752,14 @@ unsafe extern "C" fn destroy_node_template<T>(_factory: *mut ThalamusNodeFactory
   }
 }
 
+extern "C" fn prepare_node_template<T: crate::api::Node>(_factory: *mut ThalamusNodeFactory) -> ::std::os::raw::c_char {
+  if T::prepare() { 1 } else { 0 }
+}
+
+extern "C" fn cleanup_node_template<T: crate::api::Node>(_factory: *mut ThalamusNodeFactory) {
+  T::cleanup();
+}
+
 impl ThalamusNodeFactory {
   pub fn new<T: crate::api::Node+WrappableNode>(name: &str, api: *mut ThalamusAPIRaw) -> *mut ThalamusNodeFactory {
     println!("ThalamusNodeFactory::new {}", name);
@@ -760,11 +768,12 @@ impl ThalamusNodeFactory {
       type_: ThalamusCharSpan { data: c_name.as_ptr(), size: name.len() as u64, owns_data: 0 },
       create: Some(create_node_template::<T>),
       destroy: Some(destroy_node_template::<T>),
-      prepare: None,
-      cleanup: None, 
+      prepare: Some(prepare_node_template::<T>),
+      cleanup: Some(cleanup_node_template::<T>), 
       api: api,
       c_str: c_name
     }));
     result as *mut ThalamusNodeFactory
   }
 }
+

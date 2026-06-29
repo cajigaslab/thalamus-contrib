@@ -6,6 +6,7 @@ pub mod api;
 mod joystick_node;
 mod serialtouchscreen_node;
 mod aruco_node;
+mod thorcam_node;
 
 use api::{
   ThalamusNode,
@@ -16,10 +17,12 @@ use api::{
 use joystick_node::JoystickNode;
 use serialtouchscreen_node::SerialTouchscreenNode;
 use aruco_node::ArucoNode;
+use thorcam_node::ThorcamNode;
 
 export_nodes!(
   ("JOYSTICK", JoystickNode),
   ("SERIAL_TOUCH_SCREEN", SerialTouchscreenNode),
-  ("ARUCO", ArucoNode)
+  ("ARUCO", ArucoNode),
+  ("THORCAM", ThorcamNode)
 );
 

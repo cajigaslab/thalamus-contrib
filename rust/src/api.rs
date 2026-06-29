@@ -1611,6 +1611,8 @@ pub trait Node {
   fn time(&self) -> Duration;
   fn process(&self, handle: Request, request: Json);
   fn new(api: ThalamusAPI, state: State, token: MainThreadToken) -> Self;
+  fn prepare() -> bool { true }
+  fn cleanup() {}
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {
