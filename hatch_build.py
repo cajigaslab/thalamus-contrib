@@ -69,9 +69,6 @@ class CustomBuildHook(BuildHookInterface):
     if vv:
       cargo_command += ['-vv']
     cargo_env = dict(os.environ)
-    cargo_env['OPENCV_LINK_PATHS'] = str(build_path / '_deps' / 'opencv-build' / build_type / 'install' / 'staticlib')
-    cargo_env['OPENCV_INCLUDE_PATHS'] = str(build_path / '_deps' / 'opencv-build' / build_type / 'install' / 'include')
-
 
     if platform.system() == 'Windows':
       d = 'd' if debug else ''
@@ -96,6 +93,10 @@ class CustomBuildHook(BuildHookInterface):
         f'zlib{d}',
       ]
       cargo_env['OPENCV_LINK_LIBS'] = ','.join(opencv_libs)
+      cargo_env['OPENCV_LINK_PATHS'] = str(build_path / '_deps' / 'opencv-build' / build_type / 'install' / 'staticlib')
+      cargo_env['OPENCV_INCLUDE_PATHS'] = str(build_path / '_deps' / 'opencv-build' / build_type / 'install' / 'include')
+    elif platform.system() == 'Linux':
+      cargo_env['OpenCV_DIR'] = str(build_path / '_deps' / 'opencv-build' / build_type / 'install/lib/cmake/opencv4')
 
     print('cargo_command', cargo_command)
     subprocess.run(cargo_command, cwd=rust_dir, check=True, env=cargo_env)
