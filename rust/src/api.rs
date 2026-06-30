@@ -1801,7 +1801,18 @@ macro_rules! export_nodes {
     ( $(($name:literal, $type:ident)),* ) => {
 
 #[allow(unused_imports)]
-use $crate::api::{DontWrapAnalog, WrapAnalog, DontWrapImage, WrapImage, DontWrapMocap, WrapMocap};
+use $crate::api::{
+  DontWrapAnalog,
+  WrapAnalog,
+  DontWrapImage,
+  WrapImage,
+  DontWrapMocap,
+  WrapMocap,
+  ThalamusNode,
+  ThalamusAPIRaw,
+  WrappableNode,
+  ThalamusNodeFactory,
+};
 
   $(
 impl WrappableNode for $type {
