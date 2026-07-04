@@ -124,6 +124,26 @@ impl ExtNode {
     OnDrop { action: Box::new(cleanup) }
   }
 
+  pub fn subscribe_multithreaded<T: FnMut(ExtNode) + Send + 'static>(&self, callback: T) -> OnDrop {
+    let call_ptr = Box::into_raw(Box::new(NodeReadyArgs {
+      api: self.api,
+      callback
+    }));
+    let void_ptr = call_ptr as *mut std::os::raw::c_void;
+
+    let connection = unsafe {
+      ((&*self.api.raw).node_ready_multithreaded_connect)(self.node, Some(node_ready_callback::<T>), void_ptr)
+    };
+    let api = self.api;
+    let cleanup = move || {
+      unsafe {
+        ((&*api.raw).node_ready_disconnect)(connection);
+        drop(Box::from_raw(call_ptr));
+      }
+    };
+    OnDrop { action: Box::new(cleanup) }
+  }
+
   pub fn analog<'a>(&'a self) -> Option<ExtAnalogNode<'a>> {
     let analog = unsafe {
       (*self.node).analog
@@ -425,14 +445,75 @@ pub struct ThalamusAPI {
   pub raw: *mut ThalamusAPIRaw,
   pub node: *mut ThalamusNode
 }
-unsafe impl Send for ThalamusAPI {}
+
+#[derive(Debug,PartialEq,Copy,Clone)]
+pub struct ThalamusAPIMultiThreaded {
+  pub raw: *mut ThalamusAPIRaw,
+  pub node: *mut ThalamusNode
+}
+unsafe impl Send for ThalamusAPIMultiThreaded {}
 
 pub enum NodeSelector {
   Name(String),
   Type(String)
 }
 
+impl ThalamusAPIMultiThreaded {
+  pub fn singlethreaded(&self, _token: MainThreadToken) -> ThalamusAPI {
+    ThalamusAPI{raw: self.raw, node: self.node}
+  }
+
+  pub fn ready_offmain(&self) {
+    unsafe {
+      let node_ready_offmain = (&*self.raw).node_ready_offmain;
+      node_ready_offmain(self.node);
+    }
+  }
+
+  pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
+    unsafe {
+      let api = &*self.raw;
+      let call_ptr = Box::into_raw(Box::new(PostArgs {
+        call
+      }));
+      let void_ptr = call_ptr as *mut std::os::raw::c_void;
+      (api.io_context_post)(Some(post_callback::<T>), void_ptr);
+
+      //let call_ref =  &*call_ptr;
+      //let mut done = call_ref.mutex.lock().unwrap();
+      //while !*done {
+      //  done = call_ref.cond.wait(done).unwrap();
+      //}
+      //
+      //drop(Box::from_raw(call_ptr));
+    }
+  }
+
+  pub fn post_to_threadpool<T: FnOnce() + Send + 'static>(&self, call: T) {
+    unsafe {
+      let api = &*self.raw;
+      let call_ptr = Box::into_raw(Box::new(PostArgs {
+        call
+      }));
+      let void_ptr = call_ptr as *mut std::os::raw::c_void;
+      (api.threadpool_post)(Some(threadpool_callback::<T>), void_ptr);
+
+      //let call_ref =  &*call_ptr;
+      //let mut done = call_ref.mutex.lock().unwrap();
+      //while !*done {
+      //  done = call_ref.cond.wait(done).unwrap();
+      //}
+      //
+      //drop(Box::from_raw(call_ptr));
+    }
+  }
+}
+
 impl ThalamusAPI {
+  pub fn multithreaded(&self) -> ThalamusAPIMultiThreaded {
+    ThalamusAPIMultiThreaded{raw: self.raw, node: self.node}
+  }
+
   pub fn time(&self) -> Duration {
     unsafe {
       let time_ns = (&*self.raw).time_ns;
@@ -440,7 +521,7 @@ impl ThalamusAPI {
     }
   }
 
-  pub fn ready(&self, _token: MainThreadToken) {
+  pub fn ready(&self) {
     unsafe {
       let node_ready = (&*self.raw).node_ready;
       node_ready(self.node);

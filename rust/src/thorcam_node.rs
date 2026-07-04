@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::api::{
     ImageFormat, ImageNode, MainThreadOnly, MainThreadToken, Node, OnDrop, Request, Json,
-    State, StateAction, StateValue, ThalamusAPI,
+    State, StateAction, StateValue, ThalamusAPI, ThalamusAPIMultiThreaded,
 };
 
 type IsGetNumberOfCameras = unsafe extern "C" fn(*mut i32) -> i32;
@@ -223,8 +223,9 @@ fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
 
+    let mt_api = api.multithreaded();
     let handle = std::thread::spawn(move || {
-        run_camera(api, inner_send, stop_clone, device_id);
+        run_camera(mt_api, inner_send, stop_clone, device_id);
     });
 
     let mut borrow = inner.borrow_mut();
@@ -245,7 +246,7 @@ fn stop_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
 }
 
 fn run_camera(
-    api: ThalamusAPI,
+    api: ThalamusAPIMultiThreaded,
     inner_send: InnerSend,
     stop: Arc<AtomicBool>,
     device_id: u32,
@@ -381,7 +382,7 @@ fn run_camera(
                         borrow.frame_len = frame_size;
                         borrow.time = borrow.api.time();
                     }
-                    rc.borrow().api.ready(token); // subscribers read plane() synchronously here
+                    rc.borrow().api.ready(); // subscribers read plane() synchronously here
                     rc.borrow_mut().frame_ptr = std::ptr::null();
                 }
             }

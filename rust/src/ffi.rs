@@ -325,6 +325,10 @@ pub struct ThalamusAPIRaw {
     pub node_get_state: unsafe extern "C" fn(*mut ThalamusNode) -> *mut ThalamusState,
 
     pub threadpool_post: unsafe extern "C" fn(arg1: IoContextPostCallback, data: *mut ::std::os::raw::c_void),
+
+    pub node_ready_multithreaded_connect: unsafe extern "C" fn(*mut ThalamusNode, ThalamusNodeReadyCallback, *mut ::std::os::raw::c_void) -> *mut ThalamusNodeReadyConnection,
+
+    pub node_ready_offmain: unsafe extern "C" fn(arg1: *const ThalamusNode),
 }
 
 #[repr(C)]
