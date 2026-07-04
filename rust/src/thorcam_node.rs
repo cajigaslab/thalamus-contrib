@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::api::{
-    ImageFormat, ImageNode, MainThreadOnly, MainThreadToken, Node, OnDrop, Request, Json,
-    State, StateAction, StateValue, ThalamusAPI, ThalamusAPIMultiThreaded,
+    ImageFormat, ImageNode, MainThreadOnly, MainThreadToken, Node, NodeToken, OnDrop, Request, Json,
+    State, StateAction, StateValue, ThalamusAPI, ThalamusAPIThreadSafe,
 };
 
 type IsGetNumberOfCameras = unsafe extern "C" fn(*mut i32) -> i32;
@@ -180,6 +180,7 @@ const BLANK_HEIGHT: u64 = 480;
 
 struct ThorcamNodeInner {
     api:              ThalamusAPI,
+    node_token:       NodeToken,
     token:            MainThreadToken,
     state:            State,
     state_connection: Option<OnDrop>,
@@ -223,7 +224,7 @@ fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
 
-    let mt_api = api.multithreaded();
+    let mt_api = api.thread_safe();
     let handle = std::thread::spawn(move || {
         run_camera(mt_api, inner_send, stop_clone, device_id);
     });
@@ -246,7 +247,7 @@ fn stop_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
 }
 
 fn run_camera(
-    api: ThalamusAPIMultiThreaded,
+    api: ThalamusAPIThreadSafe,
     inner_send: InnerSend,
     stop: Arc<AtomicBool>,
     device_id: u32,
@@ -382,7 +383,10 @@ fn run_camera(
                         borrow.frame_len = frame_size;
                         borrow.time = borrow.api.time();
                     }
-                    rc.borrow().api.ready(); // subscribers read plane() synchronously here
+                    // subscribers read plane() synchronously here; ignore if the node
+                    // was destroyed before this queued callback got to run
+                    let borrow = rc.borrow();
+                    let _ = borrow.api.ready(&borrow.node_token);
                     rc.borrow_mut().frame_ptr = std::ptr::null();
                 }
             }
@@ -472,7 +476,7 @@ impl Node for ThorcamNode {
         handle.respond(&Json::from_string(api, &response));
     }
 
-    fn new(api: ThalamusAPI, state: State, token: MainThreadToken) -> Self {
+    fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self {
         let init_result = UC480.get_or_init(load_uc480);
         match init_result {
             Ok((_, cameras)) => {
@@ -488,6 +492,7 @@ impl Node for ThorcamNode {
 
         let inner = Rc::new(RefCell::new(ThorcamNodeInner {
             api,
+            node_token,
             token,
             state: state.clone(),
             state_connection: None,

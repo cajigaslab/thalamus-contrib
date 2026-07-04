@@ -435,39 +435,81 @@ unsafe extern "C" fn get_node_callback<T: FnMut(ExtNode)>(node: *mut ThalamusNod
   let args = unsafe {
     &mut*(data as *mut GetNodeArgs<T>)
   };
-  
+
   let ext_node = ExtNode::new(args.api, node);
   (args.callback)(ext_node);
 }
 
-#[derive(Debug,PartialEq,Copy,Clone)]
-pub struct ThalamusAPI {
-  pub raw: *mut ThalamusAPIRaw,
-  pub node: *mut ThalamusNode
+/// Error returned when a ThalamusAPI/ThalamusAPIThreadSafe call is made
+/// after the C++ side has already destroyed the underlying node (e.g. from a
+/// callback queued via post_to_main/post_to_threadpool that outlived the node).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeDestroyed;
+
+impl std::fmt::Display for NodeDestroyed {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "node has already been destroyed")
+  }
 }
 
-#[derive(Debug,PartialEq,Copy,Clone)]
-pub struct ThalamusAPIMultiThreaded {
-  pub raw: *mut ThalamusAPIRaw,
-  pub node: *mut ThalamusNode
+impl std::error::Error for NodeDestroyed {}
+
+/// Shared handle to a node's C++ pointer. destroy_node_template nulls this out
+/// when the C++ side destroys the node, so any clone of the token still held by
+/// a callback queued via post_to_main/post_to_threadpool (and thus possibly
+/// running after the node is gone) can detect that and bail out instead of
+/// dereferencing freed memory.
+#[derive(Debug, Clone)]
+pub struct NodeToken {
+  node: Arc<Mutex<*mut ThalamusNode>>
 }
-unsafe impl Send for ThalamusAPIMultiThreaded {}
+unsafe impl Send for NodeToken {}
+
+impl NodeToken {
+  pub fn new(node: *mut ThalamusNode) -> NodeToken {
+    NodeToken { node: Arc::new(Mutex::new(node)) }
+  }
+
+  /// Called by destroy_node_template once the node is gone.
+  pub(crate) fn destroy(&self) {
+    *self.node.lock().unwrap() = std::ptr::null_mut();
+  }
+
+  fn with<R>(&self, f: impl FnOnce(*mut ThalamusNode) -> R) -> Result<R, NodeDestroyed> {
+    let guard = self.node.lock().unwrap();
+    if guard.is_null() {
+      return Err(NodeDestroyed);
+    }
+    Ok(f(*guard))
+  }
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub struct ThalamusAPI {
+  pub raw: *mut ThalamusAPIRaw,
+}
+
+#[derive(Debug, PartialEq, Copy, Clone)]
+pub struct ThalamusAPIThreadSafe {
+  pub raw: *mut ThalamusAPIRaw,
+}
+unsafe impl Send for ThalamusAPIThreadSafe {}
 
 pub enum NodeSelector {
   Name(String),
   Type(String)
 }
 
-impl ThalamusAPIMultiThreaded {
-  pub fn singlethreaded(&self, _token: MainThreadToken) -> ThalamusAPI {
-    ThalamusAPI{raw: self.raw, node: self.node}
+impl ThalamusAPIThreadSafe {
+  pub fn thread_unsafe(&self, _token: MainThreadToken) -> ThalamusAPI {
+    ThalamusAPI{raw: self.raw}
   }
 
-  pub fn ready_offmain(&self) {
-    unsafe {
+  pub fn ready_offmain(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
+    token.with(|node| unsafe {
       let node_ready_offmain = (&*self.raw).node_ready_offmain;
-      node_ready_offmain(self.node);
-    }
+      node_ready_offmain(node);
+    })
   }
 
   pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
@@ -510,8 +552,8 @@ impl ThalamusAPIMultiThreaded {
 }
 
 impl ThalamusAPI {
-  pub fn multithreaded(&self) -> ThalamusAPIMultiThreaded {
-    ThalamusAPIMultiThreaded{raw: self.raw, node: self.node}
+  pub fn thread_safe(&self) -> ThalamusAPIThreadSafe {
+    ThalamusAPIThreadSafe{raw: self.raw}
   }
 
   pub fn time(&self) -> Duration {
@@ -521,18 +563,18 @@ impl ThalamusAPI {
     }
   }
 
-  pub fn ready(&self) {
-    unsafe {
+  pub fn ready(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
+    token.with(|node| unsafe {
       let node_ready = (&*self.raw).node_ready;
-      node_ready(self.node);
-    }
+      node_ready(node);
+    })
   }
 
-  pub fn channels_changed(&self) {
-    unsafe {
+  pub fn channels_changed(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
+    token.with(|node| unsafe {
       let node_channels_changed = (&*self.raw).node_channels_changed;
-      node_channels_changed(self.node);
-    }
+      node_channels_changed(node);
+    })
   }
 
   pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
@@ -1090,7 +1132,7 @@ pub enum StateAction {
   Delete,
 }
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug)]
 pub struct State {
   state: *mut ThalamusState,
   api: ThalamusAPI
@@ -1100,6 +1142,12 @@ impl Hash for State {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.state.hash(state);
     }
+}
+
+impl PartialEq for State {
+  fn eq(&self, other: &Self) -> bool {
+    self.state == other.state
+  }
 }
 impl Eq for State {}
 
@@ -1691,7 +1739,7 @@ impl Drop for Timer {
 pub trait Node {
   fn time(&self) -> Duration;
   fn process(&self, handle: Request, request: Json);
-  fn new(api: ThalamusAPI, state: State, token: MainThreadToken) -> Self;
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self;
   fn prepare() -> bool { true }
   fn cleanup() {}
 }

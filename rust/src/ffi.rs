@@ -537,6 +537,7 @@ pub struct ThalamusNodeFactory {
 
 struct PluginImpl<T> {
   api: crate::api::ThalamusAPI,
+  node_token: crate::api::NodeToken,
   node: T,
 }
 
@@ -733,10 +734,15 @@ extern "C" fn create_node_template<T: crate::api::Node + WrappableNode>(factory:
     process: None,
   }));
   let c_node_ref = unsafe {&mut*c_node};
-  let api = ThalamusAPI{raw: api_raw, node: c_node};
-  
+  let api = ThalamusAPI{raw: api_raw};
+  let node_token = crate::api::NodeToken::new(c_node);
+
   let token = unsafe { crate::api::MainThreadToken::new_in_main_thread_callback() };
-  let result = Box::new(PluginImpl::<T>{api, node: T::new(api, crate::api::State::new(api, state), token)});
+  let result = Box::new(PluginImpl::<T>{
+    api,
+    node_token: node_token.clone(),
+    node: T::new(api, node_token, crate::api::State::new(api, state), token)
+  });
 
   c_node_ref.time_ns = Some(c_node_time_ns::<T>);
   c_node_ref.process = Some(c_node_process::<T>);
@@ -750,7 +756,11 @@ unsafe extern "C" fn destroy_node_template<T>(_factory: *mut ThalamusNodeFactory
   println!("destroy_node_template");
   unsafe {
     let node = &*node_raw;
-    //let rust_ptr = node.plugin_impl as *mut T;
+    let plugin = &*(node.plugin_impl as *const PluginImpl<T>);
+    // Null the token first so any NodeToken clone still held by a pending
+    // post_to_main/post_to_threadpool callback sees the node as destroyed
+    // instead of dereferencing freed memory.
+    plugin.node_token.destroy();
     drop(Box::from_raw(node.plugin_impl as *mut PluginImpl<T>));
     drop(Box::from_raw(node_raw));
   }
