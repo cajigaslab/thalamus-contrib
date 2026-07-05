@@ -1,6 +1,6 @@
 use std::{ffi::CString};
 use std::ptr;
-use crate::api::{ThalamusAPI};
+use crate::api::{ThalamusAPI, PredropToken};
 use crate::api::ImageFormat;
 
 #[repr(C)]
@@ -13,6 +13,7 @@ pub struct ThalamusNode {
     pub text: *mut ThalamusTextNode,
     pub plugin_impl: *mut ::std::os::raw::c_void,
     pub process: ::std::option::Option<unsafe extern "C" fn(*mut ThalamusNode, *mut ThalamusRequestHandle, *mut ThalamusJson)>,
+    pub predrop: ::std::option::Option<unsafe extern "C" fn(*mut ThalamusNode)>,
 }
 
 #[repr(C)]
@@ -329,6 +330,7 @@ pub struct ThalamusAPIRaw {
     pub node_ready_multithreaded_connect: unsafe extern "C" fn(*mut ThalamusNode, ThalamusNodeReadyCallback, *mut ::std::os::raw::c_void) -> *mut ThalamusNodeReadyConnection,
 
     pub node_ready_offmain: unsafe extern "C" fn(arg1: *const ThalamusNode),
+    pub node_predrop_ready: unsafe extern "C" fn(arg1: *const ThalamusNode),
 }
 
 #[repr(C)]
@@ -634,6 +636,14 @@ pub extern "C" fn c_node_process<T: crate::api::Node>(raw_node: *mut ThalamusNod
   let json = crate::api::Json::new(_impl.api, arg2);
   _impl.node.process(handle, json);
 }
+#[allow(non_snake_case)]
+pub extern "C" fn c_node_predrop<T: crate::api::Node>(raw_node: *mut ThalamusNode) {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let _impl = deref_plugin_impl::<T>(c_node);
+  
+  let token = PredropToken{api: _impl.api.raw, node: raw_node};
+  _impl.node.predrop(token);
+}
 
 pub extern "C" fn c_node_image_plane<T: crate::api::ImageNode>(output: *mut ThalamusByteSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
@@ -732,6 +742,7 @@ extern "C" fn create_node_template<T: crate::api::Node + WrappableNode>(factory:
     text: ptr::null_mut() as *mut ThalamusTextNode,
     plugin_impl: ptr::null_mut() as *mut ::std::os::raw::c_void,
     process: None,
+    predrop: None
   }));
   let c_node_ref = unsafe {&mut*c_node};
   let api = ThalamusAPI{raw: api_raw};
@@ -746,6 +757,7 @@ extern "C" fn create_node_template<T: crate::api::Node + WrappableNode>(factory:
 
   c_node_ref.time_ns = Some(c_node_time_ns::<T>);
   c_node_ref.process = Some(c_node_process::<T>);
+  c_node_ref.predrop = Some(c_node_predrop::<T>);
 
   result.node.wrap(c_node_ref);
   c_node_ref.plugin_impl = Box::into_raw(result) as *mut ::std::os::raw::c_void;

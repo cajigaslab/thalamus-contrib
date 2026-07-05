@@ -1,13 +1,13 @@
 use std::cell::RefCell;
 use std::ops::Deref;
-use std::rc::{Rc, Weak};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::api::{
-    ImageFormat, ImageNode, MainThreadOnly, MainThreadToken, Node, NodeToken, OnDrop, Request, Json,
-    State, StateAction, StateValue, ThalamusAPI, ThalamusAPIThreadSafe,
+    ImageFormat, ImageNode, MainThreadToken, Node, NodeToken, OnDrop, PredropToken,
+    Request, Json, State, StateAction, StateValue, ThalamusAPI, ThalamusAPIThreadSafe,
 };
 
 type IsGetNumberOfCameras = unsafe extern "C" fn(*mut i32) -> i32;
@@ -178,39 +178,44 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
 const BLANK_WIDTH: u64 = 640;
 const BLANK_HEIGHT: u64 = 480;
 
+struct FrameState {
+    frame_ptr:  *const u8,
+    frame_len:  usize,
+    width:      u64,
+    height:     u64,
+    time:       Duration,
+    is_running: bool,
+}
+unsafe impl Send for FrameState {}
+
+type SharedFrameState = Arc<Mutex<FrameState>>;
+
 struct ThorcamNodeInner {
     api:              ThalamusAPI,
     node_token:       NodeToken,
-    token:            MainThreadToken,
     state:            State,
     state_connection: Option<OnDrop>,
-    frame_ptr:        *const u8,
-    frame_len:        usize,
-    width:            u64,
-    height:           u64,
-    time:             Duration,
+    frame_state:      SharedFrameState,
     camera_thread:    Option<std::thread::JoinHandle<()>>,
     stop_flag:        Arc<AtomicBool>,
-    is_running:       bool,
 }
 
 pub struct ThorcamNode {
     inner: Rc<RefCell<ThorcamNodeInner>>,
+    frame_state: SharedFrameState,
 }
-
-type InnerSend = Arc<Mutex<MainThreadOnly<Weak<RefCell<ThorcamNodeInner>>>>>;
 
 
 fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
     stop_camera(inner);
 
-    let (api, device_id, token) = {
+    let (api, device_id, node_token, frame_state) = {
         let borrow = inner.borrow();
         let device_id = UC480.get()
             .and_then(|r| r.as_ref().ok())
             .and_then(|(_, cameras)| cameras.first())
             .map(|c| c.device_id);
-        (borrow.api, device_id, borrow.token)
+        (borrow.api, device_id, borrow.node_token.clone(), Arc::clone(&borrow.frame_state))
     };
 
     let Some(device_id) = device_id else {
@@ -218,15 +223,12 @@ fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
         return;
     };
 
-    let inner_send: InnerSend = Arc::new(Mutex::new(
-        MainThreadOnly::new(Rc::downgrade(inner), token)
-    ));
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop_flag);
 
     let mt_api = api.thread_safe();
     let handle = std::thread::spawn(move || {
-        run_camera(mt_api, inner_send, stop_clone, device_id);
+        run_camera(mt_api, node_token, frame_state, stop_clone, device_id);
     });
 
     let mut borrow = inner.borrow_mut();
@@ -235,20 +237,21 @@ fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
 }
 
 fn stop_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-    let handle = {
+    let (handle, frame_state) = {
         let mut borrow = inner.borrow_mut();
         borrow.stop_flag.store(true, Ordering::Relaxed);
-        borrow.is_running = false;
-        borrow.camera_thread.take()
+        (borrow.camera_thread.take(), Arc::clone(&borrow.frame_state))
     };
     if let Some(h) = handle {
         let _ = h.join();
     }
+    frame_state.lock().unwrap().is_running = false;
 }
 
 fn run_camera(
     api: ThalamusAPIThreadSafe,
-    inner_send: InnerSend,
+    node_token: NodeToken,
+    frame_state: SharedFrameState,
     stop: Arc<AtomicBool>,
     device_id: u32,
 ) {
@@ -338,24 +341,14 @@ fn run_camera(
         return;
     }
 
-    // Update dimensions on main thread
     {
-        let ic = Arc::clone(&inner_send);
-        api.post_to_main(move |token| {
-            if let Some(rc) = ic.lock().unwrap().get(token).upgrade() {
-                let mut borrow = rc.borrow_mut();
-                borrow.width = width;
-                borrow.height = height;
-                borrow.is_running = true;
-            }
-        });
+        let mut fs = frame_state.lock().unwrap();
+        fs.width = width;
+        fs.height = height;
+        fs.is_running = true;
     }
 
     let frame_size = (width * height) as usize;
-    // session-level sync: (done_flag, condvar); camera thread waits here after each post_to_main
-    let session_sync = Arc::new((Mutex::new(false), Condvar::new()));
-    // abort tells a still-queued callback not to touch the (possibly freed) buffer
-    let abort = Arc::new(AtomicBool::new(false));
 
     while !stop.load(Ordering::Relaxed) {
         let mut next_mem: *mut i8 = std::ptr::null_mut();
@@ -365,56 +358,19 @@ fn run_camera(
             continue;
         }
 
-        // Reset done flag before posting
-        *session_sync.0.lock().unwrap() = false;
-
-        let sync_clone  = Arc::clone(&session_sync);
-        let abort_clone = Arc::clone(&abort);
-        let frame_addr  = next_mem as usize; // cast to usize so closure is Send
-        let ic          = Arc::clone(&inner_send);
-
-        api.post_to_main(move |token| {
-            // If the camera thread aborted (shutdown in progress), skip the buffer
-            if !abort_clone.load(Ordering::Acquire) {
-                if let Some(rc) = ic.lock().unwrap().get(token).upgrade() {
-                    {
-                        let mut borrow = rc.borrow_mut();
-                        borrow.frame_ptr = frame_addr as *const u8;
-                        borrow.frame_len = frame_size;
-                        borrow.time = borrow.api.time();
-                    }
-                    // subscribers read plane() synchronously here; ignore if the node
-                    // was destroyed before this queued callback got to run
-                    let borrow = rc.borrow();
-                    let _ = borrow.api.ready(&borrow.node_token);
-                    rc.borrow_mut().frame_ptr = std::ptr::null();
-                }
-            }
-            // Signal the camera thread that it can unlock the buffer
-            let (lock, cvar) = &*sync_clone;
-            *lock.lock().unwrap() = true;
-            cvar.notify_one();
-        });
-
-        // Block until the callback is done (or stop is requested)
         {
-            let (lock, cvar) = &*session_sync;
-            let mut done = lock.lock().unwrap();
-            while !*done {
-                let result = cvar.wait_timeout(done, Duration::from_millis(50)).unwrap();
-                done = result.0;
-                // If stop arrives while we're blocked (join() is waiting for us),
-                // set abort so the still-queued callback won't touch the buffer,
-                // then break immediately so the thread can exit and join() can return.
-                if !*done && stop.load(Ordering::Relaxed) {
-                    abort.store(true, Ordering::Relaxed);
-                    break;
-                }
-            }
+            let mut fs = frame_state.lock().unwrap();
+            fs.frame_ptr = next_mem as *const u8;
+            fs.frame_len = frame_size;
+            fs.time = crate::api::time(api.raw);
         }
 
-        // Always unlock — whether the callback ran or we aborted.
-        // The abort flag ensures any still-queued callback won't dereference the pointer.
+        // Publishes directly from this thread; subscribers read plane() synchronously
+        // before this call returns. Ignore if the node was destroyed concurrently.
+        let _ = api.ready_offmain(&node_token);
+
+        frame_state.lock().unwrap().frame_ptr = std::ptr::null();
+
         unsafe { (lib.unlock_seq_buf)(h_cam, next_id, next_mem) };
     }
 
@@ -439,20 +395,20 @@ impl Deref for RawSlice {
 
 impl ImageNode for ThorcamNode {
     fn plane(&self, _channel: i32) -> impl Deref<Target = [u8]> {
-        let borrow = self.inner.borrow();
-        RawSlice(borrow.frame_ptr, borrow.frame_len)
+        let fs = self.frame_state.lock().unwrap();
+        RawSlice(fs.frame_ptr, fs.frame_len)
     }
     fn num_planes(&self) -> u64 { 1 }
     fn format(&self) -> ImageFormat { ImageFormat::Gray }
-    fn width(&self) -> u64 { self.inner.borrow().width }
-    fn height(&self) -> u64 { self.inner.borrow().height }
+    fn width(&self) -> u64 { self.frame_state.lock().unwrap().width }
+    fn height(&self) -> u64 { self.frame_state.lock().unwrap().height }
     fn frame_interval(&self) -> Duration { Duration::from_nanos(16_666_667) } // ~60 FPS
-    fn has_image_data(&self) -> bool { self.inner.borrow().is_running }
+    fn has_image_data(&self) -> bool { self.frame_state.lock().unwrap().is_running }
 }
 
 impl Node for ThorcamNode {
     fn time(&self) -> Duration {
-        self.inner.borrow().time
+        self.frame_state.lock().unwrap().time
     }
 
     fn process(&self, handle: Request, request: Json) {
@@ -476,7 +432,7 @@ impl Node for ThorcamNode {
         handle.respond(&Json::from_string(api, &response));
     }
 
-    fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self {
+    fn new(api: ThalamusAPI, node_token: NodeToken, state: State, _token: MainThreadToken) -> Self {
         let init_result = UC480.get_or_init(load_uc480);
         match init_result {
             Ok((_, cameras)) => {
@@ -490,20 +446,23 @@ impl Node for ThorcamNode {
             Err(e) => println!("ThorcamNode: uc480 init failed: {}", e),
         }
 
-        let inner = Rc::new(RefCell::new(ThorcamNodeInner {
-            api,
-            node_token,
-            token,
-            state: state.clone(),
-            state_connection: None,
+        let frame_state: SharedFrameState = Arc::new(Mutex::new(FrameState {
             frame_ptr: std::ptr::null(),
             frame_len: 0,
             width: BLANK_WIDTH,
             height: BLANK_HEIGHT,
             time: Duration::ZERO,
+            is_running: false,
+        }));
+
+        let inner = Rc::new(RefCell::new(ThorcamNodeInner {
+            api,
+            node_token,
+            state: state.clone(),
+            state_connection: None,
+            frame_state: Arc::clone(&frame_state),
             camera_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
-            is_running: false,
         }));
 
         let change_ref = Rc::clone(&inner);
@@ -524,7 +483,31 @@ impl Node for ThorcamNode {
         inner.borrow_mut().state_connection = Some(state.connect(state_callback));
         state.recap();
 
-        ThorcamNode { inner }
+        ThorcamNode { inner, frame_state }
+    }
+
+    fn predrop(&self, token: PredropToken) {
+        // Don't join the capture thread here: predrop runs on the main thread, and the
+        // capture thread's ready_offmain call synchronously posts to and waits on the
+        // main thread. A blocking join here would deadlock against that. Instead, signal
+        // the capture thread to stop and hand the join off to a threadpool thread, which
+        // reports readiness only once the capture thread has actually exited.
+        let (handle, api, frame_state) = {
+            let mut borrow = self.inner.borrow_mut();
+            borrow.stop_flag.store(true, Ordering::Relaxed);
+            (borrow.camera_thread.take(), borrow.api, Arc::clone(&borrow.frame_state))
+        };
+
+        match handle {
+            Some(h) => {
+                api.thread_safe().post_to_threadpool(move || {
+                    let _ = h.join();
+                    frame_state.lock().unwrap().is_running = false;
+                    token.ready();
+                });
+            }
+            None => token.ready(),
+        }
     }
 }
 

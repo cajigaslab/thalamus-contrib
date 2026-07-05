@@ -1736,12 +1736,29 @@ impl Drop for Timer {
   }
 }
 
+pub struct PredropToken {
+  pub api: *mut ThalamusAPIRaw,
+  pub node: *mut ThalamusNode,
+}
+unsafe impl Send for PredropToken {}
+
+impl PredropToken {
+  pub fn ready(&self) {
+    unsafe {
+      ((&(*self.api)).node_predrop_ready)(self.node);
+    }
+  }
+}
+
 pub trait Node {
   fn time(&self) -> Duration;
   fn process(&self, handle: Request, request: Json);
   fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self;
   fn prepare() -> bool { true }
   fn cleanup() {}
+  fn predrop(&self, token: PredropToken) {
+    token.ready()
+  }
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {
