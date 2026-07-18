@@ -27,11 +27,6 @@ type IsWaitForNextImage  = unsafe extern "C" fn(u32, u32, *mut *mut i8, *mut i32
 type IsInitImageQueue    = unsafe extern "C" fn(u32, i32) -> i32;
 type IsExitImageQueue    = unsafe extern "C" fn(u32) -> i32;
 type IsSetFrameRate      = unsafe extern "C" fn(u32, f64, *mut f64) -> i32;
-type IsPixelClock        = unsafe extern "C" fn(u32, u32, *mut std::ffi::c_void, u32) -> i32;
-
-// Commands for is_PixelClock (see uc480.h's E_PIXELCLOCK_CMD).
-const IS_PIXELCLOCK_CMD_GET_RANGE: u32 = 3;
-const IS_PIXELCLOCK_CMD_SET: u32 = 6;
 
 #[repr(C)]
 struct Uc480CameraInfoRaw {
@@ -90,7 +85,6 @@ struct Uc480Lib {
     init_image_queue:      IsInitImageQueue,
     exit_image_queue:      IsExitImageQueue,
     set_frame_rate:        IsSetFrameRate,
-    pixel_clock:           IsPixelClock,
 }
 
 unsafe impl Send for Uc480Lib {}
@@ -136,7 +130,6 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
     let init_image_queue      = load_fn::<IsInitImageQueue>(&library,     b"is_InitImageQueue\0")?;
     let exit_image_queue      = load_fn::<IsExitImageQueue>(&library,     b"is_ExitImageQueue\0")?;
     let set_frame_rate        = load_fn::<IsSetFrameRate>(&library,       b"is_SetFrameRate\0")?;
-    let pixel_clock           = load_fn::<IsPixelClock>(&library,         b"is_PixelClock\0")?;
 
     let mut num_cameras: i32 = 0;
     let ret = unsafe { get_number_of_cameras(&mut num_cameras) };
@@ -179,7 +172,6 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
         add_to_sequence, clear_sequence, unlock_seq_buf,
         capture_video, stop_live_video, wait_for_next_image,
         init_image_queue, exit_image_queue, set_frame_rate,
-        pixel_clock,
     }, cameras))
 }
 
@@ -280,38 +272,6 @@ fn run_camera(
     println!("ThorcamNode: camera resolution {}x{}", width, height);
 
     unsafe { (lib.set_color_mode)(h_cam, 6) }; // IS_CM_MONO8
-
-    // Raise the pixel clock to its maximum before requesting a frame rate: the
-    // driver otherwise starts at a conservative default clock that caps the
-    // achievable frame rate well below what is_SetFrameRate can otherwise reach
-    // at this resolution.
-    let mut clock_range: [u32; 3] = [0, 0, 0]; // [min, max, increment]
-    let ret = unsafe {
-        (lib.pixel_clock)(
-            h_cam,
-            IS_PIXELCLOCK_CMD_GET_RANGE,
-            clock_range.as_mut_ptr() as *mut std::ffi::c_void,
-            std::mem::size_of_val(&clock_range) as u32,
-        )
-    };
-    if ret != 0 {
-        println!("ThorcamNode: is_PixelClock (get range) failed: {}", ret);
-    } else {
-        let mut max_clock = clock_range[1];
-        println!("ThorcamNode: pixel clock range {}-{} MHz (step {}), requesting {} MHz",
-            clock_range[0], clock_range[1], clock_range[2], max_clock);
-        let ret = unsafe {
-            (lib.pixel_clock)(
-                h_cam,
-                IS_PIXELCLOCK_CMD_SET,
-                &mut max_clock as *mut u32 as *mut std::ffi::c_void,
-                std::mem::size_of_val(&max_clock) as u32,
-            )
-        };
-        if ret != 0 {
-            println!("ThorcamNode: is_PixelClock (set) failed: {}", ret);
-        }
-    }
 
     let mut actual_fps: f64 = 0.0;
     let ret = unsafe { (lib.set_frame_rate)(h_cam, 60.0, &mut actual_fps) };

@@ -91,7 +91,7 @@ pub struct ExtNode {
 impl ExtNode {
   fn new(api: ThalamusAPI, node: *mut ThalamusNode) -> ExtNode {
     unsafe {
-      ((*api.raw).node_inc_ref)(node)
+      ((*api.raw).node_inc_ref.unwrap())(node)
     };
     ExtNode {
       api, node
@@ -105,12 +105,12 @@ impl ExtNode {
     let void_ptr = call_ptr as *mut std::os::raw::c_void;
 
     let connection = unsafe {
-      ((&*self.api.raw).node_ready_connect)(self.node, Some(node_ready_callback::<T>), void_ptr)
+      ((&*self.api.raw).node_ready_connect.unwrap())(self.node, Some(node_ready_callback::<T>), void_ptr)
     };
     let api = self.api;
     let cleanup = move || {
       unsafe {
-        ((&*api.raw).node_ready_disconnect)(connection);
+        ((&*api.raw).node_ready_disconnect.unwrap())(connection);
         drop(Box::from_raw(call_ptr));
       }
     };
@@ -125,12 +125,12 @@ impl ExtNode {
     let void_ptr = call_ptr as *mut std::os::raw::c_void;
 
     let connection = unsafe {
-      ((&*self.api.raw).node_ready_multithreaded_connect)(self.node, Some(node_ready_callback::<T>), void_ptr)
+      ((&*self.api.raw).node_ready_multithreaded_connect.unwrap())(self.node, Some(node_ready_callback::<T>), void_ptr)
     };
     let api = self.api;
     let cleanup = move || {
       unsafe {
-        ((&*api.raw).node_ready_disconnect)(connection);
+        ((&*api.raw).node_ready_disconnect.unwrap())(connection);
         drop(Box::from_raw(call_ptr));
       }
     };
@@ -154,7 +154,7 @@ impl ExtNode {
 
   pub fn state(&self) -> State {
     let raw = unsafe {
-      ((*self.api.raw).node_get_state)(self.node)
+      ((*self.api.raw).node_get_state.unwrap())(self.node)
     };
     // node_get_state already increments the ref count, so construct State directly
     State { api: self.api, state: raw }
@@ -164,7 +164,7 @@ impl ExtNode {
 impl Drop for ExtNode {
   fn drop(&mut self) {
     unsafe {
-      ((*self.api.raw).node_dec_ref)(self.node)
+      ((*self.api.raw).node_dec_ref.unwrap())(self.node)
     }
   }
 }
@@ -182,12 +182,12 @@ impl<'a> ExtAnalogNode<'a> {
     let void_ptr = call_ptr as *mut std::os::raw::c_void;
 
     let connection = unsafe {
-      ((&*self.node.api.raw).node_channels_changed_connect)(self.node.node, Some(node_ready_callback::<T>), void_ptr)
+      ((&*self.node.api.raw).node_channels_changed_connect.unwrap())(self.node.node, Some(node_ready_callback::<T>), void_ptr)
     };
     let api = self.node.api;
     let cleanup = move || {
       unsafe {
-        ((&*api.raw).node_channels_changed_disconnect)(connection);
+        ((&*api.raw).node_channels_changed_disconnect.unwrap())(connection);
         drop(Box::from_raw(call_ptr));
       }
     };
@@ -492,7 +492,7 @@ impl ThalamusAPIThreadSafe {
 
   pub fn ready_offmain(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
-      let node_ready_offmain = (&*self.raw).node_ready_offmain;
+      let node_ready_offmain = (&*self.raw).node_ready_offmain.unwrap();
       let plugin_impl = plugin_impl_ptr(node);
       // SAFETY: data is only read back synchronously inside node_ready_offmain,
       // which returns before this function does, so the erased lifetime never
@@ -512,7 +512,7 @@ impl ThalamusAPIThreadSafe {
         call
       }));
       let void_ptr = call_ptr as *mut std::os::raw::c_void;
-      (api.io_context_post)(Some(post_callback::<T>), void_ptr);
+      (api.io_context_post.unwrap())(Some(post_callback::<T>), void_ptr);
 
       //let call_ref =  &*call_ptr;
       //let mut done = call_ref.mutex.lock().unwrap();
@@ -531,7 +531,7 @@ impl ThalamusAPIThreadSafe {
         call
       }));
       let void_ptr = call_ptr as *mut std::os::raw::c_void;
-      (api.threadpool_post)(Some(threadpool_callback::<T>), void_ptr);
+      (api.threadpool_post.unwrap())(Some(threadpool_callback::<T>), void_ptr);
 
       //let call_ref =  &*call_ptr;
       //let mut done = call_ref.mutex.lock().unwrap();
@@ -551,14 +551,14 @@ impl ThalamusAPI {
 
   pub fn time(&self) -> Duration {
     unsafe {
-      let time_ns = (&*self.raw).time_ns;
+      let time_ns = (&*self.raw).time_ns.unwrap();
       return Duration::from_nanos(time_ns());
     }
   }
 
   pub fn ready(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
-      let node_ready = (&*self.raw).node_ready;
+      let node_ready = (&*self.raw).node_ready.unwrap();
       let plugin_impl = plugin_impl_ptr(node);
       // SAFETY: data is only read back synchronously inside node_ready, which
       // returns before this function does, so the erased lifetime never
@@ -573,7 +573,7 @@ impl ThalamusAPI {
 
   pub fn channels_changed(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
-      let node_channels_changed = (&*self.raw).node_channels_changed;
+      let node_channels_changed = (&*self.raw).node_channels_changed.unwrap();
       node_channels_changed(node);
     })
   }
@@ -585,7 +585,7 @@ impl ThalamusAPI {
         call
       }));
       let void_ptr = call_ptr as *mut std::os::raw::c_void;
-      (api.io_context_post)(Some(post_callback::<T>), void_ptr);
+      (api.io_context_post.unwrap())(Some(post_callback::<T>), void_ptr);
 
       //let call_ref =  &*call_ptr;
       //let mut done = call_ref.mutex.lock().unwrap();
@@ -600,7 +600,7 @@ impl ThalamusAPI {
   pub fn create_serial_port(&self) -> SerialPort {
     unsafe {
       let api = &*self.raw;
-      let port = (api.serial_port_create)();
+      let port = (api.serial_port_create.unwrap())();
       SerialPort {
         api: *self, port
       }
@@ -610,17 +610,17 @@ impl ThalamusAPI {
   pub fn create_streambuf(&self) -> StreamBuf {
     unsafe {
       let api = &*self.raw;
-      let buffer = (api.streambuf_create)();
+      let buffer = (api.streambuf_create.unwrap())();
       StreamBuf {
         api: *self, buffer
       }
     }
   }
 
-  
+
   pub fn create_timer(&self) -> Timer {
     unsafe {
-      let timer = ((&(*self.raw)).timer_create)();
+      let timer = ((&(*self.raw)).timer_create.unwrap())();
       println!("new timer {:?} {:?}", self, timer);
       Timer {
         api: *self, timer
@@ -652,13 +652,13 @@ impl ThalamusAPI {
     let void_ptr = call_ptr as *mut std::os::raw::c_void;
 
     let connection = unsafe {
-      ((&*self.raw).node_get_node)(&mut c_selector as *mut ThalamusNodeSelector, Some(get_node_callback::<T>), void_ptr)
+      ((&*self.raw).node_get_node.unwrap())(&mut c_selector as *mut ThalamusNodeSelector, Some(get_node_callback::<T>), void_ptr)
     };
 
     let api = self.raw;
     let cleanup = move || {
       unsafe {
-        ((&*api).node_get_node_disconnect)(connection);
+        ((&*api).node_get_node_disconnect.unwrap())(connection);
         drop(Box::from_raw(call_ptr));
       };
     };
@@ -672,7 +672,7 @@ impl ThalamusAPI {
         call
       }));
       let void_ptr = call_ptr as *mut std::os::raw::c_void;
-      (api.threadpool_post)(Some(threadpool_callback::<T>), void_ptr);
+      (api.threadpool_post.unwrap())(Some(threadpool_callback::<T>), void_ptr);
 
       //let call_ref =  &*call_ptr;
       //let mut done = call_ref.mutex.lock().unwrap();
@@ -742,7 +742,7 @@ pub struct Json {
 impl Json {
   pub fn new(api: ThalamusAPI, handle:*mut ThalamusJson) -> Json {
     unsafe {
-      ((&*api.raw).json_inc_ref)(handle);
+      ((&*api.raw).json_inc_ref.unwrap())(handle);
     }
     Json{api, handle}
   }
@@ -750,13 +750,13 @@ impl Json {
   pub fn to_string(&self) -> String {
     unsafe {
       let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0};
-      ((&*self.api.raw).json_to_string)(&mut span as *mut ThalamusCharSpan, self.handle);
+      ((&*self.api.raw).json_to_string.unwrap())(&mut span as *mut ThalamusCharSpan, self.handle);
 
       let slice = slice::from_raw_parts(span.data as *mut u8, span.size as usize);
       let text = str::from_utf8(slice).unwrap();
       let result = text.to_string();
-      
-      ((&*self.api.raw).charspan_release)(&mut span as *mut ThalamusCharSpan);
+
+      ((&*self.api.raw).charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
 
       result
     }
@@ -764,9 +764,9 @@ impl Json {
 
   pub fn from_string(api: ThalamusAPI, text: &str) -> Json {
       let mut span = ThalamusCharSpan { data: text.as_ptr() as *const i8, size: text.len() as u64, owns_data: 0};
-      
-      
-      let handle = unsafe { ((&*api.raw).json_from_string)(&mut span as *mut ThalamusCharSpan) };
+
+
+      let handle = unsafe { ((&*api.raw).json_from_string.unwrap())(&mut span as *mut ThalamusCharSpan) };
       Json {
         api, handle
       }
@@ -782,7 +782,7 @@ impl Clone for Json {
 impl Drop for Json {
   fn drop(&mut self) {
     unsafe {
-      ((&*self.api.raw).json_dec_ref)(self.handle);
+      ((&*self.api.raw).json_dec_ref.unwrap())(self.handle);
     }
   }
 }
@@ -795,7 +795,7 @@ pub struct Request {
 impl Request {
   pub fn respond(self, response: &Json) {
     unsafe {
-      ((&*self.api.raw).request_respond)(self.handle, response.handle)
+      ((&*self.api.raw).request_respond.unwrap())(self.handle, response.handle)
     }
   }
 }
@@ -936,7 +936,7 @@ impl Drop for StreamBuf {
   fn drop(&mut self) {
     unsafe {
       let api = &*self.api.raw;
-      (api.streambuf_destroy)(self.buffer);
+      (api.streambuf_destroy.unwrap())(self.buffer);
     }
   }
 }
@@ -946,11 +946,11 @@ impl StreamBuf {
     unsafe {
       let api = &*self.api.raw;
       let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0};
-      (api.streambuf_to_span)(&mut span as *mut ThalamusCharSpan, self.buffer);
+      (api.streambuf_to_span.unwrap())(&mut span as *mut ThalamusCharSpan, self.buffer);
       let slice = slice::from_raw_parts(span.data as *mut u8, span.size as usize);
       let text = str::from_utf8(slice).unwrap();
       let result = text.to_string();
-      (api.charspan_release)(&mut span as *mut ThalamusCharSpan);
+      (api.charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
       result
     }
   }
@@ -958,14 +958,14 @@ impl StreamBuf {
   pub fn consume(&self, count: u64) {
     unsafe {
       let api = &*self.api.raw;
-      (api.streambuf_consume)(self.buffer, count);
+      (api.streambuf_consume.unwrap())(self.buffer, count);
     }
   }
 
   pub fn size(&self) -> u64 {
     unsafe {
       let api = &*self.api.raw;
-      (api.streambuf_size)(self.buffer)
+      (api.streambuf_size.unwrap())(self.buffer)
     }
   }
 }
@@ -979,7 +979,7 @@ impl SerialPort {
   pub fn error(&self) -> Option<ErrorCode> {
     unsafe {
       let api = &*self.api.raw;
-      let error = (api.serial_port_error)(self.port);
+      let error = (api.serial_port_error.unwrap())(self.port);
       let error_code = ErrorCode::new(self.api, error);
       if error_code.code == 0 {
         None
@@ -992,7 +992,7 @@ impl SerialPort {
     unsafe {
       let api = &*self.api.raw;
       let name_span = ThalamusCharSpan { data: name.as_ptr() as *const i8, size: name.len() as u64, owns_data: 0 };
-      (api.serial_port_open)(self.port, &name_span as *const ThalamusCharSpan);
+      (api.serial_port_open.unwrap())(self.port, &name_span as *const ThalamusCharSpan);
       match self.error() {
         None => Ok(()),
         Some(error) => Err(error)
@@ -1002,7 +1002,7 @@ impl SerialPort {
   pub fn set_baud_rate(&self, rate: u32) -> Result<(), ErrorCode> {
     unsafe {
       let api = &*self.api.raw;
-      (api.serial_set_baud_rate)(self.port, rate);
+      (api.serial_set_baud_rate.unwrap())(self.port, rate);
       match self.error() {
         None => Ok(()),
         Some(error) => Err(error)
@@ -1019,7 +1019,7 @@ impl SerialPort {
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
       let mut span = ThalamusByteSpan { data: data.as_ptr(), size: data.len() as u64 };
-      (api.serial_port_write)(self.port, &mut span as *mut ThalamusByteSpan, Some(io_callback::<T>), args);
+      (api.serial_port_write.unwrap())(self.port, &mut span as *mut ThalamusByteSpan, Some(io_callback::<T>), args);
     }
   }
   pub fn write(&self, data: &[u8]) -> SimpleFuture<u64, ErrorCode> {
@@ -1040,7 +1040,7 @@ impl SerialPort {
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
       let mut span = ThalamusMutableByteSpan { data: data.as_mut_ptr(), size: data.len() as u64 };
-      (api.serial_port_read)(self.port, &mut span as *mut ThalamusMutableByteSpan, Some(io_callback::<T>), args);
+      (api.serial_port_read.unwrap())(self.port, &mut span as *mut ThalamusMutableByteSpan, Some(io_callback::<T>), args);
     }
   }
   pub fn read(&self, data: &mut [u8]) -> SimpleFuture<u64, ErrorCode> {
@@ -1061,7 +1061,7 @@ impl SerialPort {
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
       let mut span = ThalamusMutableByteSpan { data: data.as_mut_ptr(), size: data.len() as u64 };
-      (api.serial_port_read_some)(self.port, &mut span as *mut ThalamusMutableByteSpan, Some(io_callback::<T>), args);
+      (api.serial_port_read_some.unwrap())(self.port, &mut span as *mut ThalamusMutableByteSpan, Some(io_callback::<T>), args);
     }
   }
   pub fn read_some(&self, data: &mut [u8]) -> SimpleFuture<u64, ErrorCode> {
@@ -1082,7 +1082,7 @@ impl SerialPort {
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
       let delimiter_span = ThalamusCharSpan { data: delimiter.as_ptr() as *const i8, size: delimiter.len() as u64, owns_data: 0 };
-      (api.serial_port_read_until)(self.port, buffer.buffer, &delimiter_span as *const ThalamusCharSpan, Some(io_callback::<T>), args);
+      (api.serial_port_read_until.unwrap())(self.port, buffer.buffer, &delimiter_span as *const ThalamusCharSpan, Some(io_callback::<T>), args);
     }
   }
   pub fn read_until(&self, buffer: &StreamBuf, delimiter: &str) -> SimpleFuture<u64, ErrorCode> {
@@ -1100,7 +1100,7 @@ impl Drop for SerialPort {
   fn drop(&mut self) {
     unsafe {
       let api = &*self.api.raw;
-      (api.serial_port_destroy)(self.port);
+      (api.serial_port_destroy.unwrap())(self.port);
     }
   }
 }
@@ -1172,7 +1172,7 @@ pub fn run_task<F: Future<Output = ()> + 'static>(future: F) -> TaskScope
 
 pub fn time(api: *const ThalamusAPIRaw) -> Duration {
   unsafe {
-    return Duration::from_nanos(((&*api).time_ns)());
+    return Duration::from_nanos(((&*api).time_ns.unwrap())());
   }
 }
 
@@ -1288,19 +1288,19 @@ pub enum StateKey {
 fn wrap_state(api:ThalamusAPI, arg: *mut ThalamusState) -> StateValue {
   unsafe {
     let raw = &*api.raw;
-    if (raw.state_is_bool)(arg) != 0 {
-      StateValue::Bool((raw.state_get_bool)(arg) != 0)
-    } else if (raw.state_is_dict)(arg) != 0 {
+    if (raw.state_is_bool.unwrap())(arg) != 0 {
+      StateValue::Bool((raw.state_get_bool.unwrap())(arg) != 0)
+    } else if (raw.state_is_dict.unwrap())(arg) != 0 {
       StateValue::Dict(State::new(api, arg))
-    } else if (raw.state_is_float)(arg) != 0 {
-      StateValue::Float((raw.state_get_float)(arg))
-    } else if (raw.state_is_int)(arg) != 0 {
-      StateValue::Int((raw.state_get_int)(arg))
-    } else if (raw.state_is_list)(arg) != 0 {
+    } else if (raw.state_is_float.unwrap())(arg) != 0 {
+      StateValue::Float((raw.state_get_float.unwrap())(arg))
+    } else if (raw.state_is_int.unwrap())(arg) != 0 {
+      StateValue::Int((raw.state_get_int.unwrap())(arg))
+    } else if (raw.state_is_list.unwrap())(arg) != 0 {
       StateValue::List(State::new(api, arg))
-    } else if (raw.state_is_string)(arg) != 0 {
+    } else if (raw.state_is_string.unwrap())(arg) != 0 {
       let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
-      ((&*raw).state_get_string)(&mut span, arg);
+      ((&*raw).state_get_string.unwrap())(&mut span, arg);
       let text = std::str::from_utf8(std::slice::from_raw_parts(span.data as *const u8, span.size as usize)).unwrap();
       StateValue::String(text.to_string())
     } else {
@@ -1424,14 +1424,14 @@ impl ErrorCode {
 
   pub fn new(api: ThalamusAPI, error: *mut ThalamusErrorCode) -> ErrorCode {
     unsafe {
-      let code = ((&(*api.raw)).error_code_value)(error);
+      let code = ((&(*api.raw)).error_code_value.unwrap())(error);
       let message = if code != 0 {
         let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0};
-        ((&(*api.raw)).error_code_message)(&mut span as *mut ThalamusCharSpan, error);
+        ((&(*api.raw)).error_code_message.unwrap())(&mut span as *mut ThalamusCharSpan, error);
 
         let slice = slice::from_raw_parts(span.data as *mut u8, span.size as usize);
         let text = str::from_utf8(slice).unwrap().to_string();
-        ((&(*api.raw)).charspan_release)(&mut span as *mut ThalamusCharSpan);
+        ((&(*api.raw)).charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
         text
       } else {
         "".to_string()
@@ -1480,20 +1480,20 @@ impl Iterator for StateIter {
 
   fn next(&mut self) -> Option<Self::Item> {
     let readable = unsafe {
-      ((&*self.api.raw).state_iter_next)(self.raw)
+      ((&*self.api.raw).state_iter_next.unwrap())(self.raw)
     };
 
     if readable != 0 {
       let (raw_key, raw_val) = unsafe {
-        (((&*self.api.raw).state_iter_key)(self.raw), ((&*self.api.raw).state_iter_value)(self.raw))
+        (((&*self.api.raw).state_iter_key.unwrap())(self.raw), ((&*self.api.raw).state_iter_value.unwrap())(self.raw))
       };
 
       let key = wrap_state_key(self.api, raw_key);
       let val = wrap_state(self.api, raw_val);
 
       unsafe {
-        ((&*self.api.raw).state_dec_ref)(raw_key);
-        ((&*self.api.raw).state_dec_ref)(raw_val);
+        ((&*self.api.raw).state_dec_ref.unwrap())(raw_key);
+        ((&*self.api.raw).state_dec_ref.unwrap())(raw_val);
       };
 
       Some(StateEntry{key, val})
@@ -1509,7 +1509,7 @@ impl IntoIterator for &State {
 
   fn into_iter(self) -> Self::IntoIter {
     let raw = unsafe {
-      ((&*self.api.raw).state_iter_create)(self.state)
+      ((&*self.api.raw).state_iter_create.unwrap())(self.state)
     };
     StateIter { api: self.api, raw }
   }
@@ -1518,7 +1518,7 @@ impl IntoIterator for &State {
 impl Drop for StateIter {
   fn drop(&mut self) {
     unsafe {
-      ((&*self.api.raw).state_iter_destroy)(self.raw);
+      ((&*self.api.raw).state_iter_destroy.unwrap())(self.raw);
     }
   }
 }
@@ -1526,7 +1526,7 @@ impl Drop for StateIter {
 impl State {
   pub fn new(api:ThalamusAPI, state:*mut ThalamusState) -> State {
     unsafe {
-      ((&*api.raw).state_inc_ref)(state);
+      ((&*api.raw).state_inc_ref.unwrap())(state);
     }
     State {
       state: state, api: api
@@ -1553,7 +1553,7 @@ impl State {
 
   pub fn parent(&self) -> Option<State> {
     let state = unsafe {
-      ((&*self.api.raw).state_parent)(self.state)
+      ((&*self.api.raw).state_parent.unwrap())(self.state)
     };
     if state.is_null() {
       None
@@ -1566,7 +1566,7 @@ impl State {
 
   pub fn key_of(&self, val: &State) -> Option<StateKey> {
     let key = unsafe {
-      ((&*self.api.raw).state_key_of)(self.state, val.state)
+      ((&*self.api.raw).state_key_of.unwrap())(self.state, val.state)
     };
 
     if key.is_null() {
@@ -1574,7 +1574,7 @@ impl State {
     } else {
       let result = Some(wrap_state_key(self.api, key));
       unsafe {
-        ((&*self.api.raw).state_dec_ref)(key);
+        ((&*self.api.raw).state_dec_ref.unwrap())(key);
       };
       result
     }
@@ -1586,13 +1586,13 @@ impl State {
     let result = match index {
       StateKey::Int(key) => {
         unsafe {
-          ((&*self.api.raw).state_get_at_index)(self.state, key as u64)
+          ((&*self.api.raw).state_get_at_index.unwrap())(self.state, key as u64)
         }
       },
       StateKey::String(key_raw) => {
         let span = ThalamusCharSpan { data: key_raw.as_ptr() as *const i8, size: key_raw.len() as u64, owns_data: 0 };
         unsafe {
-          ((&*self.api.raw).state_get_at_name)(self.state, &span)
+          ((&*self.api.raw).state_get_at_name.unwrap())(self.state, &span)
         }
       }
     };
@@ -1602,7 +1602,7 @@ impl State {
       let raw = result;
       let wrapped = wrap_state(self.api, raw);
       unsafe {
-        ((&*self.api.raw).state_dec_ref)(raw);
+        ((&*self.api.raw).state_dec_ref.unwrap())(raw);
       };
       Some(wrapped)
     }
@@ -1615,26 +1615,26 @@ impl State {
         unsafe {
           match raw_value {
             StateValue::Bool(value) => {
-              (api.state_set_at_index_bool)(self.state, key, if value { 1 } else { 0 });
+              (api.state_set_at_index_bool.unwrap())(self.state, key, if value { 1 } else { 0 });
             },
             StateValue::Dict(value) => {
-              (api.state_set_at_index_state)(self.state, key, value.state);
+              (api.state_set_at_index_state.unwrap())(self.state, key, value.state);
             },
             StateValue::Float(value) => {
-              (api.state_set_at_index_float)(self.state, key, value);
+              (api.state_set_at_index_float.unwrap())(self.state, key, value);
             },
             StateValue::Int(value) => {
-              (api.state_set_at_index_int)(self.state, key, value);
+              (api.state_set_at_index_int.unwrap())(self.state, key, value);
             },
             StateValue::List(value) => {
-              (api.state_set_at_index_state)(self.state, key, value.state);
+              (api.state_set_at_index_state.unwrap())(self.state, key, value.state);
             },
             StateValue::String(rust_value) => {
               let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const i8, size: rust_value.len() as u64, owns_data: 0 };
-              (api.state_set_at_index_string)(self.state, key, &value_span as *const ThalamusCharSpan);
+              (api.state_set_at_index_string.unwrap())(self.state, key, &value_span as *const ThalamusCharSpan);
             },
             StateValue::Null => {
-              (api.state_set_at_index_null)(self.state, key);
+              (api.state_set_at_index_null.unwrap())(self.state, key);
             },
           };
         }
@@ -1645,26 +1645,26 @@ impl State {
         unsafe {
           match raw_value {
             StateValue::Bool(value) => {
-              (api.state_set_at_name_bool)(self.state, key, if value { 1 } else { 0 });
+              (api.state_set_at_name_bool.unwrap())(self.state, key, if value { 1 } else { 0 });
             },
             StateValue::Dict(value) => {
-              (api.state_set_at_name_state)(self.state, key, value.state);
+              (api.state_set_at_name_state.unwrap())(self.state, key, value.state);
             },
             StateValue::Float(value) => {
-              (api.state_set_at_name_float)(self.state, key, value);
+              (api.state_set_at_name_float.unwrap())(self.state, key, value);
             },
             StateValue::Int(value) => {
-              (api.state_set_at_name_int)(self.state, key, value);
+              (api.state_set_at_name_int.unwrap())(self.state, key, value);
             },
             StateValue::List(value) => {
-              (api.state_set_at_name_state)(self.state, key, value.state);
+              (api.state_set_at_name_state.unwrap())(self.state, key, value.state);
             },
             StateValue::String(rust_value) => {
               let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const i8, size: rust_value.len() as u64, owns_data: 0 };
-              (api.state_set_at_name_string)(self.state, key, &value_span as *const ThalamusCharSpan);
+              (api.state_set_at_name_string.unwrap())(self.state, key, &value_span as *const ThalamusCharSpan);
             },
             StateValue::Null => {
-              (api.state_set_at_name_null)(self.state, key);
+              (api.state_set_at_name_null.unwrap())(self.state, key);
             },
           };
         }
@@ -1674,7 +1674,7 @@ impl State {
 
   pub fn recap(&self) {
     unsafe {
-      ((&*self.api.raw).state_recap)(self.state);
+      ((&*self.api.raw).state_recap.unwrap())(self.state);
     }
   }
 
@@ -1686,7 +1686,7 @@ impl State {
     let raw = Box::into_raw(callback_args);
 
     unsafe {
-      ((&*self.api.raw).state_recap_with)(self.state, Some(state_on_change::<T>), raw as *mut c_void);
+      ((&*self.api.raw).state_recap_with.unwrap())(self.state, Some(state_on_change::<T>), raw as *mut c_void);
     }
 
     unsafe { drop(Box::from_raw(raw)); }
@@ -1700,7 +1700,7 @@ impl State {
     });
     let raw = Box::into_raw(callback_args);
     let connection = unsafe {
-      ((&*self.api.raw).state_recursive_change_connect)(self.state, Some(state_on_change::<T>), raw as *mut c_void)
+      ((&*self.api.raw).state_recursive_change_connect.unwrap())(self.state, Some(state_on_change::<T>), raw as *mut c_void)
     };
     println!("connect {:?} {:?} {:?}", self.api, connection, raw);
 
@@ -1708,7 +1708,7 @@ impl State {
     let cleanup = move || {
       println!("connect drop {:?} {:?}", cleanup_api, connection);
       unsafe {
-        ((&*cleanup_api.raw).state_recursive_change_disconnect)(connection);
+        ((&*cleanup_api.raw).state_recursive_change_disconnect.unwrap())(connection);
         drop(Box::from_raw(raw));
       }
       println!("StateConnection::drop");
@@ -1727,7 +1727,7 @@ impl Clone for State {
 impl Drop for State {
   fn drop(&mut self) {
     unsafe {
-      ((&*self.api.raw).state_dec_ref)(self.state);
+      ((&*self.api.raw).state_dec_ref.unwrap())(self.state);
     }
   }
 }
@@ -1763,8 +1763,8 @@ impl Timer {
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
       let ns = duration.as_nanos() as u64;
-      (api.timer_expire_after_ns)(self.timer, ns);
-      (api.timer_async_wait)(self.timer, Some(timer_on_timer::<T>), args);
+      (api.timer_expire_after_ns.unwrap())(self.timer, ns);
+      (api.timer_async_wait.unwrap())(self.timer, Some(timer_on_timer::<T>), args);
     }
   }
   pub fn sleep(&self, duration: Duration) -> SimpleFuture<(), ErrorCode> {
@@ -1781,7 +1781,7 @@ impl Drop for Timer {
   fn drop(&mut self) {
     unsafe {
       println!("drop {:?} {:?}", self.api, self.timer);
-      ((&(*self.api.raw)).timer_destroy)(self.timer);
+      ((&(*self.api.raw)).timer_destroy.unwrap())(self.timer);
     }
   }
 }
@@ -1795,7 +1795,7 @@ unsafe impl Send for PredropToken {}
 impl PredropToken {
   pub fn ready(&self) {
     unsafe {
-      ((&(*self.api)).node_predrop_ready)(self.node);
+      ((&(*self.api)).node_predrop_ready.unwrap())(self.node);
     }
   }
 }
@@ -1912,8 +1912,9 @@ pub static OPERATION_ABORTED: OnceLock<i32> = OnceLock::<i32>::new();
 
 pub fn setup(api_raw: *mut ThalamusAPIRaw) {
   unsafe {
+    (*api_raw).sanitize();
     let api = &*api_raw;
-    OPERATION_ABORTED.set((api.error_code_operation_aborted)())
+    OPERATION_ABORTED.set((api.error_code_operation_aborted.unwrap())())
       .expect("Failed to initialize constant: OPERATION_ABORTED");
   }
 }
