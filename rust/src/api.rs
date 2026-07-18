@@ -3,7 +3,6 @@ use core::slice;
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::ptr::null;
 use std::rc::Rc;
@@ -48,6 +47,7 @@ unsafe impl<T> Send for MainThreadOnly<T> {}
 impl<T> MainThreadOnly<T> {
   pub fn new(value: T, _token: MainThreadToken) -> Self { Self { value } }
   pub fn get(&self, _token: MainThreadToken) -> &T { &self.value }
+  pub fn take(self, _token: MainThreadToken) -> T { self.value }
 }
 
 struct PostArgs<T> {
@@ -97,13 +97,6 @@ impl ExtNode {
       api, node
     }
   }
-  pub fn time(&self) -> Duration {
-    let ns = unsafe {
-      ((*self.node).time_ns).unwrap()(self.node)
-    };
-    Duration::from_nanos(ns)
-  }
-
   pub fn subscribe<T: FnMut(ExtNode) + 'static>(&self, callback: T) -> OnDrop {
     let call_ptr = Box::into_raw(Box::new(NodeReadyArgs {
       api: self.api,
@@ -151,30 +144,12 @@ impl ExtNode {
     if analog.is_null() {
       None
     } else {
-      Some(ExtAnalogNode { node: self, analog })
+      Some(ExtAnalogNode { node: self })
     }
   }
 
-  pub fn image<'a>(&'a self) -> Option<ExtImageNode<'a>> {
-    let image = unsafe {
-      (*self.node).image
-    };
-    if image.is_null() {
-      None
-    } else {
-      Some(ExtImageNode { node: self, image })
-    }
-  }
-
-  pub fn mocap<'a>(&'a self) -> Option<ExtMocapNode<'a>> {
-    let mocap = unsafe {
-      (*self.node).mocap
-    };
-    if mocap.is_null() {
-      None
-    } else {
-      Some(ExtMocapNode { node: self, mocap })
-    }
+  pub fn data(&self) -> ExtNodeData<'_> {
+    ExtNodeData { node: self }
   }
 
   pub fn state(&self) -> State {
@@ -196,11 +171,10 @@ impl Drop for ExtNode {
 
 pub struct ExtAnalogNode<'a> {
   node: &'a ExtNode,
-  analog: *mut ThalamusAnalogNode,
 }
 
 impl<'a> ExtAnalogNode<'a> {
-  pub fn subscribe_channels_changed<T: FnMut(ExtNode) + 'static>(&self, callback: T) -> OnDrop {
+  pub fn subscribe_analog_channels_changed<T: FnMut(ExtNode) + 'static>(&self, callback: T) -> OnDrop {
     let call_ptr = Box::into_raw(Box::new(NodeReadyArgs {
       api: self.node.api,
       callback
@@ -219,138 +193,162 @@ impl<'a> ExtAnalogNode<'a> {
     };
     OnDrop { action: Box::new(cleanup) }
   }
+}
 
-  pub fn data(
-      &self,
-      channel: i32) -> &[f64] {
+pub struct ExtNodeData<'a> {
+  node: &'a ExtNode,
+}
+
+impl<'a> NodeData for ExtNodeData<'a> {
+  fn time(&self) -> Duration {
+    let ns = unsafe {
+      ((*self.node.node).time_ns).unwrap()(self.node.node)
+    };
+    Duration::from_nanos(ns)
+  }
+
+  fn analog(&self) -> Option<&dyn AnalogData> {
+    let analog = unsafe { (*self.node.node).analog };
+    if analog.is_null() { None } else { Some(self) }
+  }
+
+  fn image(&self) -> Option<&dyn ImageData> {
+    let image = unsafe { (*self.node.node).image };
+    if image.is_null() { None } else { Some(self) }
+  }
+
+  fn mocap(&self) -> Option<&dyn MocapData> {
+    let mocap = unsafe { (*self.node.node).mocap };
+    if mocap.is_null() { None } else { Some(self) }
+  }
+}
+
+impl<'a> AnalogData for ExtNodeData<'a> {
+  fn data(&self, channel: i32) -> &[f64] {
     let mut span = ThalamusDoubleSpan { data : null(), size: 0 };
     unsafe {
-      let data = (*self.analog).data.unwrap();
+      let analog = (*self.node.node).analog;
+      let data = (*analog).data.unwrap();
       data(&mut span as *mut ThalamusDoubleSpan, self.node.node, channel);
       std::slice::from_raw_parts(span.data, span.size as usize)
     }
   }
 
-  pub fn short_data(
-          &self,
-          channel: i32) -> &[i16] {
+  fn short_data(&self, channel: i32) -> &[i16] {
     let mut span = ThalamusShortSpan { data : null(), size: 0 };
     unsafe {
-      let data = (*self.analog).short_data.unwrap();
+      let analog = (*self.node.node).analog;
+      let data = (*analog).short_data.unwrap();
       data(&mut span as *mut ThalamusShortSpan, self.node.node, channel);
       std::slice::from_raw_parts(span.data, span.size as usize)
     }
   }
 
-  pub fn int_data(
-          &self,
-          channel: i32) -> &[i32] {
+  fn int_data(&self, channel: i32) -> &[i32] {
     let mut span = ThalamusIntSpan { data : null(), size: 0 };
     unsafe {
-      let data = (*self.analog).int_data.unwrap();
+      let analog = (*self.node.node).analog;
+      let data = (*analog).int_data.unwrap();
       data(&mut span as *mut ThalamusIntSpan, self.node.node, channel);
       std::slice::from_raw_parts(span.data, span.size as usize)
     }
   }
-  pub fn ulong_data(
-          &self,
-          channel: i32,
-  ) -> &'a [u64] {
+
+  fn ulong_data(&self, channel: i32) -> &[u64] {
     let mut span = ThalamusULongSpan { data : null(), size: 0 };
     unsafe {
-      let data = (*self.analog).ulong_data.unwrap();
+      let analog = (*self.node.node).analog;
+      let data = (*analog).ulong_data.unwrap();
       data(&mut span as *mut ThalamusULongSpan, self.node.node, channel);
       std::slice::from_raw_parts(span.data, span.size as usize)
     }
   }
 
-  pub fn num_channels(&self) -> i32 {
+  fn num_channels(&self) -> i32 {
     unsafe {
-      let num_channels = (*self.analog).num_channels.unwrap();
+      let analog = (*self.node.node).analog;
+      let num_channels = (*analog).num_channels.unwrap();
       num_channels(self.node.node)
     }
   }
-  pub fn sample_interval(&self, channel: i32) -> Duration {
+  fn sample_interval(&self, channel: i32) -> Duration {
     unsafe {
-      let sample_interval_ns = (*self.analog).sample_interval_ns.unwrap();
+      let analog = (*self.node.node).analog;
+      let sample_interval_ns = (*analog).sample_interval_ns.unwrap();
       Duration::from_nanos(sample_interval_ns(self.node.node, channel))
     }
   }
-  pub fn name(
-          &self,
-          channel: i32) -> &str {
+  fn name(&self, channel: i32) -> &str {
     let mut span = ThalamusByteSpan { data : null(), size: 0 };
     unsafe {
-      let name_func = (*self.analog).name.unwrap();
+      let analog = (*self.node.node).analog;
+      let name_func = (*analog).name.unwrap();
       name_func(&mut span as *mut ThalamusByteSpan, self.node.node, channel);
       let slice = std::slice::from_raw_parts(span.data, span.size as usize);
       std::str::from_utf8(slice).unwrap()
     }
   }
-  pub fn has_analog_data(&self) -> bool {
+  fn is_short_data(&self) -> bool {
     unsafe {
-      ((*self.analog).has_analog_data.unwrap())(self.node.node) != 0
+      let analog = (*self.node.node).analog;
+      ((*analog).is_short_data.unwrap())(self.node.node) != 0
     }
   }
-  pub fn is_short_data(&self) -> bool {
+  fn is_int_data(&self) -> bool {
     unsafe {
-      ((*self.analog).is_short_data.unwrap())(self.node.node) != 0
+      let analog = (*self.node.node).analog;
+      ((*analog).is_int_data.unwrap())(self.node.node) != 0
     }
   }
-  pub fn is_int_data(&self) -> bool {
+  fn is_ulong_data(&self) -> bool {
     unsafe {
-      ((*self.analog).is_int_data.unwrap())(self.node.node) != 0
+      let analog = (*self.node.node).analog;
+      ((*analog).is_ulong_data.unwrap())(self.node.node) != 0
     }
   }
-  pub fn is_ulong_data(&self) -> bool {
+  fn is_transformed(&self) -> bool {
     unsafe {
-      ((*self.analog).is_ulong_data.unwrap())(self.node.node) != 0
+      let analog = (*self.node.node).analog;
+      ((*analog).is_transformed.unwrap())(self.node.node) != 0
     }
   }
-  pub fn is_transformed(&self) -> bool {
+  fn scale(&self, channel: i32) -> f64 {
     unsafe {
-      ((*self.analog).is_transformed.unwrap())(self.node.node) != 0
+      let analog = (*self.node.node).analog;
+      ((*analog).scale.unwrap())(self.node.node, channel)
     }
   }
-  pub fn scale(&self, channel: i32) -> f64 {
+  fn offset(&self, channel: i32) -> f64 {
     unsafe {
-      ((*self.analog).scale.unwrap())(self.node.node, channel)
-    }
-  }
-  pub fn offset(&self, channel: i32) -> f64 {
-    unsafe {
-      ((*self.analog).offset.unwrap())(self.node.node, channel)
+      let analog = (*self.node.node).analog;
+      ((*analog).offset.unwrap())(self.node.node, channel)
     }
   }
 }
 
-pub struct ExtImageNode<'a> {
-  node: &'a ExtNode,
-  image: *mut ThalamusImageNode,
-}
-
-impl<'a> ExtImageNode<'a> {
-  pub fn plane(
-      &self,
-      channel: i32) -> &'a [u8] {
+impl<'a> ImageData for ExtNodeData<'a> {
+  fn plane(&self, channel: i32) -> &[u8] {
     let mut span = ThalamusByteSpan { data : null(), size: 0 };
     unsafe {
-      let plane = (*self.image).plane.unwrap();
+      let image = (*self.node.node).image;
+      let plane = (*image).plane.unwrap();
       plane(&mut span as *mut ThalamusByteSpan, self.node.node, channel);
       std::slice::from_raw_parts(span.data, span.size as usize)
     }
   }
 
-  pub fn num_planes(&self) -> u64 {
+  fn num_planes(&self) -> u64 {
     unsafe {
-      let num_planes = (*self.image).num_planes.unwrap();
+      let image = (*self.node.node).image;
+      let num_planes = (*image).num_planes.unwrap();
       num_planes(self.node.node)
     }
   }
 
-  pub fn format(&self) -> ImageFormat {
+  fn format(&self) -> ImageFormat {
     unsafe {
-      let format = (*self.image).format.unwrap();
+      let image = (*self.node.node).image;
+      let format = (*image).format.unwrap();
       match format(self.node.node) {
         ThalamusImageFormat::Gray => ImageFormat::Gray,
         ThalamusImageFormat::RGB => ImageFormat::RGB,
@@ -361,63 +359,50 @@ impl<'a> ExtImageNode<'a> {
     }
   }
 
-  pub fn width(&self) -> u64 {
+  fn width(&self) -> u64 {
     unsafe {
-      let width = (*self.image).width.unwrap();
+      let image = (*self.node.node).image;
+      let width = (*image).width.unwrap();
       width(self.node.node)
     }
   }
 
-  pub fn height(&self) -> u64 {
+  fn height(&self) -> u64 {
     unsafe {
-      let height = (*self.image).height.unwrap();
+      let image = (*self.node.node).image;
+      let height = (*image).height.unwrap();
       height(self.node.node)
     }
   }
 
-  pub fn frame_interval(&self) -> Duration {
+  fn frame_interval(&self) -> Duration {
     unsafe {
-      let frame_interval_ns = (*self.image).frame_interval_ns.unwrap();
+      let image = (*self.node.node).image;
+      let frame_interval_ns = (*image).frame_interval_ns.unwrap();
       Duration::from_nanos(frame_interval_ns(self.node.node))
     }
   }
-
-  pub fn has_image_data(&self) -> bool {
-    unsafe {
-      ((*self.image).has_image_data.unwrap())(self.node.node) != 0
-    }
-  }
 }
 
-pub struct ExtMocapNode<'a> {
-  node: &'a ExtNode,
-  mocap: *mut ThalamusMocapNode,
-}
-
-impl<'a> ExtMocapNode<'a> {
-  pub fn segments(
-      &self) -> &[ThalamusMocapSegment] {
+impl<'a> MocapData for ExtNodeData<'a> {
+  fn segments(&self) -> &[ThalamusMocapSegment] {
     let mut span = ThalamusMocapSegmentSpan { data : null(), size: 0 };
     unsafe {
-      let segments = (*self.mocap).segments.unwrap();
+      let mocap = (*self.node.node).mocap;
+      let segments = (*mocap).segments.unwrap();
       segments(&mut span as *mut ThalamusMocapSegmentSpan, self.node.node);
       std::slice::from_raw_parts(span.data, span.size as usize)
     }
   }
 
-  pub fn pose_name(&self) -> &str {
+  fn pose_name(&self) -> &str {
     let mut span = ThalamusCharSpan { data : null(), size: 0, owns_data: 0 };
     unsafe {
-      let pose_name = (*self.mocap).pose_name.unwrap();
+      let mocap = (*self.node.node).mocap;
+      let pose_name = (*mocap).pose_name.unwrap();
       pose_name(&mut span as *mut ThalamusCharSpan, self.node.node);
       let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap()
-    }
-  }
-
-  pub fn has_motion_data(&self) -> bool {
-    unsafe {
-      ((*self.mocap).has_motion_data.unwrap())(self.node.node) != 0
     }
   }
 }
@@ -505,10 +490,18 @@ impl ThalamusAPIThreadSafe {
     ThalamusAPI{raw: self.raw}
   }
 
-  pub fn ready_offmain(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
+  pub fn ready_offmain(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
       let node_ready_offmain = (&*self.raw).node_ready_offmain;
+      let plugin_impl = plugin_impl_ptr(node);
+      // SAFETY: data is only read back synchronously inside node_ready_offmain,
+      // which returns before this function does, so the erased lifetime never
+      // outlives the real borrow.
+      let data: &'static dyn NodeData = std::mem::transmute(data);
+
+      (*plugin_impl).data = Some(data);
       node_ready_offmain(node);
+      (*plugin_impl).data = None;
     })
   }
 
@@ -563,10 +556,18 @@ impl ThalamusAPI {
     }
   }
 
-  pub fn ready(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
+  pub fn ready(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
       let node_ready = (&*self.raw).node_ready;
+      let plugin_impl = plugin_impl_ptr(node);
+      // SAFETY: data is only read back synchronously inside node_ready, which
+      // returns before this function does, so the erased lifetime never
+      // outlives the real borrow.
+      let data: &'static dyn NodeData = std::mem::transmute(data);
+
+      (*plugin_impl).data = Some(data);
       node_ready(node);
+      (*plugin_impl).data = None;
     })
   }
 
@@ -681,6 +682,55 @@ impl ThalamusAPI {
       //
       //drop(Box::from_raw(call_ptr));
     }
+  }
+
+  /// If `handle` is `Some` and not yet finished, joins it on a threadpool
+  /// thread (so the caller is never blocked waiting for it) and hops back to
+  /// the main thread to invoke `callback`. If `handle` is `None` or already
+  /// finished, the threadpool hop is skipped and `callback` runs immediately.
+  /// Useful when a background thread's completion handler needs to touch
+  /// non-Send, main-thread-only state (e.g. an `Rc<RefCell<..>>`).
+  ///
+  /// `token` proves this call itself is happening on the main thread; it's
+  /// what makes it sound to smuggle the non-Send `callback` through the
+  /// Send-bound post_to_* calls below.
+  ///
+  /// Returns a flag that starts out `true` and is set to `false` once
+  /// `callback` has finished running, so callers can poll completion.
+  pub fn join_then<T: Send + 'static, F: FnOnce() + 'static>(
+    &self,
+    handle: Option<std::thread::JoinHandle<T>>,
+    token: MainThreadToken,
+    callback: F,
+  ) -> Rc<RefCell<bool>> {
+    let running = Rc::new(RefCell::new(true));
+
+    match handle {
+      Some(h) if !h.is_finished() => {
+        let mt_api = self.thread_safe();
+        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), token);
+        mt_api.post_to_threadpool(move || {
+          let _ = h.join();
+          mt_api.post_to_main(move |token| {
+            let (callback, running) = wrapped.take(token);
+            callback();
+            *running.borrow_mut() = false;
+          });
+        });
+      }
+      Some(h) => {
+        // Already finished: no need to bounce through the threadpool.
+        let _ = h.join();
+        callback();
+        *running.borrow_mut() = false;
+      }
+      None => {
+        callback();
+        *running.borrow_mut() = false;
+      }
+    }
+
+    running
   }
 }
 
@@ -1751,14 +1801,14 @@ impl PredropToken {
 }
 
 pub trait Node {
-  fn time(&self) -> Duration;
   fn process(&self, handle: Request, request: Json);
-  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self;
-  fn prepare() -> bool { true }
-  fn cleanup() {}
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self where Self: Sized;
+  fn prepare() -> bool where Self: Sized { true }
+  fn cleanup() where Self: Sized {}
   fn predrop(&self, token: PredropToken) {
     token.ready()
   }
+  fn modalities(&self) -> u32 { 0 }
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {
@@ -1769,29 +1819,36 @@ pub trait Node {
 //  }
 //}
 
-pub trait AnalogNode {
+pub trait NodeData {
+  fn time(&self) -> Duration;
+  fn analog(&self) -> Option<&dyn AnalogData>;
+  fn image(&self) -> Option<&dyn ImageData>;
+  fn mocap(&self) -> Option<&dyn MocapData>;
+}
+
+pub trait AnalogData {
   fn data(
           &self,
           channel: i32,
-      ) -> impl Deref<Target = [f64]>;
+      ) -> &[f64];
 
-  fn short_data<'a>(
+  fn short_data(
           &self,
           _channel: i32,
-      ) -> &'a [i16] {
+      ) -> &[i16] {
         panic!("Unimplemented")
       }
 
-  fn int_data<'a>(
+  fn int_data(
           &self,
           _channel: i32,
-      ) -> &'a [i32] {
+      ) -> &[i32] {
         panic!("Unimplemented")
       }
-  fn ulong_data<'a>(
+  fn ulong_data(
           &self,
           _channel: i32,
-      ) -> &'a [u64] {
+      ) -> &[u64] {
         panic!("Unimplemented")
       }
 
@@ -1800,10 +1857,7 @@ pub trait AnalogNode {
   fn name(
           &self,
           channel: ::std::os::raw::c_int,
-      ) -> impl Deref<Target = str>;
-  fn has_analog_data(&self) -> bool{
-        true
-      }
+      ) -> &str;
   fn is_short_data(&self) -> bool{
         false
       }
@@ -1833,103 +1887,25 @@ pub enum ImageFormat {
     YUVJ420P,
 }
 
-pub trait ImageNode {
+pub trait ImageData {
   fn plane(
           &self,
           channel: i32,
-      ) -> impl Deref<Target = [u8]>;
+      ) -> &[u8];
   fn num_planes(&self) -> u64;
   fn format(&self) -> ImageFormat;
   fn width(&self) -> u64;
   fn height(&self) -> u64;
   fn frame_interval(&self) -> Duration;
-  fn has_image_data(&self) -> bool{ true }
 }
 
-pub trait MocapNode {
+pub trait MocapData {
   fn segments(
           &self,
-      ) -> impl Deref<Target = [ThalamusMocapSegment]>;
+      ) -> &[ThalamusMocapSegment];
   fn pose_name(
           &self,
-      ) -> impl Deref<Target = str>;
-
-  fn has_motion_data(&self) -> bool{ true }
-}
-
-pub trait DontWrapAnalog {
-  fn wrap_analog(&self, _: &mut ThalamusNode) {}
-}
-impl <T: crate::api::Node> DontWrapAnalog for &T {}
-
-pub trait WrapAnalog {
-  fn wrap_analog(&self, c_node: &mut ThalamusNode);
-}
-impl<T: crate::api::AnalogNode> WrapAnalog for T {
-  fn wrap_analog(&self, c_node: &mut ThalamusNode) {
-    println!("WrapAnalog");
-    c_node.analog = Box::into_raw(Box::new(ThalamusAnalogNode::new()));
-    unsafe {
-      (*c_node.analog).data = Some(c_node_analog_data::<T>);
-      (*c_node.analog).short_data = None;
-      (*c_node.analog).int_data = None;
-      (*c_node.analog).ulong_data = None;
-      (*c_node.analog).num_channels = Some(c_node_analog_num_channels::<T>);
-      (*c_node.analog).sample_interval_ns = Some(c_node_analog_sample_interval_ns::<T>);
-      (*c_node.analog).name = Some(c_node_analog_name::<T>);
-      (*c_node.analog).has_analog_data = Some(c_node_analog_has_analog_data::<T>);
-      (*c_node.analog).is_short_data = Some(c_node_analog_is_short_data::<T>);
-      (*c_node.analog).is_int_data = Some(c_node_analog_is_int_data::<T>);
-      (*c_node.analog).is_ulong_data = Some(c_node_analog_is_ulong_data::<T>);
-      (*c_node.analog).is_transformed = Some(c_node_analog_is_transformed::<T>);
-      (*c_node.analog).scale = Some(c_node_analog_scale::<T>);
-      (*c_node.analog).offset = Some(c_node_analog_offset::<T>);
-    }
-  }
-}
-
-pub trait DontWrapImage {
-  fn wrap_image(&self, _: &mut ThalamusNode) {}
-}
-impl <T: crate::api::Node> DontWrapImage for &T {}
-
-pub trait WrapImage {
-  fn wrap_image(&self, c_node: &mut ThalamusNode);
-}
-impl<T: crate::api::ImageNode> WrapImage for T {
-  fn wrap_image(&self, c_node: &mut ThalamusNode) {
-    println!("WrapImage");
-    c_node.image = Box::into_raw(Box::new(ThalamusImageNode::new()));
-    unsafe {
-      (*c_node.image).plane = Some(c_node_image_plane::<T>);
-      (*c_node.image).num_planes = Some(c_node_image_num_planes::<T>);
-      (*c_node.image).format = Some(c_node_image_format::<T>);
-      (*c_node.image).width = Some(c_node_image_width::<T>);
-      (*c_node.image).height = Some(c_node_image_height::<T>);
-      (*c_node.image).frame_interval_ns = Some(c_node_image_frame_interval_ns::<T>);
-      (*c_node.image).has_image_data = Some(c_node_image_has_image_data::<T>);
-    }
-  }
-}
-
-pub trait DontWrapMocap {
-  fn wrap_mocap(&self, _: &mut ThalamusNode) {}
-}
-impl <T: crate::api::Node> DontWrapMocap for &T {}
-
-pub trait WrapMocap {
-  fn wrap_mocap(&self, c_node: &mut ThalamusNode);
-}
-impl<T: crate::api::MocapNode> WrapMocap for T {
-  fn wrap_mocap(&self, c_node: &mut ThalamusNode) {
-    println!("WrapMocap");
-    c_node.mocap = Box::into_raw(Box::new(ThalamusMocapNode::new()));
-    unsafe {
-      (*c_node.mocap).segments = Some(c_node_mocap_segments::<T>);
-      (*c_node.mocap).pose_name = Some(c_node_mocap_pose_name::<T>);
-      (*c_node.mocap).has_motion_data = Some(c_node_mocap_has_motion_data::<T>);
-    }
-  }
+      ) -> &str;
 }
 
 pub static OPERATION_ABORTED: OnceLock<i32> = OnceLock::<i32>::new();
@@ -1948,28 +1924,10 @@ macro_rules! export_nodes {
 
 #[allow(unused_imports)]
 use $crate::api::{
-  DontWrapAnalog,
-  WrapAnalog,
-  DontWrapImage,
-  WrapImage,
-  DontWrapMocap,
-  WrapMocap,
   ThalamusNode,
   ThalamusAPIRaw,
-  WrappableNode,
   ThalamusNodeFactory,
 };
-
-  $(
-impl WrappableNode for $type {
-  fn wrap(&self, c_node: &mut ThalamusNode) {
-    self.wrap_analog(c_node);
-    self.wrap_image(c_node);
-    self.wrap_mocap(c_node);
-  }
-}
-  )*
-
 
 #[unsafe(no_mangle)]
 pub extern "C" fn get_node_factories(api: *mut ThalamusAPIRaw) -> *const *const ThalamusNodeFactory {
