@@ -16,11 +16,51 @@ class CustomBuildHook(BuildHookInterface):
     if self.target_name == 'sdist':
       return
     #print('files', pprint.pformat(list(pathlib.Path.cwd().rglob('*'))), file=sys.stderr)
+
+    pprint.pprint({k: v for k, v in os.environ.items() if k.startswith('THALAMUS_')})
     
     debug = os.environ.get('THALAMUS_DEBUG', 'OFF') == 'ON'
     vv = os.environ.get('THALAMUS_VV', 'OFF') == 'ON'
+    do_config = os.environ.get('THALAMUS_CONFIG', 'OFF') == 'ON'
+
+    default_parallel = str(os.cpu_count())
+    parallel = os.environ.get('THALAMUS_JOB', default_parallel)
+    is_android = False
 
     print('debug', debug)
+    build_path = pathlib.Path.cwd() / 'build' / f'{"android-" if is_android else ""}{"debug" if debug else "release"}'
+    osx_target = '12.0'
+
+    cmake_command = [
+      'cmake',
+      '-S', pathlib.Path.cwd(),
+      '-B', build_path,
+      f'-DCMAKE_BUILD_TYPE={"Debug" if debug else "Release"}',
+      '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+      '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
+      f'-DCMAKE_OSX_DEPLOYMENT_TARGET={osx_target}',
+      '-DCMAKE_C_COMPILER=clang',
+      '-DCMAKE_CXX_COMPILER=clang++',
+      '-DCMAKE_LINKER=clang',
+      '-DCMAKE_MAKE_PROGRAM=' + shutil.which('ninja'),
+      '-G', 'Ninja',
+    ]
+
+    if platform.system() == 'Linux':
+      cmake_command += ['-DCMAKE_LIBRARY_ARCHITECTURE=x86_64-linux-gnu']
+
+    cmake_command = [str(c) for c in cmake_command]
+    print(cmake_command)
+    if not (build_path / 'CMakeCache.txt').exists() or do_config:
+      subprocess.check_call(cmake_command)
+    #shutil.copy(build_path / 'compile_commands.json', 'compile_commands.json')
+    
+    command = ['cmake', '--build', build_path, '--config', "Debug" if debug else "Release", '--parallel', parallel]
+
+    command = [str(c) for c in command]
+    print(command)
+    subprocess.check_call(command)
+    return
 
     rust_dir = pathlib.Path(self.root) / "rust"
     cargo_command = ['cargo', 'build']
