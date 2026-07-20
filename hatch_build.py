@@ -60,7 +60,6 @@ class CustomBuildHook(BuildHookInterface):
     command = [str(c) for c in command]
     print(command)
     subprocess.check_call(command)
-    return
 
     rust_dir = pathlib.Path(self.root) / "rust"
     cargo_command = ['cargo', 'build']
@@ -68,7 +67,11 @@ class CustomBuildHook(BuildHookInterface):
       cargo_command += ['--release']
     if vv:
       cargo_command += ['-vv']
+
+    ffmpeg_install = build_path / '_deps' / 'ffmpeg-build' / ("Debug" if debug else "Release") / 'install'
     cargo_env = dict(os.environ)
+    cargo_env['FFMPEG_DIR'] = str(ffmpeg_install)
+    cargo_env['PKG_CONFIG_PATH'] = str(ffmpeg_install / 'lib' / 'pkgconfig')
 
     print('cargo_command', cargo_command)
     subprocess.run(cargo_command, cwd=rust_dir, check=True, env=cargo_env)

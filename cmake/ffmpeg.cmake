@@ -16,7 +16,7 @@ endif()
 if(WIN32)
   list(APPEND FFMPEG_EXTRA_FLAGS --target-os=win64 --arch=x86_64)
 else()
-  list(APPEND FFMPEG_EXTRA_FLAGS --disable-sndio)
+  list(APPEND FFMPEG_EXTRA_FLAGS --disable-sndio --enable-pic --enable-openssl)
 endif()
 
 if(WIN32)
