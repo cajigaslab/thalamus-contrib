@@ -1,5 +1,8 @@
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::os::raw::{c_char, c_int, c_void};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
 
 use ffmpeg_sys_next as ffi;
@@ -22,6 +25,21 @@ fn input_format_name() -> &'static str {
   }
 }
 
+// avdevice_list_input_sources gives back the bare device name/path, but
+// dshow's read_header (parse_device_name in dshow.c) requires the
+// avformat_open_input filename to be "video=<name>" -- passing the bare name
+// trips its strtok(url, "=") parsing and fails with "Malformed dshow input
+// string." v4l2 (a plain path like /dev/video0) and avfoundation (which
+// just av_strdup()s the url as-is in its own parse_device_name) both take
+// the bare name directly.
+fn device_url(device_name: &str) -> String {
+  if cfg!(target_os = "windows") {
+    format!("video={}", device_name)
+  } else {
+    device_name.to_string()
+  }
+}
+
 // Some devices (e.g. a webcam's separate metadata/UVC-extension node) show up
 // in avdevice_list_input_sources with the same description as the camera's
 // real capture node, but don't actually produce a video stream. Filter those
@@ -33,7 +51,7 @@ fn input_format_name() -> &'static str {
 // would needlessly start the device's capture pipeline (queue buffers, stream
 // on) just to immediately tear it down again.
 fn has_video_stream(input_fmt: *const ffi::AVInputFormat, device_name: &str) -> bool {
-  let Ok(device_cstr) = CString::new(device_name) else {
+  let Ok(device_cstr) = CString::new(device_url(device_name)) else {
     return false;
   };
   let mut fmt_ctx: *mut ffi::AVFormatContext = std::ptr::null_mut();
@@ -123,6 +141,167 @@ pub fn list_cameras() -> Vec<CameraInfo> {
   unsafe { ffi::avdevice_free_list_devices(&mut device_list) };
 
   cameras
+}
+
+unsafe extern "C" {
+  fn vsnprintf(buf: *mut c_char, size: usize, fmt: *const c_char, args: ffi::va_list) -> c_int;
+}
+
+// Accumulates messages logged (at or above PROBE_LOG_LEVEL) during a
+// probe_resolution()/list_formats() call, e.g. dshow's "Could not set video
+// options" or its list_options format dump -- far more actionable than the
+// generic errno string avformat_open_input's return code decodes to.
+static PROBE_LOG: Mutex<String> = Mutex::new(String::new());
+static PROBE_LOG_LEVEL: AtomicI32 = AtomicI32::new(ffi::AV_LOG_ERROR);
+// av_log_set_callback is process-global, so serialize probes against each
+// other to keep one probe's messages from bleeding into another's.
+static PROBE_GUARD: Mutex<()> = Mutex::new(());
+
+unsafe extern "C" fn probe_log_callback(
+  _avcl: *mut c_void,
+  level: c_int,
+  fmt: *const c_char,
+  args: ffi::va_list,
+) {
+  if level > PROBE_LOG_LEVEL.load(Ordering::Relaxed) {
+    return;
+  }
+  let mut buf = [0 as c_char; 512];
+  let n = unsafe { vsnprintf(buf.as_mut_ptr(), buf.len(), fmt, args) };
+  if n <= 0 {
+    return;
+  }
+  let len = (n as usize).min(buf.len() - 1);
+  let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, len) };
+  if let Ok(mut log) = PROBE_LOG.lock() {
+    log.push_str(&String::from_utf8_lossy(bytes));
+  }
+}
+
+fn av_error_string(ret: i32) -> String {
+  let mut buf = [0 as c_char; ffi::AV_ERROR_MAX_STRING_SIZE];
+  let rc = unsafe { ffi::av_strerror(ret, buf.as_mut_ptr(), buf.len()) };
+  if rc == 0 {
+    unsafe { CStr::from_ptr(buf.as_ptr()) }
+      .to_string_lossy()
+      .to_string()
+  } else {
+    format!("error code {}", ret)
+  }
+}
+
+// Briefly opens the device requesting the given resolution, then closes it
+// again. There's no capability-query API in this FFmpeg version (removed
+// upstream between 5.1 and 6.1), so "does the device support this
+// resolution" can only be answered by trying it and seeing whether the
+// driver accepts it.
+pub fn probe_resolution(device_name: &str, width: i32, height: i32) -> Result<(), String> {
+  let _guard = PROBE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+  unsafe { ffi::avdevice_register_all() };
+
+  let format_name = CString::new(input_format_name()).unwrap();
+  let input_fmt = unsafe { ffi::av_find_input_format(format_name.as_ptr()) };
+  if input_fmt.is_null() {
+    return Err(format!("input format '{}' not found", input_format_name()));
+  }
+
+  let device_cstr = CString::new(device_url(device_name)).map_err(|e| e.to_string())?;
+
+  let mut options: *mut ffi::AVDictionary = std::ptr::null_mut();
+  let video_size_key = CString::new("video_size").unwrap();
+  let video_size_val = CString::new(format!("{}x{}", width, height)).unwrap();
+  unsafe {
+    ffi::av_dict_set(
+      &mut options,
+      video_size_key.as_ptr(),
+      video_size_val.as_ptr(),
+      0,
+    );
+  }
+
+  *PROBE_LOG.lock().unwrap() = String::new();
+  PROBE_LOG_LEVEL.store(ffi::AV_LOG_ERROR, Ordering::Relaxed);
+  unsafe { ffi::av_log_set_callback(Some(probe_log_callback)) };
+
+  let mut fmt_ctx: *mut ffi::AVFormatContext = std::ptr::null_mut();
+  let ret = unsafe {
+    ffi::avformat_open_input(&mut fmt_ctx, device_cstr.as_ptr(), input_fmt, &mut options)
+  };
+  unsafe { ffi::av_dict_free(&mut options) };
+  unsafe { ffi::av_log_set_callback(Some(ffi::av_log_default_callback)) };
+
+  if ret >= 0 && !fmt_ctx.is_null() {
+    unsafe { ffi::avformat_close_input(&mut fmt_ctx) };
+    return Ok(());
+  }
+
+  let captured = PROBE_LOG.lock().unwrap().trim().to_string();
+  if !captured.is_empty() {
+    Err(captured)
+  } else {
+    Err(av_error_string(ret))
+  }
+}
+
+// Opens the device with its "dump every supported mode" debug option set
+// (dshow: list_options, v4l2: list_formats=all) so the driver logs each
+// pixel format / resolution / frame-rate combination it supports, and
+// returns that dump as text. This is the same information `ffmpeg -f dshow
+// -list_options true -i ...` prints on the CLI -- there's no structured
+// capability-query API to pull it from instead (see probe_resolution).
+// avfoundation has no equivalent listing option.
+pub fn list_formats(device_name: &str) -> Result<String, String> {
+  let _guard = PROBE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+
+  unsafe { ffi::avdevice_register_all() };
+
+  let format_name = CString::new(input_format_name()).unwrap();
+  let input_fmt = unsafe { ffi::av_find_input_format(format_name.as_ptr()) };
+  if input_fmt.is_null() {
+    return Err(format!("input format '{}' not found", input_format_name()));
+  }
+
+  let (opt_key, opt_val) = match input_format_name() {
+    "dshow" => ("list_options", "true"),
+    "v4l2" => ("list_formats", "all"),
+    other => return Err(format!("listing formats is not supported for '{}'", other)),
+  };
+
+  let device_cstr = CString::new(device_url(device_name)).map_err(|e| e.to_string())?;
+
+  let mut options: *mut ffi::AVDictionary = std::ptr::null_mut();
+  let opt_key_cstr = CString::new(opt_key).unwrap();
+  let opt_val_cstr = CString::new(opt_val).unwrap();
+  unsafe {
+    ffi::av_dict_set(&mut options, opt_key_cstr.as_ptr(), opt_val_cstr.as_ptr(), 0);
+  }
+
+  *PROBE_LOG.lock().unwrap() = String::new();
+  PROBE_LOG_LEVEL.store(ffi::AV_LOG_INFO, Ordering::Relaxed);
+  unsafe { ffi::av_log_set_callback(Some(probe_log_callback)) };
+
+  let mut fmt_ctx: *mut ffi::AVFormatContext = std::ptr::null_mut();
+  let ret = unsafe {
+    ffi::avformat_open_input(&mut fmt_ctx, device_cstr.as_ptr(), input_fmt, &mut options)
+  };
+  unsafe { ffi::av_dict_free(&mut options) };
+  unsafe { ffi::av_log_set_callback(Some(ffi::av_log_default_callback)) };
+  PROBE_LOG_LEVEL.store(ffi::AV_LOG_ERROR, Ordering::Relaxed);
+
+  if !fmt_ctx.is_null() {
+    unsafe { ffi::avformat_close_input(&mut fmt_ctx) };
+  }
+
+  // list_options/list_formats deliberately abort the open after printing
+  // (dshow returns AVERROR_EXIT), so a negative ret here is expected, not a
+  // real failure -- only treat it as an error if nothing was captured.
+  let captured = PROBE_LOG.lock().unwrap().trim().to_string();
+  if !captured.is_empty() {
+    Ok(captured)
+  } else {
+    Err(av_error_string(ret))
+  }
 }
 
 // Per-plane (row_bytes, rows), tightly packed (no linesize padding).
@@ -232,7 +411,7 @@ pub struct WebcamCapture {
 }
 
 impl WebcamCapture {
-  pub fn open(device_name: &str) -> Result<Self, String> {
+  pub fn open(device_name: &str, width: u32, height: u32) -> Result<Self, String> {
     unsafe { ffi::avdevice_register_all() };
 
     let format_name = CString::new(input_format_name()).unwrap();
@@ -241,17 +420,17 @@ impl WebcamCapture {
       return Err(format!("input format '{}' not found", input_format_name()));
     }
 
-    let device_cstr = CString::new(device_name).map_err(|e| e.to_string())?;
+    let device_cstr = CString::new(device_url(device_name)).map_err(|e| e.to_string())?;
 
     // Without an explicit request, v4l2 just inherits whatever mode the
     // device is currently sitting in (e.g. a prior session/tool may have
     // left it at a high-res/uncompressed/low-fps combination), which can
-    // silently cap the achievable frame rate. Request a resolution/rate
-    // known to support 30fps instead of trusting the device's current
+    // silently cap the achievable frame rate. Request the caller's
+    // resolution and a 30fps rate instead of trusting the device's current
     // state.
     let mut options: *mut ffi::AVDictionary = std::ptr::null_mut();
     let video_size_key = CString::new("video_size").unwrap();
-    let video_size_val = CString::new("640x480").unwrap();
+    let video_size_val = CString::new(format!("{}x{}", width, height)).unwrap();
     let framerate_key = CString::new("framerate").unwrap();
     let framerate_val = CString::new("30").unwrap();
     unsafe {

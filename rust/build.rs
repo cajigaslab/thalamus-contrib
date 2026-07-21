@@ -5,7 +5,7 @@ fn main() {
     "windows" => {
       for lib in [
         "Ws2_32", "Secur32", "Bcrypt", "Mfplat", "Ole32", "User32", "dxguid", "uuid", "Mfuuid",
-        "strmiids", "Kernel32", "Psapi",
+        "strmiids", "Kernel32", "Psapi", "Gdi32", "Vfw32", "OleAut32", "Shlwapi", "oldnames"
       ] {
         println!("cargo:rustc-link-lib=dylib={}", lib);
       }

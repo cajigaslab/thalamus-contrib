@@ -1,7 +1,7 @@
 FetchContent_Declare(
   ffmpeg 
   GIT_REPOSITORY https://github.com/FFmpeg/FFmpeg.git
-  GIT_TAG        n6.1
+  GIT_TAG        n8.1.2
 )
 FetchContent_MakeAvailable(ffmpeg)
 file(MAKE_DIRECTORY "${ffmpeg_BINARY_DIR}/Debug/Modules")

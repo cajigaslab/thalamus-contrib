@@ -7,9 +7,30 @@ use crate::api::{
   Json, MainThreadToken, Node, NodeToken, OnDrop, PredropToken, Request, State, StateAction,
   StateKey, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI, ThalamusAPIThreadSafe,
 };
-use crate::ffmpeg_devices::{CameraInfo, WebcamCapture, list_cameras};
+use crate::ffmpeg_devices::{CameraInfo, WebcamCapture, list_cameras, list_formats, probe_resolution};
 
 static CAMERAS: OnceLock<Vec<CameraInfo>> = OnceLock::new();
+
+const DEFAULT_WIDTH: u32 = 640;
+const DEFAULT_HEIGHT: u32 = 480;
+
+fn selected_device_name(state: &State) -> Option<String> {
+  let selected = state.get(StateKey::String("Camera".to_string()));
+  match selected {
+    Some(StateValue::String(description)) => CAMERAS
+      .get()
+      .and_then(|cameras| cameras.iter().find(|c| c.description == description))
+      .map(|c| c.device_name.clone()),
+    _ => None,
+  }
+}
+
+fn state_get_u32(state: &State, key: &str) -> Option<u32> {
+  match state.get(StateKey::String(key.to_string())) {
+    Some(StateValue::Int(i)) if i > 0 => Some(i as u32),
+    _ => None,
+  }
+}
 
 struct WebcamNodeInner {
   api: ThalamusAPI,
@@ -36,17 +57,12 @@ fn start_capture(inner: &Rc<RefCell<WebcamNodeInner>>) {
 }
 
 fn start_capture_impl(inner: &Rc<RefCell<WebcamNodeInner>>) {
-  let (api, node_token, device_name) = {
+  let (api, node_token, device_name, width, height) = {
     let borrow = inner.borrow();
-    let selected = borrow.state.get(StateKey::String("Camera".to_string()));
-    let device_name = match selected {
-      Some(StateValue::String(description)) => CAMERAS
-        .get()
-        .and_then(|cameras| cameras.iter().find(|c| c.description == description))
-        .map(|c| c.device_name.clone()),
-      _ => None,
-    };
-    (borrow.api, borrow.node_token.clone(), device_name)
+    let device_name = selected_device_name(&borrow.state);
+    let width = state_get_u32(&borrow.state, "Width").unwrap_or(DEFAULT_WIDTH);
+    let height = state_get_u32(&borrow.state, "Height").unwrap_or(DEFAULT_HEIGHT);
+    (borrow.api, borrow.node_token.clone(), device_name, width, height)
   };
 
   let Some(device_name) = device_name else {
@@ -59,7 +75,7 @@ fn start_capture_impl(inner: &Rc<RefCell<WebcamNodeInner>>) {
 
   let mt_api = api.thread_safe();
   let handle = std::thread::spawn(move || {
-    run_capture(mt_api, node_token, stop_clone, device_name);
+    run_capture(mt_api, node_token, stop_clone, device_name, width, height);
   });
 
   let mut borrow = inner.borrow_mut();
@@ -88,8 +104,10 @@ fn run_capture(
   node_token: NodeToken,
   stop: Arc<AtomicBool>,
   device_name: String,
+  width: u32,
+  height: u32,
 ) {
-  let mut capture = match WebcamCapture::open(&device_name) {
+  let mut capture = match WebcamCapture::open(&device_name, width, height) {
     Ok(capture) => capture,
     Err(e) => {
       println!("WebcamNode: failed to open {}: {}", device_name, e);
@@ -127,6 +145,38 @@ impl Node for WebcamNode {
           .map(|c| serde_json::Value::String(c.description.clone()))
           .collect();
         serde_json::to_string_pretty(&cameras).unwrap()
+      }
+      Ok(serde_json::Value::String(s)) if s == "test_resolution" => {
+        let borrow = self.inner.borrow();
+        let device_name = selected_device_name(&borrow.state);
+        let width = state_get_u32(&borrow.state, "Width");
+        let height = state_get_u32(&borrow.state, "Height");
+        drop(borrow);
+
+        let formats = device_name.as_ref().and_then(|name| match list_formats(name) {
+          Ok(formats) => Some(formats),
+          Err(e) => {
+            println!("WebcamNode: could not list formats for {}: {}", name, e);
+            None
+          }
+        });
+
+        let result = match (&device_name, width, height) {
+          (None, _, _) => Err("no camera selected".to_string()),
+          (_, None, _) | (_, _, None) => Err("width and height must both be set".to_string()),
+          (Some(device_name), Some(width), Some(height)) => {
+            probe_resolution(device_name, width as i32, height as i32)
+          }
+        };
+
+        let mut response = match result {
+          Ok(()) => serde_json::json!({ "success": true }),
+          Err(error) => serde_json::json!({ "success": false, "error": error }),
+        };
+        if let Some(formats) = formats {
+          response["formats"] = serde_json::Value::String(formats);
+        }
+        response.to_string()
       }
       _ => "null".to_string(),
     };
