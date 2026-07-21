@@ -1,9 +1,28 @@
 use std::ffi::{CStr, CString};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use ffmpeg_sys_next as ffi;
+use skia_safe::{AlphaType, Color, ColorType, Font, FontMgr, ImageInfo, Paint, Point, Rect, surfaces};
 
 use crate::api::ImageFormat;
+
+// Bundled directly rather than relying on Font::default()'s system font
+// manager: FontMgr::default() finds the system's real font families fine,
+// but Font::default()'s typeface doesn't go through it and resolves to an
+// empty, zero-glyph stub here -- silently rendering no text at all instead
+// of erroring. See assets/DejaVuSans-LICENSE.txt.
+static OVERLAY_FONT_DATA: &[u8] = include_bytes!("../assets/DejaVuSans.ttf");
+
+fn overlay_font() -> &'static Font {
+  static FONT: OnceLock<Font> = OnceLock::new();
+  FONT.get_or_init(|| {
+    let typeface = FontMgr::new()
+      .new_from_data(OVERLAY_FONT_DATA, None)
+      .expect("bundled DejaVuSans.ttf should parse as a valid font");
+    Font::from_typeface(typeface, OVERLAY_FONT_SIZE)
+  })
+}
 
 // One decoded frame, copied out of a NodeData's borrowed planes so it can
 // cross a thread boundary to the publisher thread (see rtmps_node.rs).
@@ -52,6 +71,71 @@ fn duration_to_time_base(interval: Duration) -> ffi::AVRational {
     return ffi::AVRational { num: 1, den: 30 };
   }
   unsafe { ffi::av_d2q(interval.as_secs_f64(), 1_000_000) }
+}
+
+const OVERLAY_MARGIN: i32 = 10;
+const OVERLAY_FONT_SIZE: f32 = 24.0;
+const OVERLAY_PADDING: i32 = 8;
+
+// Draws `text` directly into the frame's Y (luma) plane: white text on a
+// translucent dark box, bottom-left corner. Wraps the plane's own bytes as
+// a Gray8 Skia surface (row bytes = the AVFrame's real linesize, which can
+// exceed width due to alignment padding) rather than rendering to a
+// separate buffer and compositing by hand -- Skia's normal SrcOver
+// blending already alpha-blends each draw against whatever's underneath,
+// which for a Gray8 destination *is* the actual video luma. Chroma is left
+// untouched, so the overlay reads as grayscale, a fine tradeoff for a small
+// corner timestamp.
+fn draw_overlay_text(frame: *mut ffi::AVFrame, text: &str) {
+  let frame_w = unsafe { (*frame).width };
+  let frame_h = unsafe { (*frame).height };
+  let linesize = unsafe { (*frame).linesize[0] };
+  let y_data = unsafe { (*frame).data[0] };
+  if frame_w <= 0 || frame_h <= 0 || linesize <= 0 || y_data.is_null() {
+    return;
+  }
+
+  let y_len = linesize as usize * frame_h as usize;
+  let y_plane = unsafe { std::slice::from_raw_parts_mut(y_data, y_len) };
+
+  let info = ImageInfo::new((frame_w, frame_h), ColorType::Gray8, AlphaType::Opaque, None);
+  let Some(mut surface) = surfaces::wrap_pixels(&info, y_plane, linesize as usize, None) else {
+    return;
+  };
+  let canvas = surface.canvas();
+
+  let font = overlay_font();
+  let mut text_paint = Paint::default();
+  text_paint.set_anti_alias(true);
+  text_paint.set_color(Color::WHITE);
+
+  let (advance, bounds) = font.measure_str(text, Some(&text_paint));
+  let box_w = (advance.ceil() as i32 + OVERLAY_PADDING * 2).min(frame_w);
+  let box_h = (bounds.height().ceil() as i32 + OVERLAY_PADDING * 2).min(frame_h);
+  if box_w <= 0 || box_h <= 0 {
+    return;
+  }
+
+  let box_x = OVERLAY_MARGIN as f32;
+  let box_y = (frame_h - OVERLAY_MARGIN - box_h) as f32;
+
+  let mut bg_paint = Paint::default();
+  bg_paint.set_anti_alias(true);
+  bg_paint.set_color(Color::from_argb(160, 0, 0, 0));
+  canvas.draw_rect(
+    Rect::from_xywh(box_x, box_y, box_w as f32, box_h as f32),
+    &bg_paint,
+  );
+
+  // bounds.top is negative (the ascent, measured above the baseline), so
+  // this places the glyphs' top edge OVERLAY_PADDING below the box's top.
+  let baseline_y = box_y + OVERLAY_PADDING as f32 - bounds.top;
+  canvas.draw_str(
+    text,
+    Point::new(box_x + OVERLAY_PADDING as f32, baseline_y),
+    font,
+    &text_paint,
+  );
 }
 
 const fn mktag(a: u8, b: u8, c: u8, d: u8) -> i32 {
@@ -316,6 +400,9 @@ impl RtmpsPublisher {
       (*self.frame).pts = pts;
     }
 
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    draw_overlay_text(self.frame, &now);
+
     self.encode_and_write(self.frame)
   }
 
@@ -370,6 +457,60 @@ impl Drop for RtmpsPublisher {
       }
       ffi::avcodec_free_context(&mut self.codec_ctx);
       ffi::avformat_free_context(self.fmt_ctx);
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use skia_safe::EncodedImageFormat;
+
+  // Renders the overlay onto a synthetic mid-gray frame and dumps the
+  // result to a PNG for visual inspection, to check whether draw_overlay_text
+  // is actually painting anything without needing the full RTMPS pipeline.
+  #[test]
+  fn overlay_smoke_test() {
+    unsafe {
+      let mut frame = ffi::av_frame_alloc();
+      (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+      (*frame).width = 320;
+      (*frame).height = 240;
+      let ret = ffi::av_frame_get_buffer(frame, 32);
+      assert!(ret >= 0, "av_frame_get_buffer failed: {}", ret);
+
+      let linesize = (*frame).linesize[0] as usize;
+      let height = (*frame).height as usize;
+      let width = (*frame).width as usize;
+      let y_data = (*frame).data[0];
+      std::ptr::write_bytes(y_data, 128, linesize * height);
+
+      draw_overlay_text(frame, "2026-07-20 12:34:56");
+
+      let info = ImageInfo::new(
+        ((*frame).width, (*frame).height),
+        ColorType::Gray8,
+        AlphaType::Opaque,
+        None,
+      );
+      let y_plane = std::slice::from_raw_parts_mut(y_data, linesize * height);
+      let mut surface = surfaces::wrap_pixels(&info, y_plane, linesize, None)
+        .expect("failed to wrap Y plane for snapshot");
+      let image = surface.image_snapshot();
+      let data = image
+        .encode(None, EncodedImageFormat::PNG, None)
+        .expect("PNG encode failed");
+
+      let path = std::env::temp_dir().join("rtmps_overlay_test.png");
+      std::fs::write(&path, data.as_bytes()).unwrap();
+      println!(
+        "wrote {} ({}x{})",
+        path.display(),
+        width,
+        height
+      );
+
+      ffi::av_frame_free(&mut frame);
     }
   }
 }
