@@ -366,6 +366,14 @@ thalamus_api_raw! {
 
     node_ready_offmain: unsafe extern "C" fn(arg1: *const ThalamusNode),
     node_predrop_ready: unsafe extern "C" fn(arg1: *const ThalamusNode),
+
+    get_vulkan_instance: unsafe extern "C" fn() -> VkInstance,
+    get_vulkan_device: unsafe extern "C" fn() -> VkDevice,
+    get_vulkan_physical_device: unsafe extern "C" fn() -> VkPhysicalDevice,
+    get_vulkan_queue: unsafe extern "C" fn() -> VkQueue,
+    create_vulkan_command_pool: unsafe extern "C" fn() -> VkCommandPool,
+    lock_vulkan_queue: unsafe extern "C" fn() -> *mut ThalamusVkQueueLock,
+    unlock_vulkan_queue: unsafe extern "C" fn(*mut ThalamusVkQueueLock),
 }
 
 #[repr(C)]
@@ -449,6 +457,47 @@ pub struct ThalamusIoContext {
 pub struct ThalamusNodeGraph {
     _unused: [u8; 0],
 }
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusVkQueueLock {
+    _unused: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkInstance_T {
+    _unused: [u8; 0],
+}
+pub type VkInstance = *mut VkInstance_T;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkPhysicalDevice_T {
+    _unused: [u8; 0],
+}
+pub type VkPhysicalDevice = *mut VkPhysicalDevice_T;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkDevice_T {
+    _unused: [u8; 0],
+}
+pub type VkDevice = *mut VkDevice_T;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkQueue_T {
+    _unused: [u8; 0],
+}
+pub type VkQueue = *mut VkQueue_T;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkCommandPool_T {
+    _unused: [u8; 0],
+}
+pub type VkCommandPool = *mut VkCommandPool_T;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ThalamusDoubleSpan {

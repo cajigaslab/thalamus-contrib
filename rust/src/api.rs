@@ -13,6 +13,7 @@ use std::{os::raw::c_void, sync::OnceLock};
 use std::time::Duration;
 
 use futures::future::FusedFuture;
+use ash::vk::Handle;
 
 pub use crate::ffi::{
   *
@@ -735,6 +736,103 @@ impl ThalamusAPI {
     }
 
     running
+  }
+
+  /// Raw handle to the VkInstance Thalamus already created. Thalamus owns it —
+  /// never destroy it from a plugin.
+  pub fn vulkan_instance_handle(&self) -> ash::vk::Instance {
+    unsafe {
+      let raw = ((&*self.raw).get_vulkan_instance.unwrap())();
+      ash::vk::Instance::from_raw(raw as u64)
+    }
+  }
+
+  pub fn vulkan_physical_device(&self) -> ash::vk::PhysicalDevice {
+    unsafe {
+      let raw = ((&*self.raw).get_vulkan_physical_device.unwrap())();
+      ash::vk::PhysicalDevice::from_raw(raw as u64)
+    }
+  }
+
+  /// Raw handle to the VkDevice Thalamus already created. Thalamus owns it —
+  /// never destroy it from a plugin.
+  pub fn vulkan_device_handle(&self) -> ash::vk::Device {
+    unsafe {
+      let raw = ((&*self.raw).get_vulkan_device.unwrap())();
+      ash::vk::Device::from_raw(raw as u64)
+    }
+  }
+
+  /// Loads instance-level Vulkan entry points for the VkInstance Thalamus
+  /// already created, so a plugin can call into it through `ash` without
+  /// creating its own instance. `entry` only needs to resolve
+  /// `vkGetInstanceProcAddr` (e.g. `unsafe { ash::Entry::load() }`).
+  ///
+  /// # Safety
+  /// The returned `ash::Instance` must not outlive the Thalamus process, and
+  /// callers must never call `destroy_instance` on it -- Thalamus owns the
+  /// underlying VkInstance.
+  pub unsafe fn load_vulkan_instance(&self, entry: &ash::Entry) -> ash::Instance {
+    unsafe { ash::Instance::load(entry.static_fn(), self.vulkan_instance_handle()) }
+  }
+
+  /// Loads device-level Vulkan entry points for the VkDevice Thalamus already
+  /// created.
+  ///
+  /// # Safety
+  /// The returned `ash::Device` must not outlive the Thalamus process, and
+  /// callers must never call `destroy_device` on it -- Thalamus owns the
+  /// underlying VkDevice.
+  pub unsafe fn load_vulkan_device(&self, instance: &ash::Instance) -> ash::Device {
+    unsafe { ash::Device::load(instance.fp_v1_0(), self.vulkan_device_handle()) }
+  }
+
+  /// Creates a new VkCommandPool on Thalamus's Vulkan device. Ownership
+  /// transfers to the caller, which is responsible for destroying it (e.g.
+  /// via `device.destroy_command_pool(pool, None)`) before the device goes
+  /// away.
+  pub fn create_vulkan_command_pool(&self) -> ash::vk::CommandPool {
+    unsafe {
+      let raw = ((&*self.raw).create_vulkan_command_pool.unwrap())();
+      ash::vk::CommandPool::from_raw(raw as u64)
+    }
+  }
+
+  /// Locks Thalamus's shared VkQueue for the duration of the returned guard.
+  /// Thalamus serializes all access to this queue -- it uses the same queue
+  /// for its own rendering -- so any `vkQueueSubmit`/`vkQueuePresentKHR`/etc.
+  /// must happen while holding this lock.
+  pub fn lock_vulkan_queue(&self) -> VulkanQueueGuard {
+    unsafe {
+      let raw = &*self.raw;
+      let lock = (raw.lock_vulkan_queue.unwrap())();
+      let queue = ash::vk::Queue::from_raw((raw.get_vulkan_queue.unwrap())() as u64);
+      VulkanQueueGuard { api: *self, lock, queue }
+    }
+  }
+}
+
+/// RAII guard holding Thalamus's shared VkQueue lock. Access `queue()` only
+/// while this guard is alive; dropping it releases the lock via
+/// `unlock_vulkan_queue`.
+pub struct VulkanQueueGuard {
+  api: ThalamusAPI,
+  lock: *mut ThalamusVkQueueLock,
+  queue: ash::vk::Queue,
+}
+unsafe impl Send for VulkanQueueGuard {}
+
+impl VulkanQueueGuard {
+  pub fn queue(&self) -> ash::vk::Queue {
+    self.queue
+  }
+}
+
+impl Drop for VulkanQueueGuard {
+  fn drop(&mut self) {
+    unsafe {
+      ((&*self.api.raw).unlock_vulkan_queue.unwrap())(self.lock);
+    }
   }
 }
 

@@ -143,8 +143,13 @@ pub fn list_cameras() -> Vec<CameraInfo> {
   cameras
 }
 
+// va_list decays to a pointer when used as a C function parameter (System V
+// x86-64 ABI), but ffi::va_list is the raw, non-decayed array typedef, and
+// Rust doesn't apply C's array-to-pointer decay -- so these declarations use
+// the decayed pointer type directly to match the real ABI these functions
+// expect.
 unsafe extern "C" {
-  fn vsnprintf(buf: *mut c_char, size: usize, fmt: *const c_char, args: ffi::va_list) -> c_int;
+  fn vsnprintf(buf: *mut c_char, size: usize, fmt: *const c_char, args: *mut ffi::__va_list_tag) -> c_int;
 }
 
 // Accumulates messages logged (at or above PROBE_LOG_LEVEL) during a
@@ -161,7 +166,7 @@ unsafe extern "C" fn probe_log_callback(
   _avcl: *mut c_void,
   level: c_int,
   fmt: *const c_char,
-  args: ffi::va_list,
+  args: *mut ffi::__va_list_tag,
 ) {
   if level > PROBE_LOG_LEVEL.load(Ordering::Relaxed) {
     return;
