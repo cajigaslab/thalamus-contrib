@@ -7,15 +7,20 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
+chrono = "0.4"
+ffmpeg-sys-next = "7"
 futures = "0.3.32"
 libloading = "0.8"
+skia-safe = "0.87"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_core = "1.0.228"
 serde_derive = "1.0.228"
 serde_json = "1.0.150"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [build-dependencies]
 cmake = "0.1.58"
+pkg-config = "0.3"
 ureq = "3.3.0"
 zip = "8.6.0"
 

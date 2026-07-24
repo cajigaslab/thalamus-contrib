@@ -9,7 +9,9 @@ import platform
 import importlib
 import importlib.resources
 
-from thalamus.pipeline.thalamus_window import Factory, UserData, UserDataType
+from thalamus.pipeline.thalamus_window import Factory, UserData, UserDataType, get_node_names
+
+from .webcam_widget import WebcamWidget
 
 print(__package__, type(__package__))
 print(type(importlib.resources.files(__package__)))
@@ -29,6 +31,15 @@ def widgets():
     'THORCAM': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
+    ]),
+    'WEBCAM': Factory(lambda c, s: WebcamWidget(c, s), [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.CHECK_BOX, 'View', False, []),
+    ]),
+    'RTMPS': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
+      UserData(UserDataType.DEFAULT, 'Destination', '', []),
     ]),
   }
 

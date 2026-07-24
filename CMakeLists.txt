@@ -52,19 +52,8 @@ else()
   set(CMAKE_PARALLEL --parallel ${CPU_COUNT})
 endif()
 
-if(WIN32)
-  if("${CMAKE_CXX_COMPILER_ID}" MATCHES "MSVC")
-    list(APPEND ALL_COMPILE_OPTIONS /MP)
-    list(APPEND ALL_COMPILE_OPTIONS /Zi)
-    list(APPEND ALL_LINK_OPTIONS /DEBUG)
-  else()
-    message("Release debug symbols enabled")
-    list(APPEND ALL_COMPILE_OPTIONS -g)
-  endif()
-else()
-  message("Release debug symbols enabled")
-  list(APPEND ALL_COMPILE_OPTIONS -g)
-endif()
+message("Release debug symbols enabled")
+list(APPEND ALL_COMPILE_OPTIONS -g)
   
 if("${SANITIZER}" STREQUAL thread)
   list(APPEND ALL_COMPILE_OPTIONS -fsanitize=thread -O1)
@@ -91,5 +80,5 @@ string(REPLACE ";" " " ALL_LINK_OPTIONS_SPACED "${ALL_LINK_OPTIONS}")
 
 add_definitions(-DPRINTSYNC)
 
-include(cmake/opencv.cmake)
+include(cmake/ffmpeg.cmake)
 

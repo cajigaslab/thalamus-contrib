@@ -549,6 +549,10 @@ impl ThalamusAPI {
     ThalamusAPIThreadSafe{raw: self.raw}
   }
 
+  pub fn tokio(&self) -> std::sync::MutexGuard<'static, Option<tokio::runtime::Runtime>> {
+    tokio_runtime()
+  }
+
   pub fn time(&self) -> Duration {
     unsafe {
       let time_ns = (&*self.raw).time_ns.unwrap();
@@ -1910,6 +1914,12 @@ pub trait MocapData {
 
 pub static OPERATION_ABORTED: OnceLock<i32> = OnceLock::<i32>::new();
 
+static TOKIO_RUNTIME: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
+
+pub fn tokio_runtime() -> std::sync::MutexGuard<'static, Option<tokio::runtime::Runtime>> {
+  TOKIO_RUNTIME.lock().unwrap()
+}
+
 pub fn setup(api_raw: *mut ThalamusAPIRaw) {
   unsafe {
     (*api_raw).sanitize();
@@ -1917,6 +1927,20 @@ pub fn setup(api_raw: *mut ThalamusAPIRaw) {
     OPERATION_ABORTED.set((api.error_code_operation_aborted.unwrap())())
       .expect("Failed to initialize constant: OPERATION_ABORTED");
   }
+  let mut runtime = TOKIO_RUNTIME.lock().unwrap();
+  assert!(runtime.is_none(), "Tokio runtime already initialized");
+  *runtime = Some(
+    tokio::runtime::Builder::new_multi_thread()
+      .enable_all()
+      .build()
+      .expect("Failed to build Tokio runtime")
+  );
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn thalamus_teardown() {
+  println!("thalamus_teardown");
+  *TOKIO_RUNTIME.lock().unwrap() = None;
 }
 
 #[macro_export]
@@ -1931,8 +1955,8 @@ use $crate::api::{
 };
 
 #[unsafe(no_mangle)]
-pub extern "C" fn get_node_factories(api: *mut ThalamusAPIRaw) -> *const *const ThalamusNodeFactory {
-  println!("get_node_factories");
+pub extern "C" fn thalamus_get_node_factories(api: *mut ThalamusAPIRaw) -> *const *const ThalamusNodeFactory {
+  println!("thalamus_get_node_factories");
   $crate::api::setup(api);
   let mut vec = Vec::<*const ThalamusNodeFactory>::new();
   $(
