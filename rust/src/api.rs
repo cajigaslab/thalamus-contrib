@@ -810,6 +810,111 @@ impl ThalamusAPI {
       VulkanQueueGuard { api: *self, lock, queue }
     }
   }
+
+  /// Text of the last SDL error set on this thread. SDL owns the underlying
+  /// buffer (a per-thread static, not freshly allocated), so this copies it
+  /// into an owned String rather than releasing anything.
+  pub fn sdl_error(&self) -> String {
+    unsafe {
+      let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
+      ((&*self.raw).sdl_get_error.unwrap())(&mut span as *mut ThalamusCharSpan);
+      if span.data.is_null() || span.size == 0 {
+        return String::new();
+      }
+      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      std::str::from_utf8(slice).unwrap_or("").to_string()
+    }
+  }
+
+  /// Creates a native window via Thalamus's own SDL3 instance. `flags` is a
+  /// bitor of the `THALAMUS_SDL_WINDOW_*` constants (e.g. `THALAMUS_SDL_WINDOW_VULKAN`).
+  pub fn create_sdl_window(&self, title: &str, width: i32, height: i32, flags: u64) -> Result<SDLWindow, String> {
+    unsafe {
+      let mut span = ThalamusCharSpan { data: title.as_ptr() as *const i8, size: title.len() as u64, owns_data: 0 };
+      let window = ((&*self.raw).sdl_create_window.unwrap())(&mut span as *mut ThalamusCharSpan, width, height, flags);
+      if window.is_null() {
+        Err(self.sdl_error())
+      } else {
+        Ok(SDLWindow { api: *self, window })
+      }
+    }
+  }
+
+  pub fn get_clipboard_text(&self) -> String {
+    unsafe {
+      let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
+      ((&*self.raw).sdl_get_clipboard_text.unwrap())(&mut span as *mut ThalamusCharSpan);
+      let result = if span.data.is_null() || span.size == 0 {
+        String::new()
+      } else {
+        let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+        std::str::from_utf8(slice).unwrap_or("").to_string()
+      };
+      if span.owns_data != 0 {
+        ((&*self.raw).charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
+      }
+      result
+    }
+  }
+
+  pub fn set_clipboard_text(&self, text: &str) -> bool {
+    unsafe {
+      let span = ThalamusCharSpan { data: text.as_ptr() as *const i8, size: text.len() as u64, owns_data: 0 };
+      ((&*self.raw).sdl_set_clipboard_text.unwrap())(&span as *const ThalamusCharSpan) != 0
+    }
+  }
+
+  /// `id` is one of the `THALAMUS_SDL_SYSTEM_CURSOR_*` constants.
+  pub fn create_system_cursor(&self, id: i32) -> Option<SDLCursor> {
+    unsafe {
+      let cursor = ((&*self.raw).sdl_create_system_cursor.unwrap())(id);
+      if cursor.is_null() { None } else { Some(SDLCursor { api: *self, cursor }) }
+    }
+  }
+
+  /// Passing `None` restores the default cursor.
+  pub fn set_cursor(&self, cursor: Option<&SDLCursor>) -> bool {
+    unsafe {
+      let ptr = cursor.map(|c| c.cursor).unwrap_or(std::ptr::null_mut());
+      ((&*self.raw).sdl_set_cursor.unwrap())(ptr) != 0
+    }
+  }
+
+  pub fn show_cursor(&self) -> bool {
+    unsafe { ((&*self.raw).sdl_show_cursor.unwrap())() != 0 }
+  }
+
+  pub fn hide_cursor(&self) -> bool {
+    unsafe { ((&*self.raw).sdl_hide_cursor.unwrap())() != 0 }
+  }
+
+  /// Subscribes to every SDL event Thalamus's central pump sees (from any
+  /// window, including ones this plugin created via `create_sdl_window`).
+  /// Dropping the returned `OnDrop` unsubscribes.
+  pub fn subscribe_sdl_events<T: FnMut(&ThalamusSDLEvent) + 'static>(&self, callback: T) -> OnDrop {
+    let call_ptr = Box::into_raw(Box::new(SDLEventArgs { callback }));
+    let void_ptr = call_ptr as *mut std::os::raw::c_void;
+    let subscription = unsafe {
+      ((&*self.raw).sdl_events_subscribe.unwrap())(Some(sdl_event_callback::<T>), void_ptr)
+    };
+    let api = *self;
+    let cleanup = move || {
+      unsafe {
+        ((&*api.raw).sdl_events_unsubscribe.unwrap())(subscription);
+        drop(Box::from_raw(call_ptr));
+      }
+    };
+    OnDrop { action: Box::new(cleanup) }
+  }
+}
+
+struct SDLEventArgs<T> {
+  callback: T,
+}
+
+unsafe extern "C" fn sdl_event_callback<T: FnMut(&ThalamusSDLEvent)>(event: *mut ThalamusSDLEvent, data: *mut ::std::os::raw::c_void) {
+  let args = unsafe { &mut *(data as *mut SDLEventArgs<T>) };
+  (args.callback)(unsafe { &*event });
 }
 
 /// RAII guard holding Thalamus's shared VkQueue lock. Access `queue()` only
@@ -833,6 +938,92 @@ impl Drop for VulkanQueueGuard {
     unsafe {
       ((&*self.api.raw).unlock_vulkan_queue.unwrap())(self.lock);
     }
+  }
+}
+
+/// A native window created via `ThalamusAPI::create_sdl_window`, owned by
+/// Thalamus's own SDL3 instance -- the plugin never links or includes SDL
+/// itself. Destroyed via `sdl_destroy_window` when dropped.
+pub struct SDLWindow {
+  api: ThalamusAPI,
+  window: *mut ThalamusSDLWindow,
+}
+unsafe impl Send for SDLWindow {}
+
+impl SDLWindow {
+  pub fn set_position(&self, x: i32, y: i32) {
+    unsafe { ((&*self.api.raw).sdl_set_window_position.unwrap())(self.window, x, y); }
+  }
+
+  pub fn set_size(&self, w: i32, h: i32) {
+    unsafe { ((&*self.api.raw).sdl_set_window_size.unwrap())(self.window, w, h); }
+  }
+
+  pub fn set_title(&self, title: &str) {
+    let mut span = ThalamusCharSpan { data: title.as_ptr() as *const i8, size: title.len() as u64, owns_data: 0 };
+    unsafe { ((&*self.api.raw).sdl_set_window_title.unwrap())(self.window, &mut span as *mut ThalamusCharSpan); }
+  }
+
+  pub fn size_in_pixels(&self) -> (i32, i32) {
+    let (mut w, mut h) = (0, 0);
+    unsafe { ((&*self.api.raw).sdl_get_window_size_in_pixels.unwrap())(self.window, &mut w, &mut h); }
+    (w, h)
+  }
+
+  pub fn id(&self) -> u32 {
+    unsafe { ((&*self.api.raw).sdl_get_window_id.unwrap())(self.window) }
+  }
+
+  pub fn position(&self) -> (i32, i32) {
+    let (mut x, mut y) = (0, 0);
+    unsafe { ((&*self.api.raw).sdl_get_window_position.unwrap())(self.window, &mut x, &mut y); }
+    (x, y)
+  }
+
+  pub fn size(&self) -> (i32, i32) {
+    let (mut w, mut h) = (0, 0);
+    unsafe { ((&*self.api.raw).sdl_get_window_size.unwrap())(self.window, &mut w, &mut h); }
+    (w, h)
+  }
+
+  /// Creates a VkSurfaceKHR for this window against `instance` (e.g. from
+  /// `ThalamusAPI::load_vulkan_instance`). Ownership transfers to the
+  /// caller -- destroy it (e.g. via ash's `khr::surface::Instance::destroy_surface`)
+  /// before this window or the instance goes away.
+  pub fn create_vulkan_surface(&self, instance: ash::vk::Instance) -> Result<ash::vk::SurfaceKHR, String> {
+    unsafe {
+      let raw_instance = instance.as_raw() as *mut VkInstance_T;
+      let mut surface: VkSurfaceKHR = std::ptr::null_mut();
+      let ok = ((&*self.api.raw).sdl_vulkan_create_surface.unwrap())(
+        self.window, raw_instance, std::ptr::null(), &mut surface as *mut VkSurfaceKHR,
+      );
+      if ok != 0 {
+        Ok(ash::vk::SurfaceKHR::from_raw(surface as u64))
+      } else {
+        Err(self.api.sdl_error())
+      }
+    }
+  }
+}
+
+impl Drop for SDLWindow {
+  fn drop(&mut self) {
+    unsafe { ((&*self.api.raw).sdl_destroy_window.unwrap())(self.window); }
+  }
+}
+
+/// A system cursor created via `ThalamusAPI::create_system_cursor`. Destroyed
+/// via `sdl_destroy_cursor` when dropped -- do not `set_cursor` a cursor that
+/// has already been dropped.
+pub struct SDLCursor {
+  api: ThalamusAPI,
+  cursor: *mut ThalamusSDLCursor,
+}
+unsafe impl Send for SDLCursor {}
+
+impl Drop for SDLCursor {
+  fn drop(&mut self) {
+    unsafe { ((&*self.api.raw).sdl_destroy_cursor.unwrap())(self.cursor); }
   }
 }
 

@@ -24,10 +24,42 @@ if(WIN32)
   string(REPLACE "clang-cl" "clang" FFMPEG_COMPILER "${FFMPEG_COMPILER}")
   string(REPLACE "Program Files (x86)" "Progra~2" FFMPEG_COMPILER "${FFMPEG_COMPILER}")
   string(REPLACE "Program Files" "Progra~1" FFMPEG_COMPILER "${FFMPEG_COMPILER}")
+
+  string(REGEX REPLACE "^([a-zA-Z]):" "/\\1" FFMPEG_CXX_COMPILER "${CMAKE_CXX_COMPILER}")
+  string(REPLACE "clang-cl" "clang" FFMPEG_CXX_COMPILER "${FFMPEG_CXX_COMPILER}")
+  string(REPLACE "Program Files (x86)" "Progra~2" FFMPEG_CXX_COMPILER "${FFMPEG_CXX_COMPILER}")
+  string(REPLACE "Program Files" "Progra~1" FFMPEG_CXX_COMPILER "${FFMPEG_CXX_COMPILER}")
 else()
   set(FFMPEG_COMPILER "${CMAKE_C_COMPILER}")
+  set(FFMPEG_CXX_COMPILER "${CMAKE_CXX_COMPILER}")
 endif()
 message("FFMPEG_COMPILER ${FFMPEG_COMPILER}")
+message("FFMPEG_CXX_COMPILER ${FFMPEG_CXX_COMPILER}")
+
+if(WIN32)
+  # Plain clang (as opposed to clang-cl) defaults to the static MSVC CRT
+  # (libcmt/libcpmt) on the windows-msvc target, unlike CMake's own default
+  # (dynamic, /MD) that the rest of this project now relies on and that
+  # skia-bindings' prebuilt skia.lib and Rust's own windows-msvc target
+  # already use. Force ffmpeg onto the dynamic CRT too, or the final link
+  # fails with RuntimeLibrary mismatches (LNK2038/LNK2005). This has to go
+  # on extra-ldflags as well as extra-cflags/-cxxflags: configure's own
+  # link-check step (test_ld) invokes the compiler driver again without
+  # extra-cflags, so without it here that check step links against the
+  # default (static) CRT and fails to resolve the dynamic-CRT imports
+  # (e.g. __imp__aligned_malloc) the extra-cflags compile step emitted.
+  set(FFMPEG_EXTRA_CFLAGS "${ALL_C_COMPILE_OPTIONS_SPACED} -fms-runtime-lib=dll")
+  set(FFMPEG_EXTRA_CXXFLAGS "-fms-runtime-lib=dll")
+  # -fms-runtime-lib=dll alone isn't enough at link time either: plain
+  # clang (as opposed to clang-cl) always hands link.exe "-defaultlib:libcmt
+  # -defaultlib:oldnames" regardless of -fms-runtime-lib, which still
+  # conflicts with the msvcrt-linked object files. Override explicitly.
+  set(FFMPEG_EXTRA_LDFLAGS "${ALL_C_LINK_OPTIONS_SPACED} -fms-runtime-lib=dll -Xlinker -defaultlib:msvcrt -Xlinker -nodefaultlib:libcmt -Xlinker -defaultlib:msvcprt -Xlinker -nodefaultlib:libcpmt")
+else()
+  set(FFMPEG_EXTRA_CFLAGS "${ALL_C_COMPILE_OPTIONS_SPACED}")
+  set(FFMPEG_EXTRA_CXXFLAGS "")
+  set(FFMPEG_EXTRA_LDFLAGS "${ALL_C_LINK_OPTIONS_SPACED}")
+endif()
 
 add_library(ffmpeg_m m_stub.cpp)
 set_target_properties(ffmpeg_m PROPERTIES 
@@ -45,7 +77,7 @@ add_custom_command(
   DEPENDS ffmpeg_m
   COMMAND cmake -E env 
   "PKG_CONFIG_PATH=${ZLIB_PKG_CONFIG_DIR}:${SDL_PKG_CONFIG_DIR}"
-  sh "${ffmpeg_SOURCE_DIR}/configure" ${FFMPEG_EXTRA_FLAGS} --cc=${FFMPEG_COMPILER} "--extra-cflags=${ALL_C_COMPILE_OPTIONS_SPACED}" "--extra-ldflags=${ALL_C_LINK_OPTIONS_SPACED}" --enable-static --disable-shared --disable-sndio $<IF:$<CONFIG:Debug>,--enable-debug,> --prefix=${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install
+  sh "${ffmpeg_SOURCE_DIR}/configure" ${FFMPEG_EXTRA_FLAGS} "--cc=${FFMPEG_COMPILER}" "--cxx=${FFMPEG_CXX_COMPILER}" "--extra-cflags=${FFMPEG_EXTRA_CFLAGS}" "--extra-cxxflags=${FFMPEG_EXTRA_CXXFLAGS}" "--extra-ldflags=${FFMPEG_EXTRA_LDFLAGS}" --enable-static --disable-shared --disable-sndio $<IF:$<CONFIG:Debug>,--enable-debug,> --prefix=${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install
   && cmake -E touch_nocreate "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/Makefile"
   ${FFMPEG_POST_CONFIG}
   WORKING_DIRECTORY "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>")

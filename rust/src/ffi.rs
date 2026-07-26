@@ -374,6 +374,28 @@ thalamus_api_raw! {
     create_vulkan_command_pool: unsafe extern "C" fn() -> VkCommandPool,
     lock_vulkan_queue: unsafe extern "C" fn() -> *mut ThalamusVkQueueLock,
     unlock_vulkan_queue: unsafe extern "C" fn(*mut ThalamusVkQueueLock),
+
+    sdl_create_window: unsafe extern "C" fn(name: *mut ThalamusCharSpan, width: i32, height: i32, flags: u64) -> *mut ThalamusSDLWindow,
+    sdl_destroy_window: unsafe extern "C" fn(*mut ThalamusSDLWindow),
+    sdl_set_window_position: unsafe extern "C" fn(*mut ThalamusSDLWindow, i32, i32),
+    sdl_set_window_size: unsafe extern "C" fn(*mut ThalamusSDLWindow, i32, i32),
+    sdl_set_window_title: unsafe extern "C" fn(*mut ThalamusSDLWindow, *mut ThalamusCharSpan),
+    sdl_get_error: unsafe extern "C" fn(*mut ThalamusCharSpan),
+    sdl_vulkan_create_surface: unsafe extern "C" fn(*mut ThalamusSDLWindow, VkInstance, *const VkAllocationCallbacks, *mut VkSurfaceKHR) -> u8,
+    sdl_get_window_size_in_pixels: unsafe extern "C" fn(*mut ThalamusSDLWindow, *mut i32, *mut i32),
+    sdl_get_window_id: unsafe extern "C" fn(*mut ThalamusSDLWindow) -> u32,
+    sdl_get_window_position: unsafe extern "C" fn(*mut ThalamusSDLWindow, *mut i32, *mut i32),
+    sdl_get_window_size: unsafe extern "C" fn(*mut ThalamusSDLWindow, *mut i32, *mut i32),
+    sdl_events_subscribe: unsafe extern "C" fn(ThalamusSDLEventCallback, *mut ::std::os::raw::c_void) -> *mut ThalamusSDLEventSubscription,
+    sdl_events_unsubscribe: unsafe extern "C" fn(*mut ThalamusSDLEventSubscription),
+
+    sdl_get_clipboard_text: unsafe extern "C" fn(*mut ThalamusCharSpan),
+    sdl_set_clipboard_text: unsafe extern "C" fn(*const ThalamusCharSpan) -> u8,
+    sdl_create_system_cursor: unsafe extern "C" fn(i32) -> *mut ThalamusSDLCursor,
+    sdl_set_cursor: unsafe extern "C" fn(*mut ThalamusSDLCursor) -> u8,
+    sdl_destroy_cursor: unsafe extern "C" fn(*mut ThalamusSDLCursor),
+    sdl_show_cursor: unsafe extern "C" fn() -> u8,
+    sdl_hide_cursor: unsafe extern "C" fn() -> u8,
 }
 
 #[repr(C)]
@@ -498,6 +520,198 @@ pub struct VkCommandPool_T {
     _unused: [u8; 0],
 }
 pub type VkCommandPool = *mut VkCommandPool_T;
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkSurfaceKHR_T {
+    _unused: [u8; 0],
+}
+pub type VkSurfaceKHR = *mut VkSurfaceKHR_T;
+
+/// Only ever used as a `*const` pointer (always passed as null from Rust --
+/// we have no allocation callbacks to supply), so it's never dereferenced;
+/// kept opaque like the Vk*_T handles above rather than modeling its real
+/// (function-pointer-filled) fields.
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct VkAllocationCallbacks {
+    _unused: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLWindow {
+    _unused: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLEventSubscription {
+    _unused: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLCursor {
+    _unused: [u8; 0],
+}
+
+pub type ThalamusSDLEventCallback = ::std::option::Option<
+    unsafe extern "C" fn(event: *mut ThalamusSDLEvent, data: *mut ::std::os::raw::c_void),
+>;
+
+// SDL window creation flags (subset of THALAMUS_SDL_WINDOW_* in plugin.h --
+// numeric values must stay in lockstep with that header).
+pub const THALAMUS_SDL_WINDOW_HIDDEN: u64 = 0x0000000000000008;
+pub const THALAMUS_SDL_WINDOW_RESIZABLE: u64 = 0x0000000000000020;
+pub const THALAMUS_SDL_WINDOW_VULKAN: u64 = 0x0000000010000000;
+
+// Mirrors THALAMUS_SDL_SYSTEM_CURSOR_* in plugin.h (itself mirroring SDL3's
+// SDL_SystemCursor ordinals) -- only the entries imgui ever requests.
+pub const THALAMUS_SDL_SYSTEM_CURSOR_DEFAULT: i32 = 0;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_TEXT: i32 = 1;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_WAIT: i32 = 2;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_CROSSHAIR: i32 = 3;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_PROGRESS: i32 = 4;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_NWSE_RESIZE: i32 = 5;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_NESW_RESIZE: i32 = 6;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_EW_RESIZE: i32 = 7;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_NS_RESIZE: i32 = 8;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_MOVE: i32 = 9;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_NOT_ALLOWED: i32 = 10;
+pub const THALAMUS_SDL_SYSTEM_CURSOR_POINTER: i32 = 11;
+
+// SDL event type tags actually consumed by the imgui backend (subset of
+// THALAMUS_SDL_EventType in plugin_window_event.h).
+pub const THALAMUS_SDL_EVENT_QUIT: u32 = 0x100;
+pub const THALAMUS_SDL_EVENT_WINDOW_RESIZED: u32 = 0x206;
+pub const THALAMUS_SDL_EVENT_WINDOW_FOCUS_GAINED: u32 = 0x20E;
+pub const THALAMUS_SDL_EVENT_WINDOW_FOCUS_LOST: u32 = 0x20F;
+pub const THALAMUS_SDL_EVENT_WINDOW_CLOSE_REQUESTED: u32 = 0x210;
+pub const THALAMUS_SDL_EVENT_KEY_DOWN: u32 = 0x300;
+pub const THALAMUS_SDL_EVENT_KEY_UP: u32 = 0x301;
+pub const THALAMUS_SDL_EVENT_MOUSE_MOTION: u32 = 0x400;
+pub const THALAMUS_SDL_EVENT_MOUSE_BUTTON_DOWN: u32 = 0x401;
+pub const THALAMUS_SDL_EVENT_MOUSE_BUTTON_UP: u32 = 0x402;
+pub const THALAMUS_SDL_EVENT_MOUSE_WHEEL: u32 = 0x403;
+
+/// Mirrors THALAMUS_SDL_Event (itself a shadow of SDL3's SDL_Event union --
+/// see plugin_window_event.h). Rather than transcribe all ~35 variants, this
+/// stays an opaque, correctly-sized byte buffer; decode only the variants
+/// actually used via the `as_*` accessors below, gated on `event_type()`
+/// matching the corresponding THALAMUS_SDL_EVENT_* constant first.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct ThalamusSDLEvent {
+    pub bytes: [u8; 128],
+}
+
+impl ThalamusSDLEvent {
+    pub fn event_type(&self) -> u32 {
+        u32::from_ne_bytes(self.bytes[0..4].try_into().unwrap())
+    }
+    /// # Safety
+    /// `event_type()` must be one of the THALAMUS_SDL_EVENT_WINDOW_* constants.
+    pub unsafe fn as_window(&self) -> &ThalamusSDLWindowEvent {
+        unsafe { &*(self.bytes.as_ptr() as *const ThalamusSDLWindowEvent) }
+    }
+    /// # Safety
+    /// `event_type()` must be THALAMUS_SDL_EVENT_KEY_DOWN or _KEY_UP.
+    pub unsafe fn as_key(&self) -> &ThalamusSDLKeyboardEvent {
+        unsafe { &*(self.bytes.as_ptr() as *const ThalamusSDLKeyboardEvent) }
+    }
+    /// # Safety
+    /// `event_type()` must be THALAMUS_SDL_EVENT_MOUSE_MOTION.
+    pub unsafe fn as_mouse_motion(&self) -> &ThalamusSDLMouseMotionEvent {
+        unsafe { &*(self.bytes.as_ptr() as *const ThalamusSDLMouseMotionEvent) }
+    }
+    /// # Safety
+    /// `event_type()` must be THALAMUS_SDL_EVENT_MOUSE_BUTTON_DOWN or _UP.
+    pub unsafe fn as_mouse_button(&self) -> &ThalamusSDLMouseButtonEvent {
+        unsafe { &*(self.bytes.as_ptr() as *const ThalamusSDLMouseButtonEvent) }
+    }
+    /// # Safety
+    /// `event_type()` must be THALAMUS_SDL_EVENT_MOUSE_WHEEL.
+    pub unsafe fn as_mouse_wheel(&self) -> &ThalamusSDLMouseWheelEvent {
+        unsafe { &*(self.bytes.as_ptr() as *const ThalamusSDLMouseWheelEvent) }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLWindowEvent {
+    pub r#type: u32,
+    pub reserved: u32,
+    pub timestamp: u64,
+    pub window_id: u32,
+    pub data1: i32,
+    pub data2: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLKeyboardEvent {
+    pub r#type: u32,
+    pub reserved: u32,
+    pub timestamp: u64,
+    pub window_id: u32,
+    pub which: u32,
+    pub scancode: u32,
+    pub key: u32,
+    pub modifiers: u16,
+    pub raw: u16,
+    pub down: bool,
+    pub repeat: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLMouseMotionEvent {
+    pub r#type: u32,
+    pub reserved: u32,
+    pub timestamp: u64,
+    pub window_id: u32,
+    pub which: u32,
+    pub state: u32,
+    pub x: f32,
+    pub y: f32,
+    pub xrel: f32,
+    pub yrel: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLMouseButtonEvent {
+    pub r#type: u32,
+    pub reserved: u32,
+    pub timestamp: u64,
+    pub window_id: u32,
+    pub which: u32,
+    pub button: u8,
+    pub down: bool,
+    pub clicks: u8,
+    pub padding: u8,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusSDLMouseWheelEvent {
+    pub r#type: u32,
+    pub reserved: u32,
+    pub timestamp: u64,
+    pub window_id: u32,
+    pub which: u32,
+    pub x: f32,
+    pub y: f32,
+    pub direction: u32,
+    pub mouse_x: f32,
+    pub mouse_y: f32,
+    pub integer_x: i32,
+    pub integer_y: i32,
+}
+
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ThalamusDoubleSpan {

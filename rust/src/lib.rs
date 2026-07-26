@@ -3,6 +3,8 @@ use std::ptr;
 mod ffi;
 mod wakers;
 pub mod api;
+mod imgui_platform;
+mod imgui_window;
 mod thorcam_node;
 mod ffmpeg_devices;
 mod webcam_node;
