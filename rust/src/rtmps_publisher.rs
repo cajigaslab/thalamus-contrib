@@ -313,7 +313,7 @@ impl RtmpsPublisher {
         width as i32,
         height as i32,
         ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-        ffi::SwsFlags::SWS_BILINEAR as std::os::raw::c_int,
+        ffi::SWS_BILINEAR,
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         std::ptr::null(),
