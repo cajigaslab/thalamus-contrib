@@ -501,6 +501,13 @@ impl ThalamusAPIThreadSafe {
     ThalamusAPI{raw: self.raw}
   }
 
+  pub fn time(&self) -> Duration {
+    unsafe {
+      let time_ns = (&*self.raw).time_ns.unwrap();
+      return Duration::from_nanos(time_ns());
+    }
+  }
+
   pub fn ready_offmain(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
       let node_ready_offmain = (&*self.raw).node_ready_offmain.unwrap();
@@ -1943,16 +1950,18 @@ pub trait Node {
 
 pub trait NodeData {
   fn time(&self) -> Duration;
-  fn analog(&self) -> Option<&dyn AnalogData>;
-  fn image(&self) -> Option<&dyn ImageData>;
-  fn mocap(&self) -> Option<&dyn MocapData>;
+  fn analog(&self) -> Option<&dyn AnalogData> { None }
+  fn image(&self) -> Option<&dyn ImageData> { None }
+  fn mocap(&self) -> Option<&dyn MocapData> { None }
 }
 
 pub trait AnalogData {
   fn data(
           &self,
           channel: i32,
-      ) -> &[f64];
+      ) -> &[f64] {
+        panic!("Unimplemented")
+      }
 
   fn short_data(
           &self,
