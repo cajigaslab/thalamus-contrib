@@ -33,8 +33,18 @@ impl MainThreadToken {
   /// (e.g. node factory callbacks, post_callback). Not pub so callers outside
   /// this crate cannot manufacture a token.
   pub(crate) unsafe fn new_in_main_thread_callback() -> Self {
+    MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());
     MainThreadToken { _not_send: PhantomData }
   }
+}
+
+/// Thread ID of the main (io_context) thread, learned the first time a
+/// MainThreadToken is manufactured, which only ever happens on that thread.
+static MAIN_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// True if the calling thread is the main (io_context) thread.
+pub fn is_main_thread() -> bool {
+  MAIN_THREAD_ID.get() == Some(&std::thread::current().id())
 }
 
 /// Wraps a !Send value so it can travel inside a Send closure, while ensuring
@@ -504,6 +514,16 @@ impl ThalamusAPIThreadSafe {
       node_ready_offmain(node);
       (*plugin_impl).data = None;
     })
+  }
+
+  /// Calls `ready` if invoked on the main thread, otherwise `ready_offmain`.
+  pub fn ready_this_thread(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
+    if is_main_thread() {
+      let main_token = unsafe { MainThreadToken::new_in_main_thread_callback() };
+      self.thread_unsafe(main_token).ready(data, token)
+    } else {
+      self.ready_offmain(data, token)
+    }
   }
 
   pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
