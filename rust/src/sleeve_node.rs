@@ -1,36 +1,37 @@
-use std::cell::{RefCell};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
+use tokio::task::JoinHandle;
 use std::time::Duration;
-use crate::api::{self, AnalogData, Json, MainThreadToken, Node, NodeToken, OnDrop, Request, State, StateAction, StateValue, ThalamusAPI};
+use uuid::Uuid;
+use futures::stream::StreamExt;
+use bytebuffer::ByteReader;
+use crate::api::{self, NodeData, AnalogData, Json, MainThreadToken, Node, NodeToken, OnDrop, Request, State, StateAction, StateValue, ThalamusAPI};
 
 use btleplug::api::{
-  Characteristic, Service, ValueNotification,
-  bleuuid::uuid_from_u16, Central, Manager as _,
+  Characteristic, Service,
+  Central, Manager as _,
   Peripheral as _, ScanFilter, WriteType, CentralEvent};
-use btleplug::platform::{Adapter, Manager, Peripheral};
-use chrono::Duration;
+use btleplug::platform::{Manager, Peripheral};
 use crate::block as blk;
 
 struct SleeveNodeInner {
-  api:               ThalamusAPI,
-  node_token:        NodeToken,
-  state:             State,
-  state_connection:  OnDrop,
-  bluetooth_handle: Some(JoinHandle<()>),
+  api:              ThalamusAPI,
+  node_token:       NodeToken,
+  state:            State,
+  state_connection: OnDrop,
+  bluetooth_handle: Option<JoinHandle<()>>,
+  main_thread_token: MainThreadToken,
 }
 
 pub struct SleeveNode {
     inner: Arc<Mutex<SleeveNodeInner>>,
 }
 
-struct SleeveData {
-  channels: Vec::<Vec<i16>>,
+struct SleeveData<'a> {
+  channels: &'a Vec::<Vec<i16>>,
   time: Duration,
 }
 
-impl NodeData for SleeveData {
+impl<'a> NodeData for SleeveData<'a> {
     fn time(&self) -> Duration {
         self.time
     }
@@ -39,19 +40,19 @@ impl NodeData for SleeveData {
     }
 }
 
-impl AnalogData for SleeveData {
+impl<'a> AnalogData for SleeveData<'a> {
   fn short_data(
             &self,
             channel: i32,
         ) -> &[i16] {
-    self.channels[channel].as_slice()
+    self.channels[channel as usize].as_slice()
   }
 
   fn num_channels(&self) -> i32 {
     self.channels.len() as i32
   }
 
-  fn sample_interval(&self, channel: i32) -> std::time::Duration {
+  fn sample_interval(&self, _channel: i32) -> std::time::Duration {
     Duration::from_millis(1)
   }
 
@@ -97,24 +98,60 @@ impl AnalogData for SleeveData {
   }
 }
 
+macro_rules! get_result {
+  ($result:expr, $msg:expr) => {
+    match $result {
+      Ok(val) => val,
+      Err(e) => {
+        println!("[{}:{}] {}: {}", file!(), line!(), $msg, e);
+        return;
+      }
+    }
+  };
+}
+
+macro_rules! get_option {
+  ($result:expr, $msg:expr) => {
+    match $result {
+      Some(val) => val,
+      None => {
+        println!("[{}:{}] {}", file!(), line!(), $msg);
+        return;
+      }
+    }
+  };
+}
+  
+fn stop_bluetooth<F: FnOnce() + 'static>(inner: Arc<Mutex<SleeveNodeInner>>, on_stopped: F) {
+  let (handle, api, main_thread_token) = {
+    let mut lock = inner.lock().unwrap();
+    (lock.bluetooth_handle.take(), lock.api, lock.main_thread_token)
+  };
+  if let Some(h) = handle.as_ref() {
+    h.abort();
+  }
+  api.join_task_then(handle, main_thread_token, on_stopped);
+}
+
 impl SleeveNodeInner {
   async fn bluetooth(api: api::ThalamusAPIThreadSafe, node_token: NodeToken) {
-    let uart_service_uuid = Uuid::parse_str("6e400001-b5a3-f393-e0a9-e50e24dcca9e")?;
-    let uart_rx_char_uuid = Uuid::parse_str("6E400002-B5A3-F393-E0A9-E50E24DCCA9E")?;
-    let uart_tx_char_uuid = Uuid::parse_str("6E400003-B5A3-F393-E0A9-E50E24DCCA9E")?;
+    let uart_service_uuid = Uuid::parse_str("6e400001-b5a3-f393-e0a9-e50e24dcca9e").unwrap();
+    let uart_rx_char_uuid = Uuid::parse_str("6E400002-B5A3-F393-E0A9-E50E24DCCA9E").unwrap();
+    let uart_tx_char_uuid = Uuid::parse_str("6E400003-B5A3-F393-E0A9-E50E24DCCA9E").unwrap();
 
-    let manager = Manager::new().await.unwrap();
-    let adapters = manager.adapters().await?;
-    let central = adapters.into_iter().nth(0).unwrap();
+    let manager = get_result!(Manager::new().await, "Manager init failed");
+    let adapters = get_result!(manager.adapters().await, "Failed to get adapters");
+    let central = get_option!(adapters.into_iter().nth(0), "No adapters found");
+    get_result!(central.start_scan(ScanFilter::default()).await, "start_scan failed");
 
-    central.start_scan(ScanFilter::default()).await?;
-    let mut events = central.events().await?;
+    let mut events = get_result!(central.events().await, "Failed to get events");
     let mut peripheral_opt: Option<Peripheral> = None;
     while let Some(e) = events.next().await {
       match e {
         CentralEvent::DeviceDiscovered(id) => {
-          let peripheral = central.peripheral(&id).await?;
-          let properties = peripheral.properties().await?.unwrap();
+          let peripheral = get_result!(central.peripheral(&id).await, "Failed to get peripheral");
+          let properties_opt = get_result!(peripheral.properties().await, "Failed to get peripheral properties");
+          let properties = get_option!(properties_opt, "Failed to get peripheral properties");
           let address = properties.address;
           let name = properties.local_name.unwrap_or("no name".to_string());
           println!("{name} {address}");
@@ -128,11 +165,11 @@ impl SleeveNodeInner {
       }
     }
 
-    let peripheral = peripheral_opt.unwrap();
-    peripheral.connect().await?;
+    let peripheral = get_option!(peripheral_opt, "No peripheral found");
+    get_result!(peripheral.connect().await, "Connect failed");
     println!("MTU = {}", peripheral.mtu());
 
-    peripheral.discover_services().await?;
+    get_result!(peripheral.discover_services().await, "Failed to discover services");
     let mut uart_service_opt: Option<Service> = None;
     for service in peripheral.services() {
       if service.uuid == uart_service_uuid {
@@ -141,7 +178,7 @@ impl SleeveNodeInner {
       }
     }
 
-    let uart_service = uart_service_opt.unwrap();
+    let uart_service = get_option!(uart_service_opt, "UART service not found");
 
     let mut rx_char_opt: Option<Characteristic> = None;
     let mut tx_char_opt: Option<Characteristic> = None;
@@ -153,73 +190,70 @@ impl SleeveNodeInner {
       }
     }
 
-    let rx_char = rx_char_opt.unwrap();
-    let tx_char = tx_char_opt.unwrap();
+    let rx_char = get_option!(rx_char_opt, "No RX found");
+    let tx_char = get_option!(tx_char_opt, "No TX found");
 
     //peripheral.subscribe(&rx_char).await?;
-    peripheral.subscribe(&tx_char).await?;
+    get_result!(peripheral.subscribe(&tx_char).await, "Failed to subscript to TX");
 
     let pause = Duration::from_millis(800);
 
     {
       tokio::time::sleep(pause).await;
       let block = blk::Block::cmd(blk::ID_SET_CHANNEL_MASK, &[4, 0, 0, 0x0F, 0xF0]);
-      peripheral.write(&rx_char, &block.encode(), WriteType::WithoutResponse).await?;
+      get_result!(peripheral.write(&rx_char, &block.encode(), WriteType::WithoutResponse).await, "Write failed");
     }
 
     {
       tokio::time::sleep(pause).await;
       let block = blk::Block::cmd(blk::ID_SET_SAMPLE_RATE, &[4, 0x13]);
-      peripheral.write(&rx_char, &block.encode(), WriteType::WithoutResponse).await?;
+      get_result!(peripheral.write(&rx_char, &block.encode(), WriteType::WithoutResponse).await, "Write failed");
     }
 
     {
       tokio::time::sleep(pause).await;
       let block = blk::Block::cmd(blk::ID_ENABLE, &[4, 0x01]);
-      peripheral.write(&rx_char, &block.encode(), WriteType::WithoutResponse).await?;
+      get_result!(peripheral.write(&rx_char, &block.encode(), WriteType::WithoutResponse).await, "Write failed");
     }
     
     let mut next_first_point: i32 = 0;
-    let mut notifications = peripheral.notifications().await?;
+    let mut notifications = get_result!(peripheral.notifications().await, "Failed to get notifications");
+    let mut channels = Vec::<Vec<i16>>::new();
+    channels.resize(8, Vec::<i16>::default());
     while let Some(n) = notifications.next().await {
-      let blocks = blk::decode_block_packet(&n.value)?;
+      let blocks = get_result!(blk::decode_block_packet(&n.value), "Failed to parse blocks");
       for block in blocks {
         match block.block_id {
           2 => { println!("ICM"); }
           4 => { 
-            let raw_stride = block.data.len()/8/2;
-            let data = block.data;
+            let num_channels = 8;
+            let num_samples = block.data.len()/2/num_channels;
+            if num_samples == 0 { break; }
 
-            let total_bytes = data.len();
-            let points_avail = total_bytes / 2;            // 16-bit values available (after trim)
-            let full_frames  = points_avail / raw_stride;
-            let read_points  = full_frames * raw_stride;
-            if read_points == 0 { break; }
+            let data = block.data;
 
             let mut missing = (block.first_point_idx as i32) - next_first_point;
             while missing < 0 {
               missing += 0x100;
             }
-
-            next_first_point = (block.first_point_idx as i32) + i32::try_from(full_frames).unwrap();
-
-            let mut channels = Vec::<Vec<i16>>::new();
-            channels.resize(8, Vec::<i16>::default());
-
-            let mut reader = ByteReader::from_bytes(data);
-            let mut channel = (block.first_channel_sampled - 4) as usize;
-            println!("{}", channel);
-            while reader.get_rpos() < reader.len() {
-              let temp = (reader.read_u16()? as i32) - 0x8000;
-              channels[channel].push(temp as i16);
-              channel = (channel + 1) % channels.len();
+            if missing != 0 {
+              println!("missing {missing}");
             }
 
-            api.ready_offmain(data, &node_token);
-            let lock = self.lock().unwrap();
-            lock.api.ready(SleeveData {
-              channels, time: api.time()
-            }, token);
+            next_first_point = (block.first_point_idx as i32) + i32::try_from(num_samples).unwrap();
+
+            let mut reader = ByteReader::from_bytes(data);
+            let mut index = (block.first_channel_sampled - 4) as usize;
+            while reader.get_rpos() < reader.len() {
+              let raw = get_result!(reader.read_u16(), "Failed to read u16") as i32;
+              let temp = raw - 0x8000;
+              channels[index].push(temp as i16);
+              index = (index + 1) % channels.len();
+            }
+
+            api.ready_offmain(&SleeveData {
+              channels: &channels, time: api.time()
+            }, &node_token);
           }
           5 => { println!("ADC"); }
           _ => { println!("Other"); }
@@ -229,22 +263,24 @@ impl SleeveNodeInner {
     }
   }
 
-  fn on_state(self: Arc<Mutex<SleeveNodeInner>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
+
+  fn on_state(me: Arc<Mutex<SleeveNodeInner>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
     let StateValue::String(key_str) = key else {
       return;
     };
     match key_str.as_str() {
       "Running" => {
         if value == StateValue::Bool(true) {
-          let lock = self.lock().unwrap();
-          lock.bluetooth_handle = Some(lock.api.tokio().unwrap().spawn(async {
-            SleeveNodeInner::bluetooth(self.api, lock.node_token).await
-          }));
+          stop_bluetooth(me.clone(), move || {
+            let mut lock = me.lock().unwrap();
+            let api = lock.api.thread_safe();
+            let node_token = lock.node_token.clone();
+            lock.bluetooth_handle = Some(api.tokio().as_ref().unwrap().spawn(async move {
+              SleeveNodeInner::bluetooth(api, node_token).await
+            }));
+          });
         } else {
-          let lock = self.lock().unwrap();
-          if let Some(bluetooth) = lock.bluetooth_handle.take() {
-            bluetooth.abort();
-          }
+          stop_bluetooth(me, || {});
         }
       }
       _ => {}
@@ -269,7 +305,7 @@ impl Node for SleeveNode {
 
       let state_connection = state.connect(state_callback);
       Mutex::new(SleeveNodeInner {
-        api, node_token, state, state_connection, bluetooth_handle: None
+        api, node_token, state, state_connection, bluetooth_handle: None, main_thread_token,
       })
     });
 
@@ -279,14 +315,8 @@ impl Node for SleeveNode {
   }
 
   fn predrop(&self, token: api::PredropToken) {
-    let inner = self.inner.clone();
-    lock.api.tokio().unwrap().spawn(async {
-      let lock = inner.lock().unwrap();
-      if let Some(bluetooth) = lock.bluetooth_handle.take() {
-        bluetooth.abort();
-      }
+    stop_bluetooth(self.inner.clone(), move || {
       token.ready();
     });
   }
-
 }

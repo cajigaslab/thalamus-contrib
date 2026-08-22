@@ -501,6 +501,10 @@ impl ThalamusAPIThreadSafe {
     ThalamusAPI{raw: self.raw}
   }
 
+  pub fn tokio(&self) -> std::sync::MutexGuard<'static, Option<tokio::runtime::Runtime>> {
+    tokio_runtime()
+  }
+
   pub fn time(&self) -> Duration {
     unsafe {
       let time_ns = (&*self.raw).time_ns.unwrap();
@@ -757,6 +761,36 @@ impl ThalamusAPI {
         *running.borrow_mut() = false;
       }
       None => {
+        callback();
+        *running.borrow_mut() = false;
+      }
+    }
+
+    running
+  }
+
+  pub fn join_task_then<T: Send + 'static, F: FnOnce() + 'static>(
+    &self,
+    handle: Option<tokio::task::JoinHandle<T>>,
+    token: MainThreadToken,
+    callback: F,
+  ) -> Rc<RefCell<bool>> {
+    let running = Rc::new(RefCell::new(true));
+
+    match handle {
+      Some(h) if !h.is_finished() => {
+        let mt_api = self.thread_safe();
+        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), token);
+        self.tokio().as_ref().unwrap().spawn(async move {
+          let _ = h.await;
+          mt_api.post_to_main(move |token| {
+            let (callback, running) = wrapped.take(token);
+            callback();
+            *running.borrow_mut() = false;
+          });
+        });
+      }
+      _ => {
         callback();
         *running.borrow_mut() = false;
       }
@@ -1958,7 +1992,7 @@ pub trait NodeData {
 pub trait AnalogData {
   fn data(
           &self,
-          channel: i32,
+          _channel: i32,
       ) -> &[f64] {
         panic!("Unimplemented")
       }

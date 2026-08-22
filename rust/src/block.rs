@@ -40,8 +40,6 @@ impl<'a> Block<'a> {
     let mut reader = ByteReader::from_bytes(data);
     reader.set_endian(bytebuffer::Endian::BigEndian);
     
-    let total_len = reader.read_u8()?;
-
     let id_byte = reader.read_u8()?;
     let is_command_block = (id_byte & 0b10000000) != 0;
     let block_id = id_byte & 0x7F;
