@@ -4,7 +4,7 @@ fn main() {
   match target_os.as_str() {
     "windows" => {
       for lib in [
-        "Ws2_32", "Secur32", "Bcrypt", "Mfplat", "Ole32", "User32", "dxguid", "uuid", "Mfuuid",
+        "Ws2_32", "Secur32", "Bcrypt", "Ncrypt", "Crypt32", "Mfplat", "Ole32", "User32", "dxguid", "uuid", "Mfuuid",
         "strmiids", "Kernel32", "Psapi", "Gdi32", "Vfw32", "OleAut32", "Shlwapi", "oldnames"
       ] {
         println!("cargo:rustc-link-lib=dylib={}", lib);

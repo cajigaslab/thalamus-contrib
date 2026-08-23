@@ -46,6 +46,10 @@ def widgets():
       UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation X', 0.0, []),
       UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation Y', 0.0, []),
     ]),
+    'SLEEVE': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.DEFAULT, 'Address', '', []),
+    ]),
   }
 
 def library():

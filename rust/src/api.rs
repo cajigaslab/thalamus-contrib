@@ -125,7 +125,7 @@ impl ExtNode {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn subscribe_multithreaded<T: FnMut(ExtNode) + Send + 'static>(&self, callback: T) -> OnDrop {
@@ -145,7 +145,7 @@ impl ExtNode {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn analog<'a>(&'a self) -> Option<ExtAnalogNode<'a>> {
@@ -202,7 +202,7 @@ impl<'a> ExtAnalogNode<'a> {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -231,6 +231,11 @@ impl<'a> NodeData for ExtNodeData<'a> {
   fn mocap(&self) -> Option<&dyn MocapData> {
     let mocap = unsafe { (*self.node.node).mocap };
     if mocap.is_null() { None } else { Some(self) }
+  }
+
+  fn text(&self) -> Option<&dyn TextData> {
+    let text = unsafe { (*self.node.node).text };
+    if text.is_null() { None } else { Some(self) }
   }
 }
 
@@ -418,6 +423,19 @@ impl<'a> MocapData for ExtNodeData<'a> {
   }
 }
 
+impl<'a> TextData for ExtNodeData<'a> {
+  fn text(&self) -> &str {
+    let mut span = ThalamusCharSpan { data : null(), size: 0, owns_data: 0 };
+    unsafe {
+      let text_node = (*self.node.node).text;
+      let text_func = (*text_node).text.unwrap();
+      text_func(&mut span as *mut ThalamusCharSpan, self.node.node);
+      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      std::str::from_utf8(slice).unwrap()
+    }
+  }
+}
+
 unsafe extern "C" fn node_ready_callback<T: FnMut(ExtNode)>(node: *mut ThalamusNode, data: *mut ::std::os::raw::c_void) {
   let args = unsafe {
     &mut*(data as *mut NodeReadyArgs<T>)
@@ -499,6 +517,17 @@ pub enum NodeSelector {
 impl ThalamusAPIThreadSafe {
   pub fn thread_unsafe(&self, _token: MainThreadToken) -> ThalamusAPI {
     ThalamusAPI{raw: self.raw}
+  }
+
+  pub fn tokio(&self) -> std::sync::MutexGuard<'static, Option<tokio::runtime::Runtime>> {
+    tokio_runtime()
+  }
+
+  pub fn time(&self) -> Duration {
+    unsafe {
+      let time_ns = (&*self.raw).time_ns.unwrap();
+      return Duration::from_nanos(time_ns());
+    }
   }
 
   pub fn ready_offmain(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
@@ -687,7 +716,7 @@ impl ThalamusAPI {
         drop(Box::from_raw(call_ptr));
       };
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn post_to_threadpool<T: FnOnce() + Send + 'static>(&self, call: T) {
@@ -750,6 +779,36 @@ impl ThalamusAPI {
         *running.borrow_mut() = false;
       }
       None => {
+        callback();
+        *running.borrow_mut() = false;
+      }
+    }
+
+    running
+  }
+
+  pub fn join_task_then<T: Send + 'static, F: FnOnce() + 'static>(
+    &self,
+    handle: Option<tokio::task::JoinHandle<T>>,
+    token: MainThreadToken,
+    callback: F,
+  ) -> Rc<RefCell<bool>> {
+    let running = Rc::new(RefCell::new(true));
+
+    match handle {
+      Some(h) if !h.is_finished() => {
+        let mt_api = self.thread_safe();
+        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), token);
+        self.tokio().as_ref().unwrap().spawn(async move {
+          let _ = h.await;
+          mt_api.post_to_main(move |token| {
+            let (callback, running) = wrapped.take(token);
+            callback();
+            *running.borrow_mut() = false;
+          });
+        });
+      }
+      _ => {
         callback();
         *running.borrow_mut() = false;
       }
@@ -830,6 +889,111 @@ impl ThalamusAPI {
       VulkanQueueGuard { api: *self, lock, queue }
     }
   }
+
+  /// Text of the last SDL error set on this thread. SDL owns the underlying
+  /// buffer (a per-thread static, not freshly allocated), so this copies it
+  /// into an owned String rather than releasing anything.
+  pub fn sdl_error(&self) -> String {
+    unsafe {
+      let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
+      ((&*self.raw).sdl_get_error.unwrap())(&mut span as *mut ThalamusCharSpan);
+      if span.data.is_null() || span.size == 0 {
+        return String::new();
+      }
+      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      std::str::from_utf8(slice).unwrap_or("").to_string()
+    }
+  }
+
+  /// Creates a native window via Thalamus's own SDL3 instance. `flags` is a
+  /// bitor of the `THALAMUS_SDL_WINDOW_*` constants (e.g. `THALAMUS_SDL_WINDOW_VULKAN`).
+  pub fn create_sdl_window(&self, title: &str, width: i32, height: i32, flags: u64) -> Result<SDLWindow, String> {
+    unsafe {
+      let mut span = ThalamusCharSpan { data: title.as_ptr() as *const i8, size: title.len() as u64, owns_data: 0 };
+      let window = ((&*self.raw).sdl_create_window.unwrap())(&mut span as *mut ThalamusCharSpan, width, height, flags);
+      if window.is_null() {
+        Err(self.sdl_error())
+      } else {
+        Ok(SDLWindow { api: *self, window })
+      }
+    }
+  }
+
+  pub fn get_clipboard_text(&self) -> String {
+    unsafe {
+      let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
+      ((&*self.raw).sdl_get_clipboard_text.unwrap())(&mut span as *mut ThalamusCharSpan);
+      let result = if span.data.is_null() || span.size == 0 {
+        String::new()
+      } else {
+        let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+        std::str::from_utf8(slice).unwrap_or("").to_string()
+      };
+      if span.owns_data != 0 {
+        ((&*self.raw).charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
+      }
+      result
+    }
+  }
+
+  pub fn set_clipboard_text(&self, text: &str) -> bool {
+    unsafe {
+      let span = ThalamusCharSpan { data: text.as_ptr() as *const i8, size: text.len() as u64, owns_data: 0 };
+      ((&*self.raw).sdl_set_clipboard_text.unwrap())(&span as *const ThalamusCharSpan) != 0
+    }
+  }
+
+  /// `id` is one of the `THALAMUS_SDL_SYSTEM_CURSOR_*` constants.
+  pub fn create_system_cursor(&self, id: i32) -> Option<SDLCursor> {
+    unsafe {
+      let cursor = ((&*self.raw).sdl_create_system_cursor.unwrap())(id);
+      if cursor.is_null() { None } else { Some(SDLCursor { api: *self, cursor }) }
+    }
+  }
+
+  /// Passing `None` restores the default cursor.
+  pub fn set_cursor(&self, cursor: Option<&SDLCursor>) -> bool {
+    unsafe {
+      let ptr = cursor.map(|c| c.cursor).unwrap_or(std::ptr::null_mut());
+      ((&*self.raw).sdl_set_cursor.unwrap())(ptr) != 0
+    }
+  }
+
+  pub fn show_cursor(&self) -> bool {
+    unsafe { ((&*self.raw).sdl_show_cursor.unwrap())() != 0 }
+  }
+
+  pub fn hide_cursor(&self) -> bool {
+    unsafe { ((&*self.raw).sdl_hide_cursor.unwrap())() != 0 }
+  }
+
+  /// Subscribes to every SDL event Thalamus's central pump sees (from any
+  /// window, including ones this plugin created via `create_sdl_window`).
+  /// Dropping the returned `OnDrop` unsubscribes.
+  pub fn subscribe_sdl_events<T: FnMut(&ThalamusSDLEvent) + 'static>(&self, callback: T) -> OnDrop {
+    let call_ptr = Box::into_raw(Box::new(SDLEventArgs { callback }));
+    let void_ptr = call_ptr as *mut std::os::raw::c_void;
+    let subscription = unsafe {
+      ((&*self.raw).sdl_events_subscribe.unwrap())(Some(sdl_event_callback::<T>), void_ptr)
+    };
+    let api = *self;
+    let cleanup = move || {
+      unsafe {
+        ((&*api.raw).sdl_events_unsubscribe.unwrap())(subscription);
+        drop(Box::from_raw(call_ptr));
+      }
+    };
+    OnDrop::new(cleanup)
+  }
+}
+
+struct SDLEventArgs<T> {
+  callback: T,
+}
+
+unsafe extern "C" fn sdl_event_callback<T: FnMut(&ThalamusSDLEvent)>(event: *mut ThalamusSDLEvent, data: *mut ::std::os::raw::c_void) {
+  let args = unsafe { &mut *(data as *mut SDLEventArgs<T>) };
+  (args.callback)(unsafe { &*event });
 }
 
 /// RAII guard holding Thalamus's shared VkQueue lock. Access `queue()` only
@@ -853,6 +1017,92 @@ impl Drop for VulkanQueueGuard {
     unsafe {
       ((&*self.api.raw).unlock_vulkan_queue.unwrap())(self.lock);
     }
+  }
+}
+
+/// A native window created via `ThalamusAPI::create_sdl_window`, owned by
+/// Thalamus's own SDL3 instance -- the plugin never links or includes SDL
+/// itself. Destroyed via `sdl_destroy_window` when dropped.
+pub struct SDLWindow {
+  api: ThalamusAPI,
+  window: *mut ThalamusSDLWindow,
+}
+unsafe impl Send for SDLWindow {}
+
+impl SDLWindow {
+  pub fn set_position(&self, x: i32, y: i32) {
+    unsafe { ((&*self.api.raw).sdl_set_window_position.unwrap())(self.window, x, y); }
+  }
+
+  pub fn set_size(&self, w: i32, h: i32) {
+    unsafe { ((&*self.api.raw).sdl_set_window_size.unwrap())(self.window, w, h); }
+  }
+
+  pub fn set_title(&self, title: &str) {
+    let mut span = ThalamusCharSpan { data: title.as_ptr() as *const i8, size: title.len() as u64, owns_data: 0 };
+    unsafe { ((&*self.api.raw).sdl_set_window_title.unwrap())(self.window, &mut span as *mut ThalamusCharSpan); }
+  }
+
+  pub fn size_in_pixels(&self) -> (i32, i32) {
+    let (mut w, mut h) = (0, 0);
+    unsafe { ((&*self.api.raw).sdl_get_window_size_in_pixels.unwrap())(self.window, &mut w, &mut h); }
+    (w, h)
+  }
+
+  pub fn id(&self) -> u32 {
+    unsafe { ((&*self.api.raw).sdl_get_window_id.unwrap())(self.window) }
+  }
+
+  pub fn position(&self) -> (i32, i32) {
+    let (mut x, mut y) = (0, 0);
+    unsafe { ((&*self.api.raw).sdl_get_window_position.unwrap())(self.window, &mut x, &mut y); }
+    (x, y)
+  }
+
+  pub fn size(&self) -> (i32, i32) {
+    let (mut w, mut h) = (0, 0);
+    unsafe { ((&*self.api.raw).sdl_get_window_size.unwrap())(self.window, &mut w, &mut h); }
+    (w, h)
+  }
+
+  /// Creates a VkSurfaceKHR for this window against `instance` (e.g. from
+  /// `ThalamusAPI::load_vulkan_instance`). Ownership transfers to the
+  /// caller -- destroy it (e.g. via ash's `khr::surface::Instance::destroy_surface`)
+  /// before this window or the instance goes away.
+  pub fn create_vulkan_surface(&self, instance: ash::vk::Instance) -> Result<ash::vk::SurfaceKHR, String> {
+    unsafe {
+      let raw_instance = instance.as_raw() as *mut VkInstance_T;
+      let mut surface: VkSurfaceKHR = std::ptr::null_mut();
+      let ok = ((&*self.api.raw).sdl_vulkan_create_surface.unwrap())(
+        self.window, raw_instance, std::ptr::null(), &mut surface as *mut VkSurfaceKHR,
+      );
+      if ok != 0 {
+        Ok(ash::vk::SurfaceKHR::from_raw(surface as u64))
+      } else {
+        Err(self.api.sdl_error())
+      }
+    }
+  }
+}
+
+impl Drop for SDLWindow {
+  fn drop(&mut self) {
+    unsafe { ((&*self.api.raw).sdl_destroy_window.unwrap())(self.window); }
+  }
+}
+
+/// A system cursor created via `ThalamusAPI::create_system_cursor`. Destroyed
+/// via `sdl_destroy_cursor` when dropped -- do not `set_cursor` a cursor that
+/// has already been dropped.
+pub struct SDLCursor {
+  api: ThalamusAPI,
+  cursor: *mut ThalamusSDLCursor,
+}
+unsafe impl Send for SDLCursor {}
+
+impl Drop for SDLCursor {
+  fn drop(&mut self) {
+    unsafe { ((&*self.api.raw).sdl_destroy_cursor.unwrap())(self.cursor); }
   }
 }
 
@@ -1655,6 +1905,24 @@ impl State {
     }
   }
 
+  /// Creates a new, detached list state (not yet attached anywhere in the
+  /// tree). Comes back already at refcount 1, like `parent()`/`key_of()` --
+  /// don't wrap it in another `State::new`. Attach it with `set()` (e.g.
+  /// `StateValue::List(list)` at some key) once populated via `push_int()`.
+  pub fn make_list(api: ThalamusAPI) -> State {
+    let state = unsafe { (&*api.raw).state_make_list.unwrap()() };
+    State { api, state }
+  }
+
+  /// Appends an int to a list state built via `make_list()`. Fire-and-forget
+  /// (no completion callback) -- fine for local plugin state, same as the
+  /// existing scalar setters.
+  pub fn push_int(&self, value: i64) {
+    unsafe {
+      (&*self.api.raw).state_push_int_with_callback.unwrap()(self.state, value, None, std::ptr::null_mut());
+    }
+  }
+
   pub fn contains_key(&self, val: StateKey) -> bool {
     for entry in self {
       if entry.key == val {
@@ -1836,7 +2104,7 @@ impl State {
       println!("StateConnection::drop");
     };
 
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -1855,18 +2123,44 @@ impl Drop for State {
 }
 
 pub struct OnDrop {
-  action: Box<dyn FnMut()>
+  action: Option<Box<dyn FnOnce()>>
 }
 
 impl OnDrop {
   pub fn noop() -> OnDrop {
-    OnDrop { action: Box::new(|| {}) }
+    OnDrop { action: Some(Box::new(|| {})) }
+  }
+  pub fn new<F: FnOnce() + 'static>(f: F) -> OnDrop {
+    OnDrop { action: Some(Box::new(f)) }
   }
 }
 
 impl Drop for OnDrop {
   fn drop(&mut self) {
-    (self.action)();
+    if let Some(action) = self.action.take() {
+      action();
+    }
+  }
+}
+
+pub struct OnDropSend {
+  action: Option<Box<dyn FnOnce() + Send>>
+}
+
+impl OnDropSend {
+  pub fn noop() -> OnDropSend {
+    OnDropSend { action: Some(Box::new(|| {})) }
+  }
+  pub fn new<F: FnOnce() + Send + 'static>(f: F) -> OnDropSend {
+    OnDropSend { action: Some(Box::new(f)) }
+  }
+}
+
+impl Drop for OnDropSend {
+  fn drop(&mut self) {
+    if let Some(action) = self.action.take() {
+      action();
+    }
   }
 }
 
@@ -1931,6 +2225,7 @@ pub trait Node {
     token.ready()
   }
   fn modalities(&self) -> u32 { 0 }
+  fn signals_offmain(&self) -> bool { false }
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {
@@ -1943,16 +2238,19 @@ pub trait Node {
 
 pub trait NodeData {
   fn time(&self) -> Duration;
-  fn analog(&self) -> Option<&dyn AnalogData>;
-  fn image(&self) -> Option<&dyn ImageData>;
-  fn mocap(&self) -> Option<&dyn MocapData>;
+  fn analog(&self) -> Option<&dyn AnalogData> { None }
+  fn image(&self) -> Option<&dyn ImageData> { None }
+  fn mocap(&self) -> Option<&dyn MocapData> { None }
+  fn text(&self) -> Option<&dyn TextData> { None }
 }
 
 pub trait AnalogData {
   fn data(
           &self,
-          channel: i32,
-      ) -> &[f64];
+          _channel: i32,
+      ) -> &[f64] {
+        panic!("Unimplemented")
+      }
 
   fn short_data(
           &self,
@@ -1978,7 +2276,7 @@ pub trait AnalogData {
   fn sample_interval(&self, channel: i32) -> Duration;
   fn name(
           &self,
-          channel: ::std::os::raw::c_int,
+          channel: i32,
       ) -> &str;
   fn is_short_data(&self) -> bool{
         false
@@ -2028,6 +2326,10 @@ pub trait MocapData {
   fn pose_name(
           &self,
       ) -> &str;
+}
+
+pub trait TextData {
+  fn text(&self) -> &str;
 }
 
 pub static OPERATION_ABORTED: OnceLock<i32> = OnceLock::<i32>::new();
