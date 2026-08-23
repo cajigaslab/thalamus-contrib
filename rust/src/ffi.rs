@@ -397,6 +397,30 @@ thalamus_api_raw! {
     sdl_destroy_cursor: unsafe extern "C" fn(*mut ThalamusSDLCursor),
     sdl_show_cursor: unsafe extern "C" fn() -> u8,
     sdl_hide_cursor: unsafe extern "C" fn() -> u8,
+
+    state_make_dict: unsafe extern "C" fn() -> *mut ThalamusState,
+    state_make_list: unsafe extern "C" fn() -> *mut ThalamusState,
+
+    state_set_at_name_state_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, *mut ThalamusState, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_name_string_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, *const ThalamusCharSpan, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_name_int_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, i64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_name_float_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, f64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_name_null_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_name_bool_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, i8, IoContextPostCallback, *mut ::std::os::raw::c_void),
+
+    state_set_at_index_state_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, *mut ThalamusState, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_index_string_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, *const ThalamusCharSpan, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_index_int_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, i64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_index_float_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, f64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_index_null_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_set_at_index_bool_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, i8, IoContextPostCallback, *mut ::std::os::raw::c_void),
+
+    state_push_state_with_callback: unsafe extern "C" fn(*mut ThalamusState, *mut ThalamusState, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_push_string_with_callback: unsafe extern "C" fn(*mut ThalamusState, *const ThalamusCharSpan, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_push_int_with_callback: unsafe extern "C" fn(*mut ThalamusState, i64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_push_float_with_callback: unsafe extern "C" fn(*mut ThalamusState, f64, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_push_null_with_callback: unsafe extern "C" fn(*mut ThalamusState, IoContextPostCallback, *mut ::std::os::raw::c_void),
+    state_push_bool_with_callback: unsafe extern "C" fn(*mut ThalamusState, i8, IoContextPostCallback, *mut ::std::os::raw::c_void),
 }
 
 #[repr(C)]
@@ -815,7 +839,24 @@ impl ThalamusMocapNode {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ThalamusTextNode {
-    _unused: [u8; 0],
+    pub text: ::std::option::Option<
+        unsafe extern "C" fn(
+            *mut ThalamusCharSpan,
+            node: *mut ThalamusNode,
+        ),
+    >,
+    pub has_text_data: ::std::option::Option<
+        unsafe extern "C" fn(node: *mut ThalamusNode) -> ::std::os::raw::c_char,
+    >,
+}
+
+impl ThalamusTextNode {
+  pub fn new() -> ThalamusTextNode {
+    ThalamusTextNode {
+      text: None,
+      has_text_data: None,
+    }
+  }
 }
 
 #[repr(C)]
@@ -1063,6 +1104,23 @@ pub extern "C" fn c_node_mocap_has_motion_data(raw_node: *mut ThalamusNode) -> i
   if mocap.is_some() {1}else{0}
 }
 
+pub extern "C" fn c_node_text_text(output: *mut ThalamusCharSpan, raw_node: *mut ThalamusNode) {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let text = deref_plugin_impl(c_node).data.unwrap().text().unwrap();
+  let result = text.text();
+  unsafe {
+    (&mut *output).data = result.as_ptr() as *const i8;
+    (&mut *output).size = result.len() as u64;
+  }
+}
+
+#[allow(non_snake_case)]
+pub extern "C" fn c_node_text_has_text_data(raw_node: *mut ThalamusNode) -> i8 {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let text = deref_plugin_impl(c_node).data.and_then(|data| data.text());
+  if text.is_some() {1}else{0}
+}
+
 fn wrap_analog(c_node: &mut ThalamusNode) {
   c_node.analog = Box::into_raw(Box::new(ThalamusAnalogNode::new()));
   unsafe {
@@ -1102,6 +1160,14 @@ fn wrap_mocap(c_node: &mut ThalamusNode) {
     (*c_node.mocap).segments = Some(c_node_mocap_segments);
     (*c_node.mocap).pose_name = Some(c_node_mocap_pose_name);
     (*c_node.mocap).has_motion_data = Some(c_node_mocap_has_motion_data);
+  }
+}
+
+fn wrap_text(c_node: &mut ThalamusNode) {
+  c_node.text = Box::into_raw(Box::new(ThalamusTextNode::new()));
+  unsafe {
+    (*c_node.text).text = Some(c_node_text_text);
+    (*c_node.text).has_text_data = Some(c_node_text_has_text_data);
   }
 }
 
@@ -1148,6 +1214,9 @@ extern "C" fn create_node_template<T: crate::api::Node + 'static>(factory: *mut 
   }
   if modalities & THALAMUS_MODALITY_IMAGE != 0 {
     wrap_image(c_node_ref);
+  }
+  if modalities & THALAMUS_MODALITY_TEXT != 0 {
+    wrap_text(c_node_ref);
   }
 
   c_node_ref.plugin_impl = Box::into_raw(result) as *mut ::std::os::raw::c_void;

@@ -232,6 +232,11 @@ impl<'a> NodeData for ExtNodeData<'a> {
     let mocap = unsafe { (*self.node.node).mocap };
     if mocap.is_null() { None } else { Some(self) }
   }
+
+  fn text(&self) -> Option<&dyn TextData> {
+    let text = unsafe { (*self.node.node).text };
+    if text.is_null() { None } else { Some(self) }
+  }
 }
 
 impl<'a> AnalogData for ExtNodeData<'a> {
@@ -412,6 +417,19 @@ impl<'a> MocapData for ExtNodeData<'a> {
       let mocap = (*self.node.node).mocap;
       let pose_name = (*mocap).pose_name.unwrap();
       pose_name(&mut span as *mut ThalamusCharSpan, self.node.node);
+      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      std::str::from_utf8(slice).unwrap()
+    }
+  }
+}
+
+impl<'a> TextData for ExtNodeData<'a> {
+  fn text(&self) -> &str {
+    let mut span = ThalamusCharSpan { data : null(), size: 0, owns_data: 0 };
+    unsafe {
+      let text_node = (*self.node.node).text;
+      let text_func = (*text_node).text.unwrap();
+      text_func(&mut span as *mut ThalamusCharSpan, self.node.node);
       let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap()
     }
@@ -965,7 +983,7 @@ impl ThalamusAPI {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -1887,6 +1905,24 @@ impl State {
     }
   }
 
+  /// Creates a new, detached list state (not yet attached anywhere in the
+  /// tree). Comes back already at refcount 1, like `parent()`/`key_of()` --
+  /// don't wrap it in another `State::new`. Attach it with `set()` (e.g.
+  /// `StateValue::List(list)` at some key) once populated via `push_int()`.
+  pub fn make_list(api: ThalamusAPI) -> State {
+    let state = unsafe { (&*api.raw).state_make_list.unwrap()() };
+    State { api, state }
+  }
+
+  /// Appends an int to a list state built via `make_list()`. Fire-and-forget
+  /// (no completion callback) -- fine for local plugin state, same as the
+  /// existing scalar setters.
+  pub fn push_int(&self, value: i64) {
+    unsafe {
+      (&*self.api.raw).state_push_int_with_callback.unwrap()(self.state, value, None, std::ptr::null_mut());
+    }
+  }
+
   pub fn contains_key(&self, val: StateKey) -> bool {
     for entry in self {
       if entry.key == val {
@@ -2205,6 +2241,7 @@ pub trait NodeData {
   fn analog(&self) -> Option<&dyn AnalogData> { None }
   fn image(&self) -> Option<&dyn ImageData> { None }
   fn mocap(&self) -> Option<&dyn MocapData> { None }
+  fn text(&self) -> Option<&dyn TextData> { None }
 }
 
 pub trait AnalogData {
@@ -2289,6 +2326,10 @@ pub trait MocapData {
   fn pose_name(
           &self,
       ) -> &str;
+}
+
+pub trait TextData {
+  fn text(&self) -> &str;
 }
 
 pub static OPERATION_ABORTED: OnceLock<i32> = OnceLock::<i32>::new();

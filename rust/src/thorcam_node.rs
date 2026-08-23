@@ -1,14 +1,15 @@
 use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::{Arc, OnceLock};
+use std::rc::{Rc, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::api::{
     AnalogData, ImageData, ImageFormat, MainThreadToken, MocapData, Node, NodeData, NodeToken,
-    OnDrop, PredropToken, Request, Json, State, StateAction, StateValue, ThalamusAPI,
-    ThalamusAPIThreadSafe, THALAMUS_MODALITY_IMAGE,
+    OnDrop, PredropToken, Request, Json, State, StateAction, StateKey, StateValue, ThalamusAPI,
+    ThalamusAPIThreadSafe, THALAMUS_MODALITY_IMAGE, run_task, TaskScope,
 };
+use crate::image_viewer::{ImageFrame, ImageViewer};
 
 type IsGetNumberOfCameras = unsafe extern "C" fn(*mut i32) -> i32;
 type IsGetCameraList     = unsafe extern "C" fn(*mut u8) -> i32;
@@ -175,14 +176,26 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
     }, cameras))
 }
 
+/// Latest camera frame handed off from the capture thread to the main
+/// thread's preview window, overwritten in place each frame -- the viewer
+/// only ever needs the most recent one and drops older frames on the floor.
+struct FrameSnapshot {
+    data:   Vec<u8>,
+    width:  u32,
+    height: u32,
+}
+
 struct ThorcamNodeInner {
     api:               ThalamusAPI,
     node_token:        NodeToken,
-    _state:             State,
+    state:             State,
     state_connection:  Option<OnDrop>,
     camera_thread:     Option<std::thread::JoinHandle<()>>,
     stop_flag:         Arc<AtomicBool>,
     main_thread_token: MainThreadToken,
+    viewer:            Option<ImageViewer>,
+    viewer_task:       Option<TaskScope>,
+    shared_frame:      Arc<Mutex<Option<FrameSnapshot>>>,
 }
 
 pub struct ThorcamNode {
@@ -201,14 +214,163 @@ fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
     });
 }
 
+/// Reads `view_geometry` as `(x, y, w, h)` if the key exists and is a list
+/// with (at least) 4 int elements -- mirrors `read_geometry` in
+/// image_viewer.cpp.
+fn read_geometry(state: &State) -> Option<(i32, i32, i32, i32)> {
+    let StateValue::List(list) = state.get(StateKey::String("view_geometry".to_string()))? else {
+        return None;
+    };
+    let mut values = Vec::with_capacity(4);
+    for entry in &list {
+        if let StateValue::Int(v) = entry.val {
+            values.push(v);
+        }
+    }
+    if values.len() < 4 {
+        return None;
+    }
+    Some((values[0] as i32, values[1] as i32, values[2] as i32, values[3] as i32))
+}
+
+/// Replaces `view_geometry` with a freshly built `[x, y, w, h]` list --
+/// mirrors `write_geometry` in image_viewer.cpp, which likewise always
+/// reassigns the whole array rather than mutating elements in place.
+fn write_geometry(api: ThalamusAPI, state: &State, x: i32, y: i32, w: i32, h: i32) {
+    let list = State::make_list(api);
+    list.push_int(x as i64);
+    list.push_int(y as i64);
+    list.push_int(w as i64);
+    list.push_int(h as i64);
+    state.set(StateKey::String("view_geometry".to_string()), StateValue::List(list));
+}
+
+/// Ticks the preview window on the main thread: uploads+presents whatever
+/// frame the capture thread most recently deposited in `shared_frame`, and
+/// once a second checks whether the window moved/resized to persist that
+/// into `view_geometry`. Ends itself once the viewer is closed (by the
+/// window's X button -- which also flips `View` back to false -- or by
+/// close_viewer). Holds `inner` weakly so it never keeps ThorcamNodeInner
+/// alive by itself; see close_viewer for why.
+async fn viewer_tick_loop(api: ThalamusAPI, inner: Weak<RefCell<ThorcamNodeInner>>, initial_geometry: (i32, i32, i32, i32)) {
+    let timer = api.create_timer();
+    let mut last_geometry_check = Instant::now();
+    let mut last_geometry = initial_geometry;
+
+    loop {
+        let _ = timer.sleep(Duration::from_millis(33)).await;
+
+        let Some(inner) = inner.upgrade() else { break };
+
+        // Taken before borrowing `.viewer` mutably below: RefCell's Deref
+        // goes through a trait method, so the borrow checker can't split
+        // `borrow.shared_frame` and `borrow.viewer` as disjoint fields the
+        // way it could for a plain struct -- holding both borrows at once
+        // (even of different fields) would conflict.
+        let shared_frame = inner.borrow().shared_frame.clone();
+        let snapshot = shared_frame.lock().unwrap().take();
+
+        let mut borrow = inner.borrow_mut();
+        let Some(viewer) = borrow.viewer.as_mut() else { break };
+
+        if viewer.should_close() {
+            // Only clear `.viewer` here, never `.viewer_task`: this loop IS
+            // that task, so dropping its own TaskScope from inside its own
+            // poll would deadlock (TaskScope::drop locks the same Task
+            // state this poll call is already holding). Leaving the
+            // (now-idle) task in place is harmless -- it'll be replaced next
+            // time open_viewer runs, or dropped along with the rest of
+            // ThorcamNodeInner when the node itself goes away.
+            borrow.viewer = None;
+            drop(borrow);
+            inner.borrow().state.set(StateKey::String("View".to_string()), StateValue::Bool(false));
+            break;
+        }
+
+        let frame = snapshot.as_ref().map(|s| ImageFrame {
+            data: &s.data,
+            width: s.width,
+            height: s.height,
+            format: ImageFormat::Gray,
+        });
+        viewer.update(frame);
+
+        let now = Instant::now();
+        let geometry_to_write = if now.duration_since(last_geometry_check) >= Duration::from_secs(1) {
+            last_geometry_check = now;
+            let geometry = viewer.position_size();
+            if geometry != last_geometry {
+                last_geometry = geometry;
+                Some(geometry)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(borrow);
+
+        if let Some((x, y, w, h)) = geometry_to_write {
+            write_geometry(api, &inner.borrow().state, x, y, w, h);
+        }
+    }
+}
+
+/// Opens the preview window if it isn't already open, seeding its position
+/// from `view_geometry` (writing a default there first if it doesn't exist
+/// yet, matching the C++ ImageViewer constructor).
+fn open_viewer(inner: &Rc<RefCell<ThorcamNodeInner>>) {
+    if inner.borrow().viewer.is_some() {
+        return;
+    }
+    let (api, state) = {
+        let borrow = inner.borrow();
+        (borrow.api, borrow.state.clone())
+    };
+
+    let geometry = match read_geometry(&state) {
+        Some(geometry) => geometry,
+        None => {
+            let default_geometry = (100, 100, 400, 400);
+            write_geometry(api, &state, default_geometry.0, default_geometry.1, default_geometry.2, default_geometry.3);
+            default_geometry
+        }
+    };
+    let (x, y, w, h) = geometry;
+
+    match ImageViewer::new(api, "Thorcam", x, y, w, h) {
+        Ok(viewer) => {
+            let mut borrow = inner.borrow_mut();
+            borrow.viewer = Some(viewer);
+            borrow.viewer_task = Some(run_task(viewer_tick_loop(api, Rc::downgrade(inner), geometry)));
+        }
+        Err(e) => println!("ThorcamNode: failed to create image viewer: {}", e),
+    }
+}
+
+/// Closes the preview window (if open), which immediately releases its
+/// Vulkan/SDL resources. Deliberately does NOT touch `viewer_task`: this is
+/// called synchronously from the "View" state callback, which viewer_tick_loop's
+/// own should_close branch can trigger re-entrantly (state.set() dispatches
+/// connected callbacks inline, not posted) -- and that branch runs from
+/// inside the task's own poll, so dropping its TaskScope here would try to
+/// re-lock the Task state the poll call already holds, deadlocking exactly
+/// like the earlier Vulkan-queue double-lock bug. The idle task notices
+/// `.viewer` is gone on its own next tick and ends itself; `viewer_task` is
+/// only ever replaced (by open_viewer) or dropped (with the rest of
+/// ThorcamNodeInner) from contexts that are never inside its own poll.
+fn close_viewer(inner: &Rc<RefCell<ThorcamNodeInner>>) {
+    inner.borrow_mut().viewer = None;
+}
+
 fn start_camera_impl(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-    let (api, device_id, node_token) = {
+    let (api, device_id, node_token, shared_frame) = {
         let borrow = inner.borrow();
         let device_id = UC480.get()
             .and_then(|r| r.as_ref().ok())
             .and_then(|(_, cameras)| cameras.first())
             .map(|c| c.device_id);
-        (borrow.api, device_id, borrow.node_token.clone())
+        (borrow.api, device_id, borrow.node_token.clone(), borrow.shared_frame.clone())
     };
 
     let Some(device_id) = device_id else {
@@ -221,7 +383,7 @@ fn start_camera_impl(inner: &Rc<RefCell<ThorcamNodeInner>>) {
 
     let mt_api = api.thread_safe();
     let handle = std::thread::spawn(move || {
-        run_camera(mt_api, node_token, stop_clone, device_id);
+        run_camera(mt_api, node_token, stop_clone, device_id, shared_frame);
     });
 
     let mut borrow = inner.borrow_mut();
@@ -247,6 +409,7 @@ fn run_camera(
     node_token: NodeToken,
     stop: Arc<AtomicBool>,
     device_id: u32,
+    shared_frame: Arc<Mutex<Option<FrameSnapshot>>>,
 ) {
     let lib = match UC480.get().and_then(|r| r.as_ref().ok()) {
         Some((lib, _)) => lib,
@@ -356,6 +519,15 @@ fn run_camera(
         // before this call returns. Ignore if the node was destroyed concurrently.
         let _ = api.ready_offmain(&data, &node_token);
 
+        // Copied out before unlock_seq_buf below hands the buffer back to the
+        // driver (which may overwrite it): the main-thread preview window
+        // reads this asynchronously, well after this call returns.
+        *shared_frame.lock().unwrap() = Some(FrameSnapshot {
+            data: data.plane(0).to_vec(),
+            width: width as u32,
+            height: height as u32,
+        });
+
         unsafe { (lib.unlock_seq_buf)(h_cam, next_id, next_mem) };
     }
 
@@ -446,11 +618,14 @@ impl Node for ThorcamNode {
         let inner = Rc::new(RefCell::new(ThorcamNodeInner {
             api,
             node_token,
-            _state: state.clone(),
+            state: state.clone(),
             state_connection: None,
             camera_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
             main_thread_token: token,
+            viewer: None,
+            viewer_task: None,
+            shared_frame: Arc::new(Mutex::new(None)),
         }));
 
         let change_ref = Rc::clone(&inner);
@@ -464,6 +639,13 @@ impl Node for ThorcamNode {
                         stop_camera(&change_ref, || {});
                     }
                 }
+                "View" => {
+                    if value == StateValue::Bool(true) {
+                        open_viewer(&change_ref);
+                    } else {
+                        close_viewer(&change_ref);
+                    }
+                }
                 _ => {}
             }
         };
@@ -475,6 +657,7 @@ impl Node for ThorcamNode {
     }
 
     fn predrop(&self, token: PredropToken) {
+        close_viewer(&self.inner);
         stop_camera(&self.inner, move || {
             token.ready();
         });
@@ -483,6 +666,7 @@ impl Node for ThorcamNode {
 
 impl Drop for ThorcamNode {
     fn drop(&mut self) {
+        close_viewer(&self.inner);
         stop_camera(&self.inner, || {});
     }
 }

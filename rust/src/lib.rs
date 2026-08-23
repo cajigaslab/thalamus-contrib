@@ -5,6 +5,7 @@ mod wakers;
 pub mod api;
 mod imgui_platform;
 mod imgui_window;
+mod image_viewer;
 mod thorcam_node;
 mod ffmpeg_devices;
 mod webcam_node;
