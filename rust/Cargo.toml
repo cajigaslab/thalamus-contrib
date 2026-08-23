@@ -16,10 +16,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_core = "1.0.228"
 serde_derive = "1.0.228"
 serde_json = "1.0.150"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ash = "0.38.0"
 imgui = "0.12"
 imgui-rs-vulkan-renderer = "1.16"
+btleplug = "0.12.0"
+uuid = "1.24.1"
+bytebuffer = "2.3.0"
+tokio-util = { version = "0.7.19", features = ["rt"] }
 
 [build-dependencies]
 cmake = "0.1.58"

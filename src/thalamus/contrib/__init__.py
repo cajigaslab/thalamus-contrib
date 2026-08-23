@@ -41,6 +41,15 @@ def widgets():
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
       UserData(UserDataType.DEFAULT, 'Destination', '', []),
     ]),
+    'ANGULAR_SCALING': Factory(None, [
+      UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
+      UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation X', 0.0, []),
+      UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation Y', 0.0, []),
+    ]),
+    'SLEEVE': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.DEFAULT, 'Address', '', []),
+    ]),
   }
 
 def library():

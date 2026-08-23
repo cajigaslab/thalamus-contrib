@@ -33,8 +33,18 @@ impl MainThreadToken {
   /// (e.g. node factory callbacks, post_callback). Not pub so callers outside
   /// this crate cannot manufacture a token.
   pub(crate) unsafe fn new_in_main_thread_callback() -> Self {
+    MAIN_THREAD_ID.get_or_init(|| std::thread::current().id());
     MainThreadToken { _not_send: PhantomData }
   }
+}
+
+/// Thread ID of the main (io_context) thread, learned the first time a
+/// MainThreadToken is manufactured, which only ever happens on that thread.
+static MAIN_THREAD_ID: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+/// True if the calling thread is the main (io_context) thread.
+pub fn is_main_thread() -> bool {
+  MAIN_THREAD_ID.get() == Some(&std::thread::current().id())
 }
 
 /// Wraps a !Send value so it can travel inside a Send closure, while ensuring
@@ -115,7 +125,7 @@ impl ExtNode {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn subscribe_multithreaded<T: FnMut(ExtNode) + Send + 'static>(&self, callback: T) -> OnDrop {
@@ -135,7 +145,7 @@ impl ExtNode {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn analog<'a>(&'a self) -> Option<ExtAnalogNode<'a>> {
@@ -192,7 +202,7 @@ impl<'a> ExtAnalogNode<'a> {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -491,6 +501,17 @@ impl ThalamusAPIThreadSafe {
     ThalamusAPI{raw: self.raw}
   }
 
+  pub fn tokio(&self) -> std::sync::MutexGuard<'static, Option<tokio::runtime::Runtime>> {
+    tokio_runtime()
+  }
+
+  pub fn time(&self) -> Duration {
+    unsafe {
+      let time_ns = (&*self.raw).time_ns.unwrap();
+      return Duration::from_nanos(time_ns());
+    }
+  }
+
   pub fn ready_offmain(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
     token.with(|node| unsafe {
       let node_ready_offmain = (&*self.raw).node_ready_offmain.unwrap();
@@ -504,6 +525,16 @@ impl ThalamusAPIThreadSafe {
       node_ready_offmain(node);
       (*plugin_impl).data = None;
     })
+  }
+
+  /// Calls `ready` if invoked on the main thread, otherwise `ready_offmain`.
+  pub fn ready_this_thread(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
+    if is_main_thread() {
+      let main_token = unsafe { MainThreadToken::new_in_main_thread_callback() };
+      self.thread_unsafe(main_token).ready(data, token)
+    } else {
+      self.ready_offmain(data, token)
+    }
   }
 
   pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
@@ -667,7 +698,7 @@ impl ThalamusAPI {
         drop(Box::from_raw(call_ptr));
       };
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn post_to_threadpool<T: FnOnce() + Send + 'static>(&self, call: T) {
@@ -730,6 +761,36 @@ impl ThalamusAPI {
         *running.borrow_mut() = false;
       }
       None => {
+        callback();
+        *running.borrow_mut() = false;
+      }
+    }
+
+    running
+  }
+
+  pub fn join_task_then<T: Send + 'static, F: FnOnce() + 'static>(
+    &self,
+    handle: Option<tokio::task::JoinHandle<T>>,
+    token: MainThreadToken,
+    callback: F,
+  ) -> Rc<RefCell<bool>> {
+    let running = Rc::new(RefCell::new(true));
+
+    match handle {
+      Some(h) if !h.is_finished() => {
+        let mt_api = self.thread_safe();
+        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), token);
+        self.tokio().as_ref().unwrap().spawn(async move {
+          let _ = h.await;
+          mt_api.post_to_main(move |token| {
+            let (callback, running) = wrapped.take(token);
+            callback();
+            *running.borrow_mut() = false;
+          });
+        });
+      }
+      _ => {
         callback();
         *running.borrow_mut() = false;
       }
@@ -2007,7 +2068,7 @@ impl State {
       println!("StateConnection::drop");
     };
 
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -2026,18 +2087,44 @@ impl Drop for State {
 }
 
 pub struct OnDrop {
-  action: Box<dyn FnMut()>
+  action: Option<Box<dyn FnOnce()>>
 }
 
 impl OnDrop {
   pub fn noop() -> OnDrop {
-    OnDrop { action: Box::new(|| {}) }
+    OnDrop { action: Some(Box::new(|| {})) }
+  }
+  pub fn new<F: FnOnce() + 'static>(f: F) -> OnDrop {
+    OnDrop { action: Some(Box::new(f)) }
   }
 }
 
 impl Drop for OnDrop {
   fn drop(&mut self) {
-    (self.action)();
+    if let Some(action) = self.action.take() {
+      action();
+    }
+  }
+}
+
+pub struct OnDropSend {
+  action: Option<Box<dyn FnOnce() + Send>>
+}
+
+impl OnDropSend {
+  pub fn noop() -> OnDropSend {
+    OnDropSend { action: Some(Box::new(|| {})) }
+  }
+  pub fn new<F: FnOnce() + Send + 'static>(f: F) -> OnDropSend {
+    OnDropSend { action: Some(Box::new(f)) }
+  }
+}
+
+impl Drop for OnDropSend {
+  fn drop(&mut self) {
+    if let Some(action) = self.action.take() {
+      action();
+    }
   }
 }
 
@@ -2102,6 +2189,7 @@ pub trait Node {
     token.ready()
   }
   fn modalities(&self) -> u32 { 0 }
+  fn signals_offmain(&self) -> bool { false }
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {
@@ -2114,16 +2202,18 @@ pub trait Node {
 
 pub trait NodeData {
   fn time(&self) -> Duration;
-  fn analog(&self) -> Option<&dyn AnalogData>;
-  fn image(&self) -> Option<&dyn ImageData>;
-  fn mocap(&self) -> Option<&dyn MocapData>;
+  fn analog(&self) -> Option<&dyn AnalogData> { None }
+  fn image(&self) -> Option<&dyn ImageData> { None }
+  fn mocap(&self) -> Option<&dyn MocapData> { None }
 }
 
 pub trait AnalogData {
   fn data(
           &self,
-          channel: i32,
-      ) -> &[f64];
+          _channel: i32,
+      ) -> &[f64] {
+        panic!("Unimplemented")
+      }
 
   fn short_data(
           &self,
@@ -2149,7 +2239,7 @@ pub trait AnalogData {
   fn sample_interval(&self, channel: i32) -> Duration;
   fn name(
           &self,
-          channel: ::std::os::raw::c_int,
+          channel: i32,
       ) -> &str;
   fn is_short_data(&self) -> bool{
         false

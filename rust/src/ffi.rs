@@ -20,6 +20,7 @@ pub struct ThalamusNode {
     pub plugin_impl: *mut ::std::os::raw::c_void,
     pub process: ::std::option::Option<unsafe extern "C" fn(*mut ThalamusNode, *mut ThalamusRequestHandle, *mut ThalamusJson)>,
     pub predrop: ::std::option::Option<unsafe extern "C" fn(*mut ThalamusNode)>,
+    pub signals_offmain: u8,
 }
 
 #[repr(C)]
@@ -861,6 +862,39 @@ pub extern "C" fn c_node_analog_data(output: *mut ThalamusDoubleSpan, raw_node: 
   }
 }
 
+pub extern "C" fn c_node_analog_short_data(output: *mut ThalamusShortSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+
+  let result = analog.short_data(channel);
+  unsafe {
+    (&mut *output).data = result.as_ptr();
+    (&mut *output).size = result.len() as u64;
+  }
+}
+
+pub extern "C" fn c_node_analog_int_data(output: *mut ThalamusIntSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+
+  let result = analog.int_data(channel);
+  unsafe {
+    (&mut *output).data = result.as_ptr();
+    (&mut *output).size = result.len() as u64;
+  }
+}
+
+pub extern "C" fn c_node_analog_ulong_data(output: *mut ThalamusULongSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+
+  let result = analog.ulong_data(channel);
+  unsafe {
+    (&mut *output).data = result.as_ptr();
+    (&mut *output).size = result.len() as u64;
+  }
+}
+
 pub extern "C" fn c_node_analog_num_channels(raw_node: *mut ThalamusNode) -> i32 {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
@@ -1033,9 +1067,9 @@ fn wrap_analog(c_node: &mut ThalamusNode) {
   c_node.analog = Box::into_raw(Box::new(ThalamusAnalogNode::new()));
   unsafe {
     (*c_node.analog).data = Some(c_node_analog_data);
-    (*c_node.analog).short_data = None;
-    (*c_node.analog).int_data = None;
-    (*c_node.analog).ulong_data = None;
+    (*c_node.analog).short_data = Some(c_node_analog_short_data);
+    (*c_node.analog).int_data = Some(c_node_analog_int_data);
+    (*c_node.analog).ulong_data = Some(c_node_analog_ulong_data);
     (*c_node.analog).num_channels = Some(c_node_analog_num_channels);
     (*c_node.analog).sample_interval_ns = Some(c_node_analog_sample_interval_ns);
     (*c_node.analog).name = Some(c_node_analog_name);
@@ -1083,7 +1117,8 @@ extern "C" fn create_node_template<T: crate::api::Node + 'static>(factory: *mut 
     text: ptr::null_mut() as *mut ThalamusTextNode,
     plugin_impl: ptr::null_mut() as *mut ::std::os::raw::c_void,
     process: None,
-    predrop: None
+    predrop: None,
+    signals_offmain: 0,
   }));
   let c_node_ref = unsafe {&mut*c_node};
   let api = ThalamusAPI{raw: api_raw};
@@ -1091,6 +1126,7 @@ extern "C" fn create_node_template<T: crate::api::Node + 'static>(factory: *mut 
 
   let token = unsafe { crate::api::MainThreadToken::new_in_main_thread_callback() };
   let node = T::new(api, node_token.clone(), crate::api::State::new(api, state), token);
+  c_node_ref.signals_offmain = if node.signals_offmain() { 1 } else { 0 };
   let modalities = node.modalities();
 
   let result = Box::new(PluginImpl {
