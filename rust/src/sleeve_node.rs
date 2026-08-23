@@ -327,7 +327,7 @@ impl SleeveNodeInner {
               if let Some(ptx) = ptx_opt.take() {
                 return match ptx.send(peripheral) {
                   Ok(_) => Ok(true),
-                  Err(v) => Err(v.to_string()),
+                  Err(_) => Err("Failed to send".to_string()),
                 };
               }
             }
@@ -337,7 +337,7 @@ impl SleeveNodeInner {
               if let Some(ptx) = ptx_opt.take() {
                 return match ptx.send(peripheral) {
                   Ok(_) => Ok(true),
-                  Err(v) => Err(v.to_string()),
+                  Err(_) => Err("Failed to send".to_string()),
                 };
               }
             }

@@ -109,18 +109,16 @@ impl ImguiWindow {
 
     let renderer = {
       let guard = api.lock_vulkan_queue();
-      unsafe {
-        Renderer::with_default_allocator(
-          &instance,
-          physical_device,
-          device.clone(),
-          guard.queue(),
-          cmd_pool,
-          render_pass,
-          &mut ctx,
-          Some(Options { in_flight_frames: MAX_FRAMES_IN_FLIGHT, ..Default::default() }),
-        )
-      }
+      Renderer::with_default_allocator(
+        &instance,
+        physical_device,
+        device.clone(),
+        guard.queue(),
+        cmd_pool,
+        render_pass,
+        &mut ctx,
+        Some(Options { in_flight_frames: MAX_FRAMES_IN_FLIGHT, ..Default::default() }),
+      )
       .map_err(|e| e.to_string())?
     };
 
