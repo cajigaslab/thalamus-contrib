@@ -68,8 +68,8 @@ pub struct CameraInfo {
 
 struct Uc480Lib {
     _library: libloading::Library,
-    get_number_of_cameras: IsGetNumberOfCameras,
-    get_camera_list:       IsGetCameraList,
+    _get_number_of_cameras: IsGetNumberOfCameras,
+    _get_camera_list:       IsGetCameraList,
     init_camera:           IsInitCamera,
     exit_camera:           IsExitCamera,
     get_sensor_info:       IsGetSensorInfo,
@@ -166,7 +166,7 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
 
     Ok((Uc480Lib {
         _library: library,
-        get_number_of_cameras, get_camera_list,
+        _get_number_of_cameras: get_number_of_cameras, _get_camera_list: get_camera_list,
         init_camera, exit_camera, get_sensor_info,
         set_color_mode, alloc_image_mem, free_image_mem,
         add_to_sequence, clear_sequence, unlock_seq_buf,
@@ -178,7 +178,7 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
 struct ThorcamNodeInner {
     api:               ThalamusAPI,
     node_token:        NodeToken,
-    state:             State,
+    _state:             State,
     state_connection:  Option<OnDrop>,
     camera_thread:     Option<std::thread::JoinHandle<()>>,
     stop_flag:         Arc<AtomicBool>,
@@ -446,7 +446,7 @@ impl Node for ThorcamNode {
         let inner = Rc::new(RefCell::new(ThorcamNodeInner {
             api,
             node_token,
-            state: state.clone(),
+            _state: state.clone(),
             state_connection: None,
             camera_thread: None,
             stop_flag: Arc::new(AtomicBool::new(false)),

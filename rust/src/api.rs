@@ -125,7 +125,7 @@ impl ExtNode {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn subscribe_multithreaded<T: FnMut(ExtNode) + Send + 'static>(&self, callback: T) -> OnDrop {
@@ -145,7 +145,7 @@ impl ExtNode {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn analog<'a>(&'a self) -> Option<ExtAnalogNode<'a>> {
@@ -202,7 +202,7 @@ impl<'a> ExtAnalogNode<'a> {
         drop(Box::from_raw(call_ptr));
       }
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -698,7 +698,7 @@ impl ThalamusAPI {
         drop(Box::from_raw(call_ptr));
       };
     };
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 
   pub fn post_to_threadpool<T: FnOnce() + Send + 'static>(&self, call: T) {
@@ -1877,7 +1877,7 @@ impl State {
       println!("StateConnection::drop");
     };
 
-    OnDrop { action: Box::new(cleanup) }
+    OnDrop::new(cleanup)
   }
 }
 
@@ -1896,18 +1896,44 @@ impl Drop for State {
 }
 
 pub struct OnDrop {
-  action: Box<dyn FnMut()>
+  action: Option<Box<dyn FnOnce()>>
 }
 
 impl OnDrop {
   pub fn noop() -> OnDrop {
-    OnDrop { action: Box::new(|| {}) }
+    OnDrop { action: Some(Box::new(|| {})) }
+  }
+  pub fn new<F: FnOnce() + 'static>(f: F) -> OnDrop {
+    OnDrop { action: Some(Box::new(f)) }
   }
 }
 
 impl Drop for OnDrop {
   fn drop(&mut self) {
-    (self.action)();
+    if let Some(action) = self.action.take() {
+      action();
+    }
+  }
+}
+
+pub struct OnDropSend {
+  action: Option<Box<dyn FnOnce() + Send>>
+}
+
+impl OnDropSend {
+  pub fn noop() -> OnDropSend {
+    OnDropSend { action: Some(Box::new(|| {})) }
+  }
+  pub fn new<F: FnOnce() + Send + 'static>(f: F) -> OnDropSend {
+    OnDropSend { action: Some(Box::new(f)) }
+  }
+}
+
+impl Drop for OnDropSend {
+  fn drop(&mut self) {
+    if let Some(action) = self.action.take() {
+      action();
+    }
   }
 }
 
@@ -1972,6 +1998,7 @@ pub trait Node {
     token.ready()
   }
   fn modalities(&self) -> u32 { 0 }
+  fn signals_offmain(&self) -> bool { false }
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {
@@ -2021,7 +2048,7 @@ pub trait AnalogData {
   fn sample_interval(&self, channel: i32) -> Duration;
   fn name(
           &self,
-          channel: ::std::os::raw::c_int,
+          channel: i32,
       ) -> &str;
   fn is_short_data(&self) -> bool{
         false
