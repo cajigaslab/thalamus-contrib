@@ -179,6 +179,7 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
 /// Latest camera frame handed off from the capture thread to the main
 /// thread's preview window, overwritten in place each frame -- the viewer
 /// only ever needs the most recent one and drops older frames on the floor.
+#[derive(Clone)]
 struct FrameSnapshot {
     data:   Vec<u8>,
     width:  u32,
@@ -268,7 +269,15 @@ async fn viewer_tick_loop(api: ThalamusAPI, inner: Weak<RefCell<ThorcamNodeInner
         // way it could for a plain struct -- holding both borrows at once
         // (even of different fields) would conflict.
         let shared_frame = inner.borrow().shared_frame.clone();
-        let snapshot = shared_frame.lock().unwrap().take();
+        // Cloned, not taken: the renderer re-reads (and re-uploads) whatever
+        // the latest frame is every tick, same as the C++ ImageViewer does
+        // via node->has_image_data()/plane() -- it's not a one-shot queue.
+        // Consuming it here instead would starve one of the two
+        // frame-in-flight texture slots whenever a render tick lands between
+        // camera frames (camera runs slower than the render loop), leaving
+        // it a tick stale and making the display visibly flip back and forth
+        // between the fresh and stale slot.
+        let snapshot = shared_frame.lock().unwrap().clone();
 
         let mut borrow = inner.borrow_mut();
         let Some(viewer) = borrow.viewer.as_mut() else { break };

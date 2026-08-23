@@ -5,6 +5,13 @@
 //! `render_frame` must be called periodically (e.g. from a Thalamus timer)
 //! on the same thread that created this window -- nothing here spawns its
 //! own thread or event loop; scheduling is the caller's responsibility.
+//!
+//! Besides drawing imgui's own widgets, callers can register their own
+//! Vulkan-backed textures (e.g. a video frame) via `register_texture` and
+//! display them with `ui.image()`/`draw_list.add_image_quad()`. Updating a
+//! registered texture's pixel data must happen through `render_frame`'s
+//! `prepare` hook, which runs on the exact command buffer (and frame-in-flight
+//! slot) that frame will use -- see its doc comment for why.
 
 use ash::khr;
 use ash::vk;
@@ -15,12 +22,16 @@ use crate::api::{SDLWindow, ThalamusAPI};
 use crate::ffi::{THALAMUS_SDL_WINDOW_RESIZABLE, THALAMUS_SDL_WINDOW_VULKAN};
 use crate::imgui_platform::ImguiPlatform;
 
-const MAX_FRAMES_IN_FLIGHT: usize = 2;
+/// Number of frames-in-flight this window (and hence its swapchain sync
+/// objects and command buffers) supports. Callers maintaining their own
+/// per-frame resources (e.g. a texture updated from `render_frame`'s
+/// `prepare` hook) should size those arrays to match, indexed by the
+/// `frame_idx` that hook and `build_ui` receive.
+pub const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 pub struct ImguiWindow {
   api: ThalamusAPI,
-  #[allow(dead_code)]
-  window: SDLWindow, // kept alive; destroyed via its own Drop
+  window: SDLWindow,
   #[allow(dead_code)]
   entry: ash::Entry, // kept alive; ash::Instance/Device borrow its function table
   instance: ash::Instance,
@@ -34,14 +45,25 @@ pub struct ImguiWindow {
   extent: vk::Extent2D,
   image_views: Vec<vk::ImageView>,
   framebuffers: Vec<vk::Framebuffer>,
+  // One per swapchain image, not per frame-in-flight -- a binary semaphore
+  // must be unsignaled when signaled again, but presents happen
+  // asynchronously relative to the in-flight fence, so a frame-in-flight
+  // indexed semaphore can still be mid-present (per a previous, different
+  // image index) when this frame tries to reuse and re-signal it. Rebuilt
+  // alongside the swapchain images themselves.
+  render_finished: Vec<vk::Semaphore>,
   render_pass: vk::RenderPass,
   cmd_pool: vk::CommandPool,
   cmd_buffers: Vec<vk::CommandBuffer>,
   image_available: Vec<vk::Semaphore>,
-  render_finished: Vec<vk::Semaphore>,
   in_flight: Vec<vk::Fence>,
   frame: usize,
   dirty: bool,
+
+  // Separate from imgui's own internal (font-only) descriptor pool -- sized
+  // for whatever custom textures callers register via `register_texture`.
+  custom_desc_layout: vk::DescriptorSetLayout,
+  custom_desc_pool: vk::DescriptorPool,
 
   pub ctx: Context,
   platform: ImguiPlatform,
@@ -49,9 +71,14 @@ pub struct ImguiWindow {
   last_frame_time: std::time::Instant,
 }
 
+/// Max number of caller-registered custom textures (e.g. video preview
+/// frames) this window's dedicated descriptor pool supports.
+const MAX_CUSTOM_TEXTURES: u32 = 16;
+
 impl ImguiWindow {
-  pub fn new(api: ThalamusAPI, title: &str, width: i32, height: i32) -> Result<Self, String> {
+  pub fn new(api: ThalamusAPI, title: &str, x: i32, y: i32, width: i32, height: i32) -> Result<Self, String> {
     let window = api.create_sdl_window(title, width, height, THALAMUS_SDL_WINDOW_VULKAN | THALAMUS_SDL_WINDOW_RESIZABLE)?;
+    window.set_position(x, y);
     let window_id = window.id();
 
     let entry = unsafe { ash::Entry::load() }.map_err(|e| e.to_string())?;
@@ -97,6 +124,21 @@ impl ImguiWindow {
       .map_err(|e| e.to_string())?
     };
 
+    let custom_desc_layout = imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_set_layout(&device).map_err(|e| e.to_string())?;
+    // Not imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_pool:
+    // it hardcodes descriptor_count to 1 regardless of the max_sets argument,
+    // so the pool it returns can only ever satisfy a single allocation no
+    // matter what's passed -- every registration after the first fails
+    // (VUID-VkDescriptorSetAllocateInfo-apiVersion-07896, pool exhausted).
+    let custom_desc_pool = unsafe {
+      let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(MAX_CUSTOM_TEXTURES)];
+      device.create_descriptor_pool(
+        &vk::DescriptorPoolCreateInfo::default().pool_sizes(&sizes).max_sets(MAX_CUSTOM_TEXTURES).flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+        None,
+      )
+    }
+    .map_err(|e| format!("{e:?}"))?;
+
     let cmd_buffers = unsafe {
       device.allocate_command_buffers(
         &vk::CommandBufferAllocateInfo::default()
@@ -107,7 +149,7 @@ impl ImguiWindow {
     }
     .map_err(|e| format!("{e:?}"))?;
 
-    let (image_available, render_finished, in_flight) =
+    let (image_available, in_flight) =
       unsafe { Self::create_sync_objects(&device, MAX_FRAMES_IN_FLIGHT) }.map_err(|e| format!("{e:?}"))?;
 
     let mut result = ImguiWindow {
@@ -125,14 +167,16 @@ impl ImguiWindow {
       extent: vk::Extent2D::default(),
       image_views: Vec::new(),
       framebuffers: Vec::new(),
+      render_finished: Vec::new(),
       render_pass,
       cmd_pool,
       cmd_buffers,
       image_available,
-      render_finished,
       in_flight,
       frame: 0,
       dirty: true,
+      custom_desc_layout,
+      custom_desc_pool,
       ctx,
       platform,
       renderer,
@@ -146,9 +190,68 @@ impl ImguiWindow {
     self.platform.should_close()
   }
 
-  /// Pumps pending SDL events into imgui, builds+renders one frame, and
+  /// Current window position and size (`(x, y, w, h)`).
+  pub fn position_size(&self) -> (i32, i32, i32, i32) {
+    let (x, y) = self.window.position();
+    let (w, h) = self.window.size();
+    (x, y, w, h)
+  }
+
+  /// Handles a caller may need to build its own Vulkan resources (e.g. a
+  /// custom texture) against the same instance/device this window uses.
+  pub fn device(&self) -> &ash::Device {
+    &self.device
+  }
+  pub fn instance(&self) -> &ash::Instance {
+    &self.instance
+  }
+  pub fn physical_device(&self) -> vk::PhysicalDevice {
+    self.physical_device
+  }
+  pub fn cmd_pool(&self) -> vk::CommandPool {
+    self.cmd_pool
+  }
+
+  /// Registers a Vulkan-backed texture (image view + sampler) for display via
+  /// `ui.image()`/`draw_list.add_image_quad()`, returning its `TextureId`
+  /// alongside the raw `vk::DescriptorSet` backing it -- callers that need to
+  /// rebind the descriptor later (e.g. after rebuilding the underlying image
+  /// at a new size) do so directly with that handle via
+  /// `ash::Device::update_descriptor_sets`, using the `&ash::Device` `prepare`
+  /// already receives, rather than calling back into this window (which is
+  /// already mutably borrowed as the `render_frame` receiver at that point).
+  pub fn register_texture(&mut self, image_view: vk::ImageView, sampler: vk::Sampler) -> Result<(imgui::TextureId, vk::DescriptorSet), String> {
+    let set = imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_set(&self.device, self.custom_desc_layout, self.custom_desc_pool, image_view, sampler)
+      .map_err(|e| e.to_string())?;
+    let id = self.renderer.textures().insert(set);
+    Ok((id, set))
+  }
+
+  /// Pumps pending SDL events into imgui, then builds+renders one frame and
   /// presents it. Call once per tick from the main thread.
-  pub fn render_frame(&mut self, build_ui: impl FnOnce(&imgui::Ui)) -> Result<(), String> {
+  ///
+  /// `prepare(device, cmd, frame_idx)` runs after the frame's command buffer
+  /// is opened but before the render pass begins -- the only place commands
+  /// that can't run inside a render pass instance (buffer-to-image copies,
+  /// most pipeline barriers) are allowed. `frame_idx` is this window's
+  /// current frame-in-flight slot (`0..MAX_FRAMES_IN_FLIGHT`): recording a
+  /// texture upload into slot `frame_idx`'s own command buffer means it
+  /// inherits this window's existing fence wait for that slot, so a caller
+  /// keeping one texture per `MAX_FRAMES_IN_FLIGHT` slot (indexed the same
+  /// way) never writes to a texture a previous frame's submission might
+  /// still be sampling from, with no extra synchronization needed. The same
+  /// `frame_idx` is then passed to `build_ui`, along with whatever `prepare`
+  /// returned, so it can select the matching texture's `TextureId` -- threading
+  /// data through this return value (rather than a variable both closures
+  /// capture) sidesteps a borrow conflict: the two closures are constructed
+  /// together as arguments to this call, so the borrow checker requires their
+  /// captures to coexist even though `prepare` fully runs and returns before
+  /// `build_ui` starts.
+  pub fn render_frame<R>(
+    &mut self,
+    prepare: impl FnOnce(&ash::Device, vk::CommandBuffer, usize) -> R,
+    build_ui: impl FnOnce(&imgui::Ui, usize, R),
+  ) -> Result<(), String> {
     let now = std::time::Instant::now();
     let delta = (now - self.last_frame_time).as_secs_f32();
     self.last_frame_time = now;
@@ -160,6 +263,14 @@ impl ImguiWindow {
         return Ok(()); // zero-size (e.g. minimized) -- nothing to draw this tick
       }
     }
+
+    // ImguiPlatform doesn't track window size, only events -- without this,
+    // io.display_size stays at its zeroed default and ctx.frame() below trips
+    // Dear ImGui's "Invalid DisplaySize value!" assertion (it requires >= 0,
+    // but more to the point a real UI needs the actual extent to lay out
+    // against). Pixel dimensions, matching the swapchain; no separate
+    // display_framebuffer_scale handling (HiDPI) is done anywhere else here.
+    self.ctx.io_mut().display_size = [self.extent.width as f32, self.extent.height as f32];
 
     let frame_idx = self.frame % self.in_flight.len();
     unsafe {
@@ -194,6 +305,8 @@ impl ImguiWindow {
         .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
         .map_err(|e| format!("{e:?}"))?;
 
+      let prepared = prepare(&self.device, cmd, frame_idx);
+
       let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }];
       let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(self.render_pass)
@@ -203,7 +316,7 @@ impl ImguiWindow {
       self.device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
 
       let ui = self.ctx.frame();
-      build_ui(ui);
+      build_ui(ui, frame_idx, prepared);
       let draw_data = self.ctx.render();
       self.renderer.cmd_draw(cmd, draw_data).map_err(|e| e.to_string())?;
 
@@ -213,7 +326,7 @@ impl ImguiWindow {
       let guard = self.api.lock_vulkan_queue();
       let wait_semaphores = [self.image_available[frame_idx]];
       let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
-      let signal_semaphores = [self.render_finished[frame_idx]];
+      let signal_semaphores = [self.render_finished[image_index as usize]];
       let cmd_buffers = [cmd];
       let submit_info = vk::SubmitInfo::default()
         .wait_semaphores(&wait_semaphores)
@@ -332,6 +445,11 @@ impl ImguiWindow {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("{e:?}"))?;
 
+      self.render_finished = (0..images.len())
+        .map(|_| self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("{e:?}"))?;
+
       self.dirty = false;
       Ok(())
     }
@@ -339,6 +457,10 @@ impl ImguiWindow {
 
   unsafe fn destroy_swapchain_deps(&mut self) {
     unsafe {
+      for &s in &self.render_finished {
+        self.device.destroy_semaphore(s, None);
+      }
+      self.render_finished.clear();
       for &fb in &self.framebuffers {
         self.device.destroy_framebuffer(fb, None);
       }
@@ -380,18 +502,16 @@ impl ImguiWindow {
   unsafe fn create_sync_objects(
     device: &ash::Device,
     count: usize,
-  ) -> Result<(Vec<vk::Semaphore>, Vec<vk::Semaphore>, Vec<vk::Fence>), vk::Result> {
+  ) -> Result<(Vec<vk::Semaphore>, Vec<vk::Fence>), vk::Result> {
     let mut image_available = Vec::with_capacity(count);
-    let mut render_finished = Vec::with_capacity(count);
     let mut in_flight = Vec::with_capacity(count);
     for _ in 0..count {
       image_available.push(unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?);
-      render_finished.push(unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?);
       in_flight.push(unsafe {
         device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)
       }?);
     }
-    Ok((image_available, render_finished, in_flight))
+    Ok((image_available, in_flight))
   }
 }
 
@@ -402,16 +522,17 @@ impl Drop for ImguiWindow {
       for &s in &self.image_available {
         self.device.destroy_semaphore(s, None);
       }
-      for &s in &self.render_finished {
-        self.device.destroy_semaphore(s, None);
-      }
       for &f in &self.in_flight {
         self.device.destroy_fence(f, None);
       }
+      // Also destroys render_finished (one per swapchain image -- see its
+      // field doc comment for why it isn't alongside image_available/in_flight).
       self.destroy_swapchain_deps();
       if self.swapchain != vk::SwapchainKHR::null() {
         self.swapchain_loader.destroy_swapchain(self.swapchain, None);
       }
+      self.device.destroy_descriptor_pool(self.custom_desc_pool, None);
+      self.device.destroy_descriptor_set_layout(self.custom_desc_layout, None);
       self.device.destroy_render_pass(self.render_pass, None);
       self.device.destroy_command_pool(self.cmd_pool, None);
       self.surface_loader.destroy_surface(self.surface, None);
