@@ -14,6 +14,7 @@ mod rtmps_node;
 mod sleeve_node;
 mod angular_scaling_node;
 mod block;
+mod bluetooth;
 
 use thorcam_node::ThorcamNode;
 use webcam_node::WebcamNode;

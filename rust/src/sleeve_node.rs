@@ -15,8 +15,9 @@ use btleplug::api::{
   Characteristic, Service,
   Central, Manager as _,
   Peripheral as _, ScanFilter, WriteType, CentralEvent, BDAddr};
-use btleplug::platform::{Manager, Peripheral};
+use btleplug::platform::Peripheral;
 use crate::block as blk;
+use crate::bluetooth as bt;
 
 const ADC_VDD: f64 = 3.3;
 const ADC_VREF: f64 = ADC_VDD / 4.0;
@@ -292,7 +293,7 @@ impl SleeveNodeInner {
     let uart_rx_char_uuid = Uuid::parse_str("6E400002-B5A3-F393-E0A9-E50E24DCCA9E").unwrap();
     let uart_tx_char_uuid = Uuid::parse_str("6E400003-B5A3-F393-E0A9-E50E24DCCA9E").unwrap();
 
-    let manager = get_result!(wait(Manager::new(), &cancel_token).await, "Manager init failed");
+    let manager = get_result!(wait(bt::get_manager(), &cancel_token).await, "Manager init failed");
     let adapters = get_result!(wait(manager.adapters(), &cancel_token).await, "Failed to get adapters");
     let central = get_option!(adapters.into_iter().nth(0), "No adapters found");
     get_result!(wait(central.start_scan(ScanFilter::default()), &cancel_token).await, "start_scan failed");
@@ -430,7 +431,18 @@ impl SleeveNodeInner {
     //peripheral.subscribe(&rx_char).await?;
     get_result!(wait(peripheral.subscribe(&tx_char), &cancel_token).await, "Failed to subscript to TX");
 
-    let pause = Duration::from_millis(800);
+    let unsubscribe_peripheral = peripheral.clone();
+    let _unsubscribe = OnDropSend::new(move || {
+      api.tokio().as_ref().unwrap().spawn(async move {
+        let _ = unsubscribe_peripheral.unsubscribe(&tx_char).await;
+      });
+    });
+
+    //On Android running the following commands with no pause between them frequently breaks the
+    //connection.  On Android we space the commands out by 800 ms, Desktop and Laptops might need
+    //less or even none at all.
+    //let pause = Duration::from_millis(800);
+    let pause = Duration::from_millis(100);
 
     {
       println!("Set ICM Mask");
@@ -513,10 +525,10 @@ impl SleeveNodeInner {
           break
         }
         Some(n) = notifications.next() => {
-          //println!("{:?}", n);
+          //println!("notification {:?}", n);
           let blocks = get_result!(blk::decode_block_packet(&n.value), "Failed to parse blocks");
           for block in blocks {
-            //println!("{block:?}");
+            //println!("block {block:?}");
             match block.block_id {
               2 => {
                 let mut reader = ByteReader::from_bytes(block.data);
