@@ -15,5 +15,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
+    - run: sudo apt update
+    - run: sudo apt install nasm libdbus-1-dev libfreetype-dev libfontconfig-dev
     - run: pip install hatch
     - run: hatch build
