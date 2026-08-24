@@ -16,6 +16,6 @@ jobs:
       with:
         python-version: 3.12
     - run: sudo apt update
-    - run: sudo apt install nasm
+    - run: sudo apt install nasm libdbus-1-dev
     - run: pip install hatch
     - run: hatch build
