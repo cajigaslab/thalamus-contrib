@@ -42,15 +42,13 @@ struct SleeveData<'a> {
   intan_channels: &'a Vec::<Vec<i16>>,
   icm_channels: &'a Vec::<Vec<i16>>,
   adc_channels: &'a Vec::<Vec<i16>>,
-  rssi_channels: &'a Vec::<Vec<i16>>,
   time: Duration,
 }
 
 enum ChannelType {
   INTAN,
   ICM,
-  ADC,
-  RSSI
+  ADC
 }
 
 impl<'a> SleeveData<'a> {
@@ -66,12 +64,7 @@ impl<'a> SleeveData<'a> {
     }
     uchannel -= self.icm_channels.len();
 
-    if uchannel < self.adc_channels.len() {
-      return (ChannelType::ADC, uchannel);
-    }
-    uchannel -= self.adc_channels.len();
-
-    (ChannelType::RSSI, uchannel)
+    (ChannelType::ADC, uchannel)
   }
 }
 
@@ -100,17 +93,13 @@ impl<'a> AnalogData for SleeveData<'a> {
       (ChannelType::ADC, i) => {
         self.adc_channels[i].as_slice()
       },
-      (ChannelType::RSSI, i) => {
-        self.rssi_channels[i].as_slice()
-      },
     }
   }
 
   fn num_channels(&self) -> i32 {
     (self.intan_channels.len()
      + self.icm_channels.len()
-     + self.adc_channels.len()
-     + self.rssi_channels.len()) as i32
+     + self.adc_channels.len()) as i32
   }
 
   fn sample_interval(&self, channel: i32) -> std::time::Duration {
@@ -123,9 +112,6 @@ impl<'a> AnalogData for SleeveData<'a> {
       },
       (ChannelType::ADC, _) => {
         Duration::from_millis(10)
-      },
-      (ChannelType::RSSI, _) => {
-        Duration::from_millis(1000)
       },
     }
   }
@@ -173,12 +159,6 @@ impl<'a> AnalogData for SleeveData<'a> {
           _ => panic!("ADC Channel out of range {i}"),
         }
       },
-      (ChannelType::RSSI, i) => {
-        match i {
-          0 => "RSSI",
-          _ => panic!("RSSI Channel out of range {i}"),
-        }
-      },
     }
   }
 
@@ -204,9 +184,6 @@ impl<'a> AnalogData for SleeveData<'a> {
       },
       (ChannelType::ADC, _) => {
         ADC_VREF / ADC_GAIN / (((1 << ADC_RESOLUTION_BITS) - 1) as f64) * 1000.0
-      },
-      (ChannelType::RSSI, _) => {
-        1.0
       },
     }
   }
@@ -521,13 +498,9 @@ impl SleeveNodeInner {
     adc_channels.resize(1, Vec::<i16>::default());
     let mut icm_channels = Vec::<Vec<i16>>::new();
     icm_channels.resize(6, Vec::<i16>::default());
-    let mut rssi_channels = Vec::<Vec<i16>>::new();
-    rssi_channels.resize(1, Vec::<i16>::default());
 
     let intan_first_channel = 4;
     let intan_num_channels = 8;
-
-    let mut rssi_interval = tokio::time::interval(Duration::from_millis(1000));
 
     loop {
       tokio::select! {
@@ -538,25 +511,6 @@ impl SleeveNodeInner {
         _ = cancel_token.cancelled() => {
           println!("Cancelled");
           break
-        }
-        _ = rssi_interval.tick() => {
-          match wait(peripheral.read_rssi(), &cancel_token).await {
-            Ok(rssi) => {
-              rssi_channels[0].push(rssi);
-
-              let _ = api.ready_offmain(&SleeveData {
-                intan_channels: &intan_channels,
-                icm_channels: &icm_channels,
-                adc_channels: &adc_channels,
-                rssi_channels: &rssi_channels,
-                time: api.time()
-              }, &node_token);
-              rssi_channels.iter_mut().for_each(|c| c.clear());
-            },
-            Err(e) => {
-              println!("Failed to read RSSI: {e}");
-            }
-          }
         }
         Some(n) = notifications.next() => {
           //println!("{:?}", n);
@@ -579,7 +533,6 @@ impl SleeveNodeInner {
                   intan_channels: &intan_channels,
                   icm_channels: &icm_channels,
                   adc_channels: &adc_channels,
-                  rssi_channels: &rssi_channels,
                   time: api.time()
                 }, &node_token);
                 icm_channels.iter_mut().for_each(|c| c.clear());
@@ -619,7 +572,6 @@ impl SleeveNodeInner {
                   intan_channels: &intan_channels,
                   icm_channels: &icm_channels,
                   adc_channels: &adc_channels,
-                  rssi_channels: &rssi_channels,
                   time: api.time()
                 }, &node_token);
                 intan_channels.iter_mut().for_each(|c| c.clear());
@@ -639,7 +591,6 @@ impl SleeveNodeInner {
                   intan_channels: &intan_channels,
                   icm_channels: &icm_channels,
                   adc_channels: &adc_channels,
-                  rssi_channels: &rssi_channels,
                   time: api.time()
                 }, &node_token);
                 adc_channels.iter_mut().for_each(|c| c.clear());
