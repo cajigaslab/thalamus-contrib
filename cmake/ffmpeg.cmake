@@ -114,7 +114,7 @@ set(FFPROBE_EXECUTABLE "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>
 add_custom_command(
   OUTPUT "${FFMPEG_OUTPUT_LIBRARIES}" ${FFTOOL_OBJECTS} "${ffmpeg_BINARY_DIR}/$<CONFIG>/ffbuild/config.mak" 
   DEPENDS "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/Makefile"
-  COMMAND make -j ${CPU_COUNT} install
+  COMMAND ls && make -j ${CPU_COUNT} install
   && cmake -E touch_nocreate ${FIRST_FFMPEG_LIB}
   WORKING_DIRECTORY "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>")
 
