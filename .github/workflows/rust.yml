@@ -27,7 +27,7 @@ jobs:
     - run: |
         echo C:\msys64\usr\bin >> $env:GITHUB_PATH
         echo C:\msys64\ucrt64\bin >> $env:GITHUB_PATH
-    - run: winget install NASM.NASM
+    - run: winget install --accept-package-agreements --accept-source-agreements --disable-interactivity NASM.NASM
     - run: |
         make --version
         Get-Command make
