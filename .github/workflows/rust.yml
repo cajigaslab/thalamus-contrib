@@ -27,11 +27,12 @@ jobs:
     - run: |
         echo C:\msys64\usr\bin >> $env:GITHUB_PATH
         echo C:\msys64\ucrt64\bin >> $env:GITHUB_PATH
-    - run: winget install --accept-package-agreements --accept-source-agreements --disable-interactivity NASM.NASM
+    #- run: winget install --accept-package-agreements --accept-source-agreements --disable-interactivity NASM.NASM
     - run: |
         make --version
         Get-Command make
         Get-Command perl
+        Get-Command cmake
         Get-Command nasm
     - name: Set up Python
       uses: actions/setup-python@v5
