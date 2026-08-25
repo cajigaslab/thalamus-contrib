@@ -8,7 +8,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 chrono = "0.4"
-ffmpeg-sys-next = "7"
 futures = "0.3.32"
 libloading = "0.8"
 skia-safe = "0.87"

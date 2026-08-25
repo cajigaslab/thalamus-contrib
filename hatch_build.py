@@ -21,45 +21,45 @@ class CustomBuildHook(BuildHookInterface):
     
     debug = os.environ.get('THALAMUS_DEBUG', 'OFF') == 'ON'
     vv = os.environ.get('THALAMUS_VV', 'OFF') == 'ON'
-    do_config = os.environ.get('THALAMUS_CONFIG', 'OFF') == 'ON'
+    #do_config = os.environ.get('THALAMUS_CONFIG', 'OFF') == 'ON'
 
-    default_parallel = str(os.cpu_count())
-    parallel = os.environ.get('THALAMUS_JOB', default_parallel)
-    is_android = False
+    #default_parallel = str(os.cpu_count())
+    #parallel = os.environ.get('THALAMUS_JOB', default_parallel)
+    #is_android = False
 
-    print('debug', debug)
-    build_path = pathlib.Path.cwd() / 'build' / f'{"android-" if is_android else ""}{"debug" if debug else "release"}'
-    osx_target = '12.0'
+    #print('debug', debug)
+    #build_path = pathlib.Path.cwd() / 'build' / f'{"android-" if is_android else ""}{"debug" if debug else "release"}'
+    #osx_target = '12.0'
 
-    cmake_command = [
-      'cmake',
-      '-S', pathlib.Path.cwd(),
-      '-B', build_path,
-      f'-DCMAKE_BUILD_TYPE={"Debug" if debug else "Release"}',
-      '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
-      '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
-      f'-DCMAKE_OSX_DEPLOYMENT_TARGET={osx_target}',
-      '-DCMAKE_C_COMPILER=clang',
-      '-DCMAKE_CXX_COMPILER=clang++',
-      '-DCMAKE_LINKER=clang',
-      '-DCMAKE_MAKE_PROGRAM=' + shutil.which('ninja'),
-      '-G', 'Ninja',
-    ]
+    #cmake_command = [
+    #  'cmake',
+    #  '-S', pathlib.Path.cwd(),
+    #  '-B', build_path,
+    #  f'-DCMAKE_BUILD_TYPE={"Debug" if debug else "Release"}',
+    #  '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON',
+    #  '-DCMAKE_POLICY_VERSION_MINIMUM=3.5',
+    #  f'-DCMAKE_OSX_DEPLOYMENT_TARGET={osx_target}',
+    #  '-DCMAKE_C_COMPILER=clang',
+    #  '-DCMAKE_CXX_COMPILER=clang++',
+    #  '-DCMAKE_LINKER=clang',
+    #  '-DCMAKE_MAKE_PROGRAM=' + shutil.which('ninja'),
+    #  '-G', 'Ninja',
+    #]
 
-    if platform.system() == 'Linux':
-      cmake_command += ['-DCMAKE_LIBRARY_ARCHITECTURE=x86_64-linux-gnu']
+    #if platform.system() == 'Linux':
+    #  cmake_command += ['-DCMAKE_LIBRARY_ARCHITECTURE=x86_64-linux-gnu']
 
-    cmake_command = [str(c) for c in cmake_command]
-    print(cmake_command)
-    if not (build_path / 'CMakeCache.txt').exists() or do_config:
-      subprocess.check_call(cmake_command)
-    #shutil.copy(build_path / 'compile_commands.json', 'compile_commands.json')
-    
-    command = ['cmake', '--build', build_path, '--config', "Debug" if debug else "Release", '--parallel', parallel]
+    #cmake_command = [str(c) for c in cmake_command]
+    #print(cmake_command)
+    #if not (build_path / 'CMakeCache.txt').exists() or do_config:
+    #  subprocess.check_call(cmake_command)
+    ##shutil.copy(build_path / 'compile_commands.json', 'compile_commands.json')
+    #
+    #command = ['cmake', '--build', build_path, '--config', "Debug" if debug else "Release", '--parallel', parallel]
 
-    command = [str(c) for c in command]
-    print(command)
-    subprocess.check_call(command)
+    #command = [str(c) for c in command]
+    #print(command)
+    #subprocess.check_call(command)
 
     rust_dir = pathlib.Path(self.root) / "rust"
     cargo_command = ['cargo', 'build']
@@ -68,10 +68,10 @@ class CustomBuildHook(BuildHookInterface):
     if vv:
       cargo_command += ['-vv']
 
-    ffmpeg_install = build_path / '_deps' / 'ffmpeg-build' / ("Debug" if debug else "Release") / 'install'
+    #ffmpeg_install = build_path / '_deps' / 'ffmpeg-build' / ("Debug" if debug else "Release") / 'install'
     cargo_env = dict(os.environ)
-    cargo_env['FFMPEG_DIR'] = str(ffmpeg_install)
-    cargo_env['PKG_CONFIG_PATH'] = str(ffmpeg_install / 'lib' / 'pkgconfig')
+    #cargo_env['FFMPEG_DIR'] = str(ffmpeg_install)
+    #cargo_env['PKG_CONFIG_PATH'] = str(ffmpeg_install / 'lib' / 'pkgconfig')
 
     print('cargo_command', cargo_command)
     subprocess.run(cargo_command, cwd=rust_dir, check=True, env=cargo_env)
