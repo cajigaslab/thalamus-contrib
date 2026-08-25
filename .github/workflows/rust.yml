@@ -27,14 +27,17 @@ jobs:
     - run: |
         echo C:\msys64\usr\bin >> $env:GITHUB_PATH
         echo C:\msys64\ucrt64\bin >> $env:GITHUB_PATH
+    - run: winget install NASM.NASM
     - run: |
         make --version
         Get-Command make
+        Get-Command perl
+        Get-Command nasm
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
-    - run: pip install hatch
+    - run: pip install hatch ninja
     - run: hatch build
       env:
         PATH: C:\msys64\usr\bin
