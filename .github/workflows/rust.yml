@@ -8,6 +8,7 @@ on:
 
 jobs:
   build-linux:
+    if: false
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
@@ -18,4 +19,27 @@ jobs:
     - run: sudo apt update
     - run: sudo apt install nasm libdbus-1-dev libfreetype-dev libfontconfig-dev
     - run: pip install hatch
+    - run: hatch build
+  build-windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: |
+        echo C:\msys64\usr\bin >> $env:GITHUB_PATH
+        echo C:\msys64\ucrt64\bin >> $env:GITHUB_PATH
+    - run: |
+        pacman --noconfirm -Syu
+        pacman --noconfirm -S make
+    #- run: winget install --accept-package-agreements --accept-source-agreements --disable-interactivity NASM.NASM
+    - run: |
+        make --version
+        Get-Command make
+        Get-Command perl
+        Get-Command cmake
+        Get-Command nasm
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+    - run: pip install hatch ninja
     - run: hatch build
