@@ -688,7 +688,7 @@ impl ThalamusAPI {
       _type: ThalamusCharSpan { data: null(), size: 0, owns_data: 0 }
     };
 
-    match selector {
+    match &selector {
       NodeSelector::Name(val) => {
         c_selector.name.data = val.as_ptr() as *const i8;
         c_selector.name.size = val.len() as u64;
