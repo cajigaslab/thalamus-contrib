@@ -143,17 +143,21 @@ pub fn list_cameras() -> Vec<CameraInfo> {
   cameras
 }
 
-// On the System V x86-64 ABI (Linux/macOS), va_list decays to a pointer when
-// used as a C function parameter, but ffi::va_list is the raw, non-decayed
-// array typedef, and Rust doesn't apply C's array-to-pointer decay -- so
-// these declarations use the decayed pointer type directly to match the real
-// ABI these functions expect. On the Windows x64 ABI, va_list is already a
-// plain char* typedef (no array/decay involved, and no __va_list_tag type
-// exists), so ffi::va_list is used as-is.
-#[cfg(target_os = "windows")]
-type VaList = ffi::va_list;
-#[cfg(not(target_os = "windows"))]
+// On Linux's x86-64 SysV ABI, va_list decays to a pointer when used as a C
+// function parameter, but ffi::va_list is the raw, non-decayed array
+// typedef (`struct __va_list_tag[1]`), and Rust doesn't apply C's
+// array-to-pointer decay -- so this declaration uses the decayed pointer
+// type directly to match the real ABI these functions expect. On Windows
+// x64, va_list is already a plain char* typedef (no array/decay involved),
+// and on macOS (Intel and Apple Silicon alike) Clang's va_list is likewise
+// not the __va_list_tag array form -- bindgen never emits that type there,
+// which is why building on macOS fails with "cannot find type
+// `__va_list_tag`" if this branch is taken. So both platforms use
+// ffi::va_list as-is.
+#[cfg(target_os = "linux")]
 type VaList = *mut ffi::__va_list_tag;
+#[cfg(not(target_os = "linux"))]
+type VaList = ffi::va_list;
 
 unsafe extern "C" {
   fn vsnprintf(buf: *mut c_char, size: usize, fmt: *const c_char, args: VaList) -> c_int;

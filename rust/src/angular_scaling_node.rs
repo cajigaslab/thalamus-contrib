@@ -306,6 +306,7 @@ pub struct AngularScalingNode {
 }
 
 fn resolve_source(inner: &Rc<RefCell<Inner>>) {
+  println!("resolve_source");
   let (api, node_token, source, angular_scaling, fixation) = {
     let borrow = inner.borrow();
     (
@@ -331,6 +332,7 @@ fn resolve_source(inner: &Rc<RefCell<Inner>>) {
   let mt_api = api.thread_safe();
   let inner_for_source = Rc::clone(inner);
   let source_connection = api.get_node(NodeSelector::Name(source), move |ext_node| {
+    println!("GOT NODE");
     // A node now matches "Source" -- either the first resolution, or the
     // previously matched node was replaced. Rewire sample delivery.
     let node_token = node_token.clone();
