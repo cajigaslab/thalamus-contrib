@@ -20,7 +20,18 @@ jobs:
     - run: sudo apt install nasm libdbus-1-dev libfreetype-dev libfontconfig-dev
     - run: pip install hatch
     - run: hatch build
+  build-mac:
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+    - run: pip install hatch
+    - run: hatch build
   build-windows:
+    if: false
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
