@@ -21,7 +21,7 @@ jobs:
     - run: pip install hatch
     - run: hatch build
   build-mac:
-    runs-on: macos-13
+    runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python
