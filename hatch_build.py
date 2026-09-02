@@ -72,6 +72,12 @@ class CustomBuildHook(BuildHookInterface):
     cargo_env = dict(os.environ)
     cargo_env['FFMPEG_DIR'] = str(ffmpeg_install)
     cargo_env['PKG_CONFIG_PATH'] = str(ffmpeg_install / 'lib' / 'pkgconfig')
+    if platform.system() == 'Darwin':
+      # Match the deployment target the ffmpeg/CMake deps were built against so
+      # rustc (and the cc-crate built C/C++ deps like imgui-sys) stamp the same
+      # minimum OS version and the linker stops warning about objects built for
+      # a newer macOS than is being linked.
+      cargo_env['MACOSX_DEPLOYMENT_TARGET'] = osx_target
 
     print('cargo_command', cargo_command)
     subprocess.run(cargo_command, cwd=rust_dir, check=True, env=cargo_env)
