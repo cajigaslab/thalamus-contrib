@@ -9,7 +9,6 @@ permissions:
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
-    environment: ${{ github.ref_name }}
     outputs:
       version: ${{ steps.version_bump.outputs.version }}
     steps:
