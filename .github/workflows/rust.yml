@@ -1,15 +1,17 @@
 name: Build
 
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+  workflow_dispatch: {}
+    
+permissions:
+  contents: write
 
 jobs:
   build-linux:
-    if: false
     runs-on: ubuntu-24.04
+    environment: ${{ github.ref_name }}
+    outputs:
+      version: ${{ steps.version_bump.outputs.version }}
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python
@@ -18,8 +20,22 @@ jobs:
         python-version: 3.12
     - run: sudo apt update
     - run: sudo apt install nasm libdbus-1-dev libfreetype-dev libfontconfig-dev
-    - run: pip install hatch
+    - run: pip install hatch toml
+    - name: Version Bump
+      id: version_bump
+      run: |
+        python bump.py patch
+        echo version=`git describe --exact-match --tags` >> "$GITHUB_OUTPUT"
+
     - run: hatch build
+    - name: Archive Distribution
+      uses: actions/upload-artifact@v4
+      with:
+        name: linux-dist
+        path: dist
+    - run: |
+        git push
+        git push --tags
   build-mac:
     runs-on: macos-latest
     steps:
@@ -28,10 +44,16 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
-    - run: pip install hatch
+    - run: pip install hatch toml
+    - name: Version Bump
+      run: python bump.py patch
     - run: hatch build
+    - name: Archive Distribution
+      uses: actions/upload-artifact@v4
+      with:
+        name: mac-dist
+        path: dist
   build-windows:
-    if: false
     runs-on: windows-latest
     steps:
     - uses: actions/checkout@v4
@@ -52,5 +74,80 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
-    - run: pip install hatch ninja
+    - run: pip install hatch ninja toml
+    - name: Version Bump
+      run: python bump.py patch
     - run: hatch build
+    - name: Archive Distribution
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-dist
+        path: dist
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref_name }}
+    needs: [build-linux, build-windows, build-mac]
+    steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: 3.12
+    - run: pip install twine
+    - uses: actions/download-artifact@v4
+      with:
+        name: linux-dist
+    - uses: actions/download-artifact@v4
+      with:
+        name: windows-dist
+    - uses: actions/download-artifact@v4
+      with:
+        name: mac-dist
+    - name: Get Paths
+      id: paths
+      run: |
+        echo linux=`ls *linux*.whl` >> "$GITHUB_OUTPUT"
+        echo windows=`ls *win*.whl` >> "$GITHUB_OUTPUT"
+        echo mac=`ls *mac*.whl` >> "$GITHUB_OUTPUT"
+    - name: Create Release
+      id: create-release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{needs.build-linux.outputs.version}}
+        release_name: Release ${{needs.build-linux.outputs.version}}
+        draft: false
+        prerelease: false
+    - name: Upload Linux Release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ${{ steps.paths.outputs.linux }}
+        asset_name: ${{ steps.paths.outputs.linux }}
+        asset_content_type: application/x-wheel+zip
+    - name: Upload Windows Release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ${{ steps.paths.outputs.windows }}
+        asset_name: ${{ steps.paths.outputs.windows }}
+        asset_content_type: application/x-wheel+zip
+    - name: Upload Mac Release
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create-release.outputs.upload_url }}
+        asset_path: ${{ steps.paths.outputs.mac }}
+        asset_name: ${{ steps.paths.outputs.mac }}
+        asset_content_type: application/x-wheel+zip
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      run: twine upload *.whl
