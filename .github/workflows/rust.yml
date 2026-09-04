@@ -19,13 +19,17 @@ jobs:
         python-version: 3.12
     - run: sudo apt update
     - run: sudo apt install nasm libdbus-1-dev libfreetype-dev libfontconfig-dev
-    - run: pip install hatch toml
+    - run: pip install hatch
     - name: Version Bump
       id: version_bump
       run: |
-        python bump.py patch
-        echo version=`git describe --exact-match --tags` >> "$GITHUB_OUTPUT"
-
+        hatch version patch
+        VERSION=`hatch version`
+        echo VERSION=$VERSION
+        git add -u
+        git commit -m "[skip ci] v$VERSION"
+        git tag -a "v$VERSION" -m "[skip ci] v$VERSION"
+        echo version=$VERSION >> "$GITHUB_OUTPUT"
     - run: hatch build
     - name: Archive Distribution
       uses: actions/upload-artifact@v4
@@ -43,9 +47,8 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
-    - run: pip install hatch toml
-    - name: Version Bump
-      run: python bump.py patch
+    - run: pip install hatch
+    - run: hatch version patch
     - run: hatch build
     - name: Archive Distribution
       uses: actions/upload-artifact@v4
@@ -73,9 +76,8 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: 3.12
-    - run: pip install hatch ninja toml
-    - name: Version Bump
-      run: python bump.py patch
+    - run: pip install hatch ninja
+    - run: hatch version patch
     - run: hatch build
     - name: Archive Distribution
       uses: actions/upload-artifact@v4
