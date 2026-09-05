@@ -16,6 +16,25 @@ class CustomBuildHook(BuildHookInterface):
     if self.target_name == 'sdist':
       return
     #print('files', pprint.pformat(list(pathlib.Path.cwd().rglob('*'))), file=sys.stderr)
+    build_data["pure_python"] = False   # marks it platform-specific
+    build_data["infer_tag"] = False      # don't auto-detect from this machine
+    
+    osx_target = '12.0'
+    osx_target_underscored = osx_target.replace('.', '_')
+    platform_tag = None
+    if platform.system() == 'Windows':
+      platform_tag = 'win_amd64'
+    elif platform.system() == 'Darwin':
+      processor = 'arm64' if 'arm' in platform.processor() else 'x86_64'
+      platform_tag = f'macosx_{osx_target_underscored}_{processor}'
+    elif platform.system() == 'Linux':
+      ldd_output = subprocess.check_output(['ldd', '--version'], encoding='utf8')
+      assert ldd_output is not None
+      ldd_line = [l.strip() for l in ldd_output.split('\n') if l[:3] == 'ldd'][0]
+      libc_version = ldd_line.split(' ')[-1]
+      platform_tag = f'manylinux_{libc_version.replace(".", "_")}_x86_64'
+    assert platform_tag is not None
+    build_data["tag"] = f'py3-none-{platform_tag}'
 
     pprint.pprint({k: v for k, v in os.environ.items() if k.startswith('THALAMUS_')})
     
