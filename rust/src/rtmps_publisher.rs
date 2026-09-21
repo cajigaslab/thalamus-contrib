@@ -35,33 +35,73 @@ pub struct FrameBuf {
   pub frame_interval: Duration,
 }
 
-fn av_pixel_format(format: ImageFormat) -> ffi::AVPixelFormat {
+fn av_pixel_format(format: ImageFormat) -> Result<ffi::AVPixelFormat, String> {
   match format {
-    ImageFormat::Gray => ffi::AVPixelFormat::AV_PIX_FMT_GRAY8,
-    ImageFormat::RGB => ffi::AVPixelFormat::AV_PIX_FMT_RGB24,
-    ImageFormat::YUYV422 => ffi::AVPixelFormat::AV_PIX_FMT_YUYV422,
-    ImageFormat::YUV420P => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
-    ImageFormat::YUVJ420P => ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P,
-    ImageFormat::NV12 => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
-    ImageFormat::BGR => ffi::AVPixelFormat::AV_PIX_FMT_BGR24,
-    ImageFormat::MJPEG => panic!("Unsupported format MJPEG"),
+    ImageFormat::Gray => Ok(ffi::AVPixelFormat::AV_PIX_FMT_GRAY8),
+    ImageFormat::RGB => Ok(ffi::AVPixelFormat::AV_PIX_FMT_RGB24),
+    ImageFormat::YUYV422 => Ok(ffi::AVPixelFormat::AV_PIX_FMT_YUYV422),
+    ImageFormat::YUV420P => Ok(ffi::AVPixelFormat::AV_PIX_FMT_YUV420P),
+    ImageFormat::YUVJ420P => Ok(ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P),
+    ImageFormat::NV12 => Ok(ffi::AVPixelFormat::AV_PIX_FMT_NV12),
+    ImageFormat::BGR => Ok(ffi::AVPixelFormat::AV_PIX_FMT_BGR24),
+    ImageFormat::MJPEG => Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string()),
   }
 }
 
-// Matches the tightly-packed (no linesize padding) plane layout used by
-// every NodeData image producer in this codebase (see plane_layout in
+// (bytes per row, rows) of each plane, tightly packed (no linesize padding) as
+// every NodeData image producer in this codebase does (see plane_layout in
 // ffmpeg_devices.rs).
-fn plane_linesizes(format: ImageFormat, width: u32) -> Vec<i32> {
+fn plane_layout(format: ImageFormat, width: u32, height: u32) -> Result<Vec<(usize, usize)>, String> {
+  let (w, h) = (width as usize, height as usize);
   match format {
-    ImageFormat::Gray | ImageFormat::NV12 => vec![width as i32],
-    ImageFormat::RGB | ImageFormat::BGR => vec![width as i32 * 3],
-    ImageFormat::YUYV422 => vec![width as i32 * 2],
+    ImageFormat::Gray => Ok(vec![(w, h)]),
+    ImageFormat::RGB | ImageFormat::BGR => Ok(vec![(w * 3, h)]),
+    ImageFormat::YUYV422 => Ok(vec![(w * 2, h)]),
+    ImageFormat::NV12 => Ok(vec![(w, h), (w, h.div_ceil(2))]),
     ImageFormat::YUV420P | ImageFormat::YUVJ420P => {
-      let chroma_w = width.div_ceil(2) as i32;
-      vec![width as i32, chroma_w, chroma_w]
+      let (chroma_w, chroma_h) = (w.div_ceil(2), h.div_ceil(2));
+      Ok(vec![(w, h), (chroma_w, chroma_h), (chroma_w, chroma_h)])
     },
-    ImageFormat::MJPEG => panic!("Unsupported format MJPEG"),
+    ImageFormat::MJPEG => Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string()),
   }
+}
+
+// sws_scale reads up to four source pointers and strides, whatever the pixel
+// format, so both arrays are always four long with the unused entries empty.
+// Planar formats arrive either as one plane per array entry, or (webcam_node
+// for NV12) as a single buffer holding the planes back to back.
+fn source_planes(buf: &FrameBuf) -> Result<([*const u8; 4], [i32; 4]), String> {
+  let layout = plane_layout(buf.format, buf.width, buf.height)?;
+  let mut pointers = [std::ptr::null::<u8>(); 4];
+  let mut strides = [0i32; 4];
+
+  if buf.planes.len() == layout.len() {
+    for (i, ((stride, rows), plane)) in layout.iter().zip(&buf.planes).enumerate() {
+      if plane.len() < stride * rows {
+        return Err(format!(
+          "{:?} plane {} has {} bytes, expected {}", buf.format, i, plane.len(), stride * rows));
+      }
+      pointers[i] = plane.as_ptr();
+      strides[i] = *stride as i32;
+    }
+  } else if buf.planes.len() == 1 {
+    let total: usize = layout.iter().map(|(stride, rows)| stride * rows).sum();
+    let plane = &buf.planes[0];
+    if plane.len() < total {
+      return Err(format!(
+        "{:?} frame has {} bytes, expected {}", buf.format, plane.len(), total));
+    }
+    let mut offset = 0;
+    for (i, (stride, rows)) in layout.iter().enumerate() {
+      pointers[i] = unsafe { plane.as_ptr().add(offset) };
+      strides[i] = *stride as i32;
+      offset += stride * rows;
+    }
+  } else {
+    return Err(format!(
+      "{:?} frame has {} planes, expected {} or 1", buf.format, buf.planes.len(), layout.len()));
+  }
+  Ok((pointers, strides))
 }
 
 // AVCodecContext.time_base doubles as a nominal-frame-rate hint: h264_mf.c
@@ -199,6 +239,7 @@ impl RtmpsPublisher {
     if width == 0 || height == 0 {
       return Err("frame has no dimensions".to_string());
     }
+    let src_pix_fmt = av_pixel_format(format)?;
 
     unsafe { ffi::avformat_network_init() };
 
@@ -268,6 +309,13 @@ impl RtmpsPublisher {
       return Err(msg);
     }
 
+    println!(
+      "RtmpsPublisher: encoder {} opened, {}x{}, extradata {} bytes",
+      unsafe { std::ffi::CStr::from_ptr((*codec).name) }.to_string_lossy(),
+      width, height,
+      unsafe { (*codec_ctx).extradata_size }
+    );
+
     let ret = unsafe { ffi::avcodec_parameters_from_context((*stream).codecpar, codec_ctx) };
     if ret < 0 {
       let msg = format!(
@@ -313,7 +361,7 @@ impl RtmpsPublisher {
       ffi::sws_getContext(
         width as i32,
         height as i32,
-        av_pixel_format(format),
+        src_pix_fmt,
         width as i32,
         height as i32,
         ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
@@ -387,8 +435,7 @@ impl RtmpsPublisher {
     let pts = (elapsed.as_secs_f64() * self.encoder_time_base.den as f64
       / self.encoder_time_base.num as f64) as i64;
 
-    let linesizes = plane_linesizes(buf.format, buf.width);
-    let src_ptrs: Vec<*const u8> = buf.planes.iter().map(|p| p.as_ptr()).collect();
+    let (src_ptrs, linesizes) = source_planes(buf)?;
 
     unsafe {
       ffi::av_frame_make_writable(self.frame);
@@ -404,7 +451,7 @@ impl RtmpsPublisher {
       (*self.frame).pts = pts;
     }
 
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
     draw_overlay_text(self.frame, &now);
 
     self.encode_and_write(self.frame)
@@ -432,6 +479,14 @@ impl RtmpsPublisher {
         ));
       }
       unsafe {
+        static PACKETS_LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if PACKETS_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
+          println!(
+            "RtmpsPublisher: packet {} bytes, keyframe {}",
+            (*self.packet).size,
+            (*self.packet).flags & ffi::AV_PKT_FLAG_KEY as i32 != 0
+          );
+        }
         ffi::av_packet_rescale_ts(self.packet, self.encoder_time_base, self.stream_time_base);
         (*self.packet).stream_index = 0;
         let ret = ffi::av_interleaved_write_frame(self.fmt_ctx, self.packet);
