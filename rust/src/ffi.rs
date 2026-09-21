@@ -97,6 +97,9 @@ pub enum ThalamusImageFormat {
     YUYV422 = 2,
     YUV420P = 3,
     YUVJ420P = 4,
+    NV12 = 5,
+    BGR = 6,
+    MJPEG = 7,
 }
 
 #[repr(C)]
@@ -421,6 +424,18 @@ thalamus_api_raw! {
     state_push_float_with_callback: unsafe extern "C" fn(*mut ThalamusState, f64, IoContextPostCallback, *mut ::std::os::raw::c_void),
     state_push_null_with_callback: unsafe extern "C" fn(*mut ThalamusState, IoContextPostCallback, *mut ::std::os::raw::c_void),
     state_push_bool_with_callback: unsafe extern "C" fn(*mut ThalamusState, i8, IoContextPostCallback, *mut ::std::os::raw::c_void),
+
+    node_offmain_signaler_create: unsafe extern "C" fn (*mut ThalamusNode) -> *mut ThalamusOffMainSignaler,
+    node_offmain_signaler_destroy: unsafe extern "C" fn (*mut ThalamusOffMainSignaler),
+    node_offmain_signaler_block: unsafe extern "C" fn (*mut ThalamusOffMainSignaler),
+    node_offmain_signaler_unblock: unsafe extern "C" fn (*mut ThalamusOffMainSignaler),
+    node_offmain_signaler_ready: unsafe extern "C" fn (*mut ThalamusOffMainSignaler) -> u8,
+}
+
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ThalamusOffMainSignaler {
+    _unused: [u8; 0],
 }
 
 #[repr(C)]
@@ -874,7 +889,15 @@ pub struct ThalamusNodeFactory {
     prepare: ::std::option::Option<unsafe extern "C" fn(factory: *mut ThalamusNodeFactory) -> ::std::os::raw::c_char>,
     cleanup: ::std::option::Option<unsafe extern "C" fn(factory: *mut ThalamusNodeFactory)>,
     api: *mut ThalamusAPIRaw,
-    c_str: CString
+    create2: ::std::option::Option<
+        unsafe extern "C" fn(
+            factory: *mut ThalamusNodeFactory,
+            arg1: *mut ThalamusState,
+            arg2: *mut ThalamusIoContext,
+            arg3: *mut ThalamusNodeGraph,
+            arg4: *mut ::std::os::raw::c_void,
+        ) -> *mut ThalamusNode,
+    >,
 }
 
 pub(crate) struct PluginImpl {
@@ -1049,6 +1072,9 @@ pub extern "C" fn c_node_image_format(raw_node: *mut ThalamusNode) -> ThalamusIm
     ImageFormat::YUYV422 => ThalamusImageFormat::YUYV422,
     ImageFormat::YUV420P => ThalamusImageFormat::YUV420P,
     ImageFormat::YUVJ420P => ThalamusImageFormat::YUVJ420P,
+    ImageFormat::NV12 => ThalamusImageFormat::NV12,
+    ImageFormat::BGR => ThalamusImageFormat::BGR,
+    ImageFormat::MJPEG => ThalamusImageFormat::MJPEG,
   }
 }
 
@@ -1171,11 +1197,15 @@ fn wrap_text(c_node: &mut ThalamusNode) {
   }
 }
 
-extern "C" fn create_node_template<T: crate::api::Node + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, _io_context: *mut ThalamusIoContext, _graph: *mut ThalamusNodeGraph) -> *mut ThalamusNode {
+extern "C" fn create_node_template<T: crate::api::Node + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, io_context: *mut ThalamusIoContext, graph: *mut ThalamusNodeGraph) -> *mut ThalamusNode {
+  create2_node_template::<T>(factory, state, io_context, graph, ptr::null_mut())
+}
+
+extern "C" fn create2_node_template<T: crate::api::Node + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, _io_context: *mut ThalamusIoContext, _graph: *mut ThalamusNodeGraph, c_impl: *mut ::std::os::raw::c_void) -> *mut ThalamusNode {
   println!("create_node_template");
   let api_raw = unsafe { (*factory).api };
   let c_node = Box::into_raw(Box::new(ThalamusNode {
-    c_impl: ptr::null_mut() as *mut ::std::os::raw::c_void,
+    c_impl,
     time_ns: None,
     analog: ptr::null_mut() as *mut ThalamusAnalogNode,
     mocap: ptr::null_mut() as *mut ThalamusMocapNode,
@@ -1246,19 +1276,23 @@ extern "C" fn cleanup_node_template<T: crate::api::Node>(_factory: *mut Thalamus
 }
 
 impl ThalamusNodeFactory {
-  pub fn new<T: crate::api::Node + 'static>(name: &str, api: *mut ThalamusAPIRaw) -> *mut ThalamusNodeFactory {
+  pub fn new<T: crate::api::Node + 'static>(name: &'static str, api: *mut ThalamusAPIRaw) -> *mut ThalamusNodeFactory {
     println!("ThalamusNodeFactory::new {}", name);
-    let c_name = CString::new(name).unwrap();
     let result = Box::into_raw(Box::new(ThalamusNodeFactory {
-      type_: ThalamusCharSpan { data: c_name.as_ptr(), size: name.len() as u64, owns_data: 0 },
+      type_: ThalamusCharSpan { data: name.as_ptr() as *const i8, size: name.len() as u64, owns_data: 0 },
       create: Some(create_node_template::<T>),
       destroy: Some(destroy_node_template),
       prepare: Some(prepare_node_template::<T>),
       cleanup: Some(cleanup_node_template::<T>),
       api: api,
-      c_str: c_name
+      create2: Some(create2_node_template::<T>),
     }));
     result as *mut ThalamusNodeFactory
   }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn thalamus_get_node_factory_version() -> i32 {
+  println!("thalamus_get_node_factory_version");
+  return 1;
+}

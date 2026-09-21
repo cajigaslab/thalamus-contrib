@@ -371,6 +371,9 @@ impl<'a> ImageData for ExtNodeData<'a> {
         ThalamusImageFormat::YUYV422 => ImageFormat::YUYV422,
         ThalamusImageFormat::YUV420P => ImageFormat::YUV420P,
         ThalamusImageFormat::YUVJ420P => ImageFormat::YUVJ420P,
+        ThalamusImageFormat::NV12 => ImageFormat::NV12,
+        ThalamusImageFormat::BGR => ImageFormat::BGR,
+        ThalamusImageFormat::MJPEG => ImageFormat::MJPEG,
       }
     }
   }
@@ -478,6 +481,7 @@ pub struct NodeToken {
   node: Arc<Mutex<*mut ThalamusNode>>
 }
 unsafe impl Send for NodeToken {}
+unsafe impl Sync for NodeToken {}
 
 impl NodeToken {
   pub fn new(node: *mut ThalamusNode) -> NodeToken {
@@ -495,6 +499,59 @@ impl NodeToken {
       return Err(NodeDestroyed);
     }
     Ok(f(*guard))
+  }
+}
+
+pub struct OffMainSignaler {
+  api: *mut ThalamusAPIRaw,
+  signaler: *mut ThalamusOffMainSignaler,
+  token: NodeToken,
+}
+
+impl OffMainSignaler {
+  pub fn new(api: ThalamusAPI, token: NodeToken) -> OffMainSignaler {
+    let signaler = token.with(|node| unsafe {
+      ((*api.raw).node_offmain_signaler_create.unwrap())(node)
+    }).unwrap();
+    OffMainSignaler {
+      api: api.raw, signaler, token
+    }
+  }
+
+  pub fn ready(&self, data: &dyn NodeData) -> Result<bool, NodeDestroyed> {
+    self.token.with(|node| unsafe {
+      let plugin_impl = plugin_impl_ptr(node);
+      // SAFETY: data is only read back synchronously inside node_ready_offmain,
+      // which returns before this function does, so the erased lifetime never
+      // outlives the real borrow.
+      let data: &'static dyn NodeData = std::mem::transmute(data);
+      (*plugin_impl).data = Some(data);
+      let signaled = ((*self.api).node_offmain_signaler_ready.unwrap())(self.signaler) != 0;
+      (*plugin_impl).data = None;
+      signaled
+    })
+  }
+
+  pub fn block(&self) -> Result<(), NodeDestroyed> {
+    self.token.with(|_node| unsafe {
+      ((*self.api).node_offmain_signaler_block.unwrap())(self.signaler)
+    })
+  }
+
+  pub fn unblock(&self) -> Result<(), NodeDestroyed> {
+    self.token.with(|_node| unsafe {
+      ((*self.api).node_offmain_signaler_unblock.unwrap())(self.signaler)
+    })
+  }
+}
+unsafe impl Send for OffMainSignaler {}
+unsafe impl Sync for OffMainSignaler {}
+
+impl Drop for OffMainSignaler {
+  fn drop(&mut self) {
+    unsafe {
+      ((*self.api).node_offmain_signaler_destroy.unwrap())(self.signaler);
+    }
   }
 }
 
@@ -608,6 +665,10 @@ impl ThalamusAPI {
       let time_ns = (&*self.raw).time_ns.unwrap();
       return Duration::from_nanos(time_ns());
     }
+  }
+
+  pub fn create_offmain_signaler(&self, token: NodeToken) -> OffMainSignaler {
+    OffMainSignaler::new(self.clone(), token)
   }
 
   pub fn ready(&self, data: &dyn NodeData, token: &NodeToken) -> Result<(), NodeDestroyed> {
@@ -2305,6 +2366,9 @@ pub enum ImageFormat {
     YUYV422,
     YUV420P,
     YUVJ420P,
+    NV12,
+    BGR,
+    MJPEG,
 }
 
 pub trait ImageData {

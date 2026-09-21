@@ -16,8 +16,8 @@ use crate::imgui_window::{ImguiWindow, MAX_FRAMES_IN_FLIGHT};
 fn channels_for_format(format: ImageFormat) -> Option<u32> {
   match format {
     ImageFormat::Gray => Some(1),
-    ImageFormat::RGB => Some(3),
-    ImageFormat::YUYV422 | ImageFormat::YUV420P | ImageFormat::YUVJ420P => None,
+    ImageFormat::RGB | ImageFormat::BGR => Some(3),
+    ImageFormat::YUYV422 | ImageFormat::YUV420P | ImageFormat::YUVJ420P | ImageFormat::NV12 | ImageFormat::MJPEG => None,
   }
 }
 

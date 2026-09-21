@@ -17,16 +17,16 @@ mod block;
 mod bluetooth;
 
 use thorcam_node::ThorcamNode;
-use webcam_node::WebcamNode;
 use rtmps_node::RtmpsNode;
 use sleeve_node::SleeveNode;
 use angular_scaling_node::AngularScalingNode;
+use webcam_node::WebcamNode;
 
 export_nodes!(
   ("THORCAM", ThorcamNode),
-  ("WEBCAM", WebcamNode),
   ("RTMPS", RtmpsNode),
   ("SLEEVE", SleeveNode),
-  ("ANGULAR_SCALING", AngularScalingNode)
+  ("ANGULAR_SCALING", AngularScalingNode),
+  ("WEBCAM", WebcamNode)
 );
 

@@ -1,133 +1,168 @@
-use std::cell::RefCell;
-use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::{sync::{Arc, Mutex}, time::Duration};
+use nokhwa::pixel_format::RgbFormat;
 
 use crate::api::{
-  Json, MainThreadToken, Node, NodeToken, OnDrop, PredropToken, Request, State, StateAction,
-  StateKey, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI, ThalamusAPIThreadSafe,
+  self, ImageData, Json, MainThreadOnly, MainThreadToken, Node, NodeData, NodeToken, OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI, ThalamusAPIThreadSafe
 };
-use crate::ffmpeg_devices::{CameraInfo, WebcamCapture, list_cameras, list_formats, probe_resolution};
 
-static CAMERAS: OnceLock<Vec<CameraInfo>> = OnceLock::new();
+struct Frame<'a> {
+  buffer: &'a [u8],
+  width: u64,
+  height: u64,
+  format: api::ImageFormat,
+  time: Duration,
+  frame_interval: Duration,
+}
 
-const DEFAULT_WIDTH: u32 = 640;
-const DEFAULT_HEIGHT: u32 = 480;
+impl<'a> NodeData for Frame<'a> {
+  fn analog(&self) -> Option<&dyn api::AnalogData> { None }
 
-fn selected_device_name(state: &State) -> Option<String> {
-  let selected = state.get(StateKey::String("Camera".to_string()));
-  match selected {
-    Some(StateValue::String(description)) => CAMERAS
-      .get()
-      .and_then(|cameras| cameras.iter().find(|c| c.description == description))
-      .map(|c| c.device_name.clone()),
-    _ => None,
+  fn image(&self) -> Option<&dyn ImageData> { Some(self) }
+
+  fn mocap(&self) -> Option<&dyn api::MocapData> { None }
+
+  fn text(&self) -> Option<&dyn api::TextData> { None }
+  
+  fn time(&self) -> Duration {
+    self.time
   }
 }
 
-fn state_get_u32(state: &State, key: &str) -> Option<u32> {
-  match state.get(StateKey::String(key.to_string())) {
-    Some(StateValue::Int(i)) if i > 0 => Some(i as u32),
-    _ => None,
+impl<'a> ImageData for Frame<'a> {
+  fn plane(
+            &self,
+            _channel: i32,
+        ) -> &[u8] {
+    self.buffer
+  }
+
+  fn num_planes(&self) -> u64 {
+    1
+  }
+
+  fn format(&self) -> api::ImageFormat {
+    self.format
+  }
+
+  fn width(&self) -> u64 {
+    self.width
+  }
+
+  fn height(&self) -> u64 {
+    self.height
+  }
+
+  fn frame_interval(&self) -> std::time::Duration {
+    self.frame_interval
   }
 }
 
 struct WebcamNodeInner {
-  api: ThalamusAPI,
-  node_token: NodeToken,
-  state: State,
-  state_connection: Option<OnDrop>,
-  capture_thread: Option<std::thread::JoinHandle<()>>,
-  stop_flag: Arc<AtomicBool>,
+  api:              ThalamusAPI,
+  _state_connection: OnDrop,
   main_thread_token: MainThreadToken,
+  state: State,
+  signaler: Arc<OffMainSignaler>,
+  webcam_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 pub struct WebcamNode {
-  inner: Rc<RefCell<WebcamNodeInner>>,
+    inner: Arc<Mutex<WebcamNodeInner>>,
 }
 
-fn start_capture(inner: &Rc<RefCell<WebcamNodeInner>>) {
-  let inner_clone = Rc::clone(inner);
-  // Mirrors ThorcamNode: don't spawn the new capture thread until the old
-  // one (if any) has fully exited, so a stale thread can't still be mid
-  // shutdown (e.g. holding the device open) when a new one tries to start.
-  stop_capture(inner, move || {
-    start_capture_impl(&inner_clone);
-  });
-}
-
-fn start_capture_impl(inner: &Rc<RefCell<WebcamNodeInner>>) {
-  let (api, node_token, device_name, width, height) = {
-    let borrow = inner.borrow();
-    let device_name = selected_device_name(&borrow.state);
-    let width = state_get_u32(&borrow.state, "Width").unwrap_or(DEFAULT_WIDTH);
-    let height = state_get_u32(&borrow.state, "Height").unwrap_or(DEFAULT_HEIGHT);
-    (borrow.api, borrow.node_token.clone(), device_name, width, height)
-  };
-
-  let Some(device_name) = device_name else {
-    println!("WebcamNode: no camera selected");
-    return;
-  };
-
-  let stop_flag = Arc::new(AtomicBool::new(false));
-  let stop_clone = Arc::clone(&stop_flag);
-
-  let mt_api = api.thread_safe();
-  let handle = std::thread::spawn(move || {
-    run_capture(mt_api, node_token, stop_clone, device_name, width, height);
-  });
-
-  let mut borrow = inner.borrow_mut();
-  borrow.stop_flag = stop_flag;
-  borrow.capture_thread = Some(handle);
-}
-
-fn stop_capture<F: FnOnce() + 'static>(inner: &Rc<RefCell<WebcamNodeInner>>, on_stopped: F) {
-  let (handle, api, main_thread_token) = {
-    let mut borrow = inner.borrow_mut();
-    borrow.stop_flag.store(true, Ordering::Relaxed);
-    (
-      borrow.capture_thread.take(),
-      borrow.api,
-      borrow.main_thread_token,
-    )
-  };
-  // Never join on the main thread (see ThorcamNode) -- join_then hands the
-  // join off to a threadpool thread and runs on_stopped once back on the
-  // main thread.
-  api.join_then(handle, main_thread_token, on_stopped);
-}
-
-fn run_capture(
-  api: ThalamusAPIThreadSafe,
-  node_token: NodeToken,
-  stop: Arc<AtomicBool>,
-  device_name: String,
-  width: u32,
-  height: u32,
-) {
-  let mut capture = match WebcamCapture::open(&device_name, width, height) {
-    Ok(capture) => capture,
-    Err(e) => {
-      println!("WebcamNode: failed to open {}: {}", device_name, e);
-      return;
-    }
-  };
-
-  while !stop.load(Ordering::Relaxed) {
-    let Some(frame) = capture.read_frame() else {
-      println!("WebcamNode: {} stopped producing frames", device_name);
-      break;
-    };
-    let frame = frame.with_time(crate::api::time(api.raw));
-    // Publishes synchronously from this thread; subscribers read plane()
-    // before this call returns. Ignore if the node was destroyed
-    // concurrently.
-    let _ = api.ready_offmain(&frame, &node_token);
+impl WebcamNodeInner {
+  fn stop_webcam(&mut self) {
+    let _ = self.signaler.block();
+    self.webcam_thread.take().map(|h| {
+      h.join()
+    });
   }
 
-  println!("WebcamNode: capture thread exited");
+  fn webcam(api: ThalamusAPIThreadSafe, signaler: Arc<OffMainSignaler>) {
+    let index = nokhwa::utils::CameraIndex::Index(0);
+    let format = nokhwa::utils::RequestedFormat::new::<RgbFormat>(nokhwa::utils::RequestedFormatType::AbsoluteHighestResolution);
+    let mut camera =  match nokhwa::Camera::new(index, format) {
+      Ok(c) => {
+        c
+      },
+      Err(e) => {
+        println!("Camera Selection failed: {:?}", e);
+        return;
+      }
+    };
+    match camera.open_stream() {
+      Ok(_) => {},
+      Err(e) => {
+        println!("Camera Open failed: {:?}", e);
+        return;
+      }
+    };
+
+    loop {
+      let buffer = match camera.frame() {
+        Ok(v) => {v},
+        Err(e) => {
+          println!("Frame Grab failed: {:?}", e);
+          return;
+        }
+      };
+      let time = api.time();
+
+      let format = match buffer.source_frame_format() {
+        nokhwa::utils::FrameFormat::MJPEG => api::ImageFormat::MJPEG,
+        nokhwa::utils::FrameFormat::YUYV => api::ImageFormat::YUYV422,
+        nokhwa::utils::FrameFormat::NV12 => api::ImageFormat::NV12,
+        nokhwa::utils::FrameFormat::GRAY => api::ImageFormat::Gray,
+        nokhwa::utils::FrameFormat::RAWRGB => api::ImageFormat::RGB,
+        nokhwa::utils::FrameFormat::RAWBGR => api::ImageFormat::BGR,
+      };
+      let frame_interval = Duration::from_secs_f64(1.0/(camera.frame_rate() as f64));
+
+      let resolution = buffer.resolution();
+      //println!("{} {} {} {}", buffer.buffer().len(), resolution.width(), resolution.height(), buffer.source_frame_format());
+      let frame = Frame {
+        buffer: buffer.buffer(),
+        width: resolution.width() as u64,
+        height: resolution.height() as u64,
+        time, format, frame_interval
+      };
+      match signaler.ready(&frame) {
+        Ok(v) => { 
+          if !v {
+            println!("Blocked");
+            break
+          } 
+        },
+        Err(_) => {break}
+      }
+    }
+  }
+
+  fn on_state(me: Arc<Mutex<WebcamNodeInner>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
+    let StateValue::String(key_str) = key else {
+      return;
+    };
+    match key_str.as_str() {
+      "Running" => {
+        me.lock().unwrap().stop_webcam();
+        if value == StateValue::Bool(true) {
+          let mut lock = me.lock().unwrap();
+          let api = lock.api.thread_safe();
+          let signaler = lock.signaler.clone();
+          let _ = signaler.unblock();
+          let wrapped_state = MainThreadOnly::new(lock.state.clone(), lock.main_thread_token);
+          lock.webcam_thread = Some(std::thread::spawn(move || {
+            WebcamNodeInner::webcam(api, signaler);
+            api.post_to_main(|main_thread_token| {
+                let state = wrapped_state.take(main_thread_token);
+                state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
+            });
+          }));
+        }
+      }
+      _ => {}
+    }
+  }
 }
 
 impl Node for WebcamNode {
@@ -135,101 +170,47 @@ impl Node for WebcamNode {
     THALAMUS_MODALITY_IMAGE
   }
 
-  fn process(&self, handle: Request, request: Json) {
-    let api = self.inner.borrow().api;
-    let response = match serde_json::from_str::<serde_json::Value>(&request.to_string()) {
-      Ok(serde_json::Value::String(s)) if s == "get_cameras" => {
-        let cameras: Vec<serde_json::Value> = CAMERAS
-          .get_or_init(list_cameras)
-          .iter()
-          .map(|c| serde_json::Value::String(c.description.clone()))
-          .collect();
-        serde_json::to_string_pretty(&cameras).unwrap()
-      }
-      Ok(serde_json::Value::String(s)) if s == "test_resolution" => {
-        let borrow = self.inner.borrow();
-        let device_name = selected_device_name(&borrow.state);
-        let width = state_get_u32(&borrow.state, "Width");
-        let height = state_get_u32(&borrow.state, "Height");
-        drop(borrow);
-
-        let formats = device_name.as_ref().and_then(|name| match list_formats(name) {
-          Ok(formats) => Some(formats),
-          Err(e) => {
-            println!("WebcamNode: could not list formats for {}: {}", name, e);
-            None
-          }
-        });
-
-        let result = match (&device_name, width, height) {
-          (None, _, _) => Err("no camera selected".to_string()),
-          (_, None, _) | (_, _, None) => Err("width and height must both be set".to_string()),
-          (Some(device_name), Some(width), Some(height)) => {
-            probe_resolution(device_name, width as i32, height as i32)
-          }
-        };
-
-        let mut response = match result {
-          Ok(()) => serde_json::json!({ "success": true }),
-          Err(error) => serde_json::json!({ "success": false, "error": error }),
-        };
-        if let Some(formats) = formats {
-          response["formats"] = serde_json::Value::String(formats);
-        }
-        response.to_string()
-      }
-      _ => "null".to_string(),
-    };
-    println!("{}", response);
-    handle.respond(&Json::from_string(api, &response));
+  fn signals_offmain(&self) -> bool {
+    true
   }
 
-  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self {
-    CAMERAS.get_or_init(list_cameras);
+  fn process(&self, handle: Request, _request: Json) {
+    let api = self.inner.lock().unwrap().api;
+    handle.respond(&Json::from_string(api, "null"));
+  }
 
-    let inner = Rc::new(RefCell::new(WebcamNodeInner {
-      api,
-      node_token,
-      state: state.clone(),
-      state_connection: None,
-      capture_thread: None,
-      stop_flag: Arc::new(AtomicBool::new(false)),
-      main_thread_token: token,
-    }));
-
-    let change_ref = Rc::clone(&inner);
-    let state_callback =
-      move |_source: State, _action: StateAction, key: StateValue, value: StateValue| {
-        let StateValue::String(key_str) = key else {
-          return;
-        };
-        match key_str.as_str() {
-          "Running" => {
-            if value == StateValue::Bool(true) {
-              start_capture(&change_ref);
-            } else {
-              stop_capture(&change_ref, || {});
-            }
-          }
-          _ => {}
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, main_thread_token: MainThreadToken) -> Self {
+    let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Mutex<WebcamNodeInner>>| {
+      let weak2 = weak.clone();
+      let state_callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
+        if let Some(strong) = weak2.upgrade() {
+          WebcamNodeInner::on_state(strong, source, action, key, value);
         }
       };
 
-    inner.borrow_mut().state_connection = Some(state.connect(state_callback));
-    state.recap();
-
-    WebcamNode { inner }
-  }
-
-  fn predrop(&self, token: PredropToken) {
-    stop_capture(&self.inner, move || {
-      token.ready();
+      let _state_connection = state.connect(state_callback);
+      let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
+      Mutex::new(WebcamNodeInner {
+        api, _state_connection, main_thread_token,
+        state: state.clone(),
+        signaler, webcam_thread: None
+      })
     });
+
+    state.recap_with(|source: State, action: StateAction, key: StateValue, value: StateValue| {
+      WebcamNodeInner::on_state(inner.clone(), source, action, key, value);
+    });
+
+    WebcamNode {
+      inner
+    }
   }
 }
 
 impl Drop for WebcamNode {
   fn drop(&mut self) {
-    stop_capture(&self.inner, || {});
+    let mut lock = self.inner.lock().unwrap();
+    lock.stop_webcam();
+    lock.state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
   }
 }

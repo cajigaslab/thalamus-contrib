@@ -42,6 +42,9 @@ fn av_pixel_format(format: ImageFormat) -> ffi::AVPixelFormat {
     ImageFormat::YUYV422 => ffi::AVPixelFormat::AV_PIX_FMT_YUYV422,
     ImageFormat::YUV420P => ffi::AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::YUVJ420P => ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P,
+    ImageFormat::NV12 => ffi::AVPixelFormat::AV_PIX_FMT_NV12,
+    ImageFormat::BGR => ffi::AVPixelFormat::AV_PIX_FMT_BGR24,
+    ImageFormat::MJPEG => panic!("Unsupported format MJPEG"),
   }
 }
 
@@ -50,13 +53,14 @@ fn av_pixel_format(format: ImageFormat) -> ffi::AVPixelFormat {
 // ffmpeg_devices.rs).
 fn plane_linesizes(format: ImageFormat, width: u32) -> Vec<i32> {
   match format {
-    ImageFormat::Gray => vec![width as i32],
-    ImageFormat::RGB => vec![width as i32 * 3],
+    ImageFormat::Gray | ImageFormat::NV12 => vec![width as i32],
+    ImageFormat::RGB | ImageFormat::BGR => vec![width as i32 * 3],
     ImageFormat::YUYV422 => vec![width as i32 * 2],
     ImageFormat::YUV420P | ImageFormat::YUVJ420P => {
       let chroma_w = width.div_ceil(2) as i32;
       vec![width as i32, chroma_w, chroma_w]
-    }
+    },
+    ImageFormat::MJPEG => panic!("Unsupported format MJPEG"),
   }
 }
 
