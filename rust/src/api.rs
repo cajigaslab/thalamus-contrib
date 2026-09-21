@@ -532,16 +532,16 @@ impl OffMainSignaler {
     })
   }
 
-  pub fn block(&self) -> Result<(), NodeDestroyed> {
-    self.token.with(|_node| unsafe {
+  pub fn block(&self) {
+    unsafe {
       ((*self.api).node_offmain_signaler_block.unwrap())(self.signaler)
-    })
+    }
   }
 
-  pub fn unblock(&self) -> Result<(), NodeDestroyed> {
-    self.token.with(|_node| unsafe {
+  pub fn unblock(&self) {
+    unsafe {
       ((*self.api).node_offmain_signaler_unblock.unwrap())(self.signaler)
-    })
+    }
   }
 }
 unsafe impl Send for OffMainSignaler {}

@@ -6,6 +6,20 @@ from thalamus import thalamus_pb2
 
 LOGGER = logging.getLogger(__name__)
 
+VIEW_ROTATIONS = {
+  '0': 0,
+  '90': 90,
+  '180': 180,
+  '270': 270,
+  0: 0,
+  90: 90,
+  180: 180,
+  270: 270,
+}
+
+WIDTHS = (320, 640, 800, 1024, 1280, 1600, 1920, 2560, 3840)
+HEIGHTS = (240, 480, 600, 720, 768, 900, 1080, 1440, 2160)
+
 class WebcamComboBox(QComboBox):
   def __init__(self, config, stub):
     super().__init__()
@@ -20,31 +34,37 @@ class WebcamComboBox(QComboBox):
       return
 
     name = self.config['name']
-    current_camera = self.config.get('Camera', None)
+    current_camera = self.config.get('Camera', {})
 
     response = await self.stub.node_request(thalamus_pb2.NodeRequest(node=name,json="\"get_cameras\""))
+    print('get_cameras', response)
     cameras = json.loads(response.json)
     LOGGER.debug('asyncShowPopup %s', cameras)
     self.clear()
     if cameras is None:
       return
-    self.addItems(cameras)
-    for i, v in enumerate(cameras):
-      if v == current_camera:
+    for camera in cameras:
+      self.addItem(f'{camera["index"]}: {camera["name"]}', camera)
+    for i in range(self.count()):
+      if self.itemData(i)['index'] == current_camera.get('index', None):
         self.setCurrentIndex(i)
+        self.config['Camera'] = self.itemData(i)
         break
     self.loaded = True
     super().showPopup()
 
-  def setCurrentText(self, text):
-    if self.loaded:
-      return super().setCurrentText(text);
+  def setCamera(self, camera):
+    print('setCamera', camera)
+    if camera is None:
+      return
+    
     for i in range(self.count()):
-      if self.itemText(i) == text:
-        super().setCurrentText(text)
+      if self.itemData(i)['index'] == camera['index']:
+        super().setCurrentIndex(i)
         return
 
-    self.addItem(text)
+    text = f'{camera["index"]}: {camera["name"]}'
+    self.addItem(text, camera)
     super().setCurrentText(text)
 
   def showPopup(self):
@@ -57,15 +77,24 @@ class WebcamWidget(QWidget):
     self.config = config
     self.stub = stub
 
+    if 'Running' not in config:
+      config['Running'] = False
     if 'Width' not in config:
       config['Width'] = 640
     if 'Height' not in config:
       config['Height'] = 480
+    if 'AcquisitionFrameRate' not in config:
+      config['AcquisitionFrameRate'] = 30
+    if 'Camera' not in config:
+      config['Camera'] = {'index': -1, 'name': 'NULL', 'description': 'NULL'}
+    self.camera = config['Camera']
+
+    config.add_recursive_observer(self.on_change, lambda: isdeleted(self))
 
     layout = QVBoxLayout()
 
     self.camera_combobox = WebcamComboBox(config, stub)
-    self.camera_combobox.currentTextChanged.connect(lambda new_camera: config.update({"Camera": new_camera}))
+    self.camera_combobox.currentIndexChanged.connect(lambda index: config.update({"Camera": self.camera_combobox.itemData(index)}))
     layout.addWidget(self.camera_combobox)
 
     self.running_checkbox = QCheckBox('Running')
@@ -73,63 +102,45 @@ class WebcamWidget(QWidget):
     layout.addWidget(self.running_checkbox)
 
     layout.addWidget(QLabel('Width:'))
-    self.width_spinbox = QSpinBox()
-    self.width_spinbox.setRange(1, 10000)
-    self.width_spinbox.setValue(config['Width'])
-    self.width_spinbox.editingFinished.connect(lambda: config.update({'Width': self.width_spinbox.value()}))
-    layout.addWidget(self.width_spinbox)
+    self.width_combobox = QSpinBox()
+    self.width_combobox.setRange(0, 1000000)
+    self.width_combobox.valueChanged.connect(
+      lambda _: config.update({'Width': self.width_combobox.value()}))
+    layout.addWidget(self.width_combobox)
 
     layout.addWidget(QLabel('Height:'))
-    self.height_spinbox = QSpinBox()
-    self.height_spinbox.setRange(1, 10000)
-    self.height_spinbox.setValue(config['Height'])
-    self.height_spinbox.editingFinished.connect(lambda: config.update({'Height': self.height_spinbox.value()}))
-    layout.addWidget(self.height_spinbox)
+    self.height_combobox = QSpinBox()
+    self.height_combobox.setRange(0, 1000000)
+    self.height_combobox.valueChanged.connect(
+      lambda _: config.update({'Height': self.height_combobox.value()}))
+    layout.addWidget(self.height_combobox)
 
-    async def test_resolution():
-      name = self.config['name']
-      response = await self.stub.node_request(thalamus_pb2.NodeRequest(node=name, json="\"test_resolution\""))
-      result = json.loads(response.json)
-      LOGGER.debug('test_resolution %s', result)
-      success = isinstance(result, dict) and result.get('success')
-      if success:
-        message = f"{self.width_spinbox.value()}x{self.height_spinbox.value()} is supported by the selected camera."
-      else:
-        error = result.get('error') if isinstance(result, dict) else None
-        message = f"{self.width_spinbox.value()}x{self.height_spinbox.value()} is not supported: {error or 'unknown error'}"
-
-      formats = result.get('formats') if isinstance(result, dict) else None
-      if formats:
-        message += f"\n\nFormats supported by this camera:\n{formats}"
-
-      if success:
-        QMessageBox.information(self, 'Test Resolution', message)
-      else:
-        QMessageBox.warning(self, 'Test Resolution', message)
-
-    def sync_test_resolution():
-      create_task_with_exc_handling(test_resolution())
-
-    self.test_button = QPushButton('Test')
-    self.test_button.clicked.connect(sync_test_resolution)
-    layout.addWidget(self.test_button)
+    layout.addWidget(QLabel('Frame Rate:'))
+    self.framerate_spinbox = QDoubleSpinBox()
+    self.framerate_spinbox.setRange(0, 1000000)
+    self.framerate_spinbox.setSuffix(' Hz')
+    self.framerate_spinbox.editingFinished.connect(lambda: config.update({'AcquisitionFrameRate': self.framerate_spinbox.value()}))
+    layout.addWidget(self.framerate_spinbox)
 
     layout.addStretch(1)
 
     self.setLayout(layout)
 
-    self.config.add_recursive_observer(self.on_change, lambda: isdeleted(self))
     self.config.recap(lambda *args: self.on_change(self.config, *args))
 
   def on_change(self, source, action, key, value):
-    if key == 'Camera':
-      self.camera_combobox.setCurrentText(value)
-    elif key == 'Running':
-      if self.running_checkbox.isChecked() != value:
-        self.running_checkbox.setChecked(value)
-    elif key == 'Width':
-      if self.width_spinbox.value() != value:
-        self.width_spinbox.setValue(value)
-    elif key == 'Height':
-      if self.height_spinbox.value() != value:
-        self.height_spinbox.setValue(value)
+    if source is self.config:
+      if key == 'Camera':
+        self.camera_combobox.setCamera(value)
+      elif key == 'Running':
+        if self.running_checkbox.isChecked() != value:
+          self.running_checkbox.setChecked(value)
+      elif key == 'Width':
+        self.width_combobox.setValue(int(value))
+      elif key == 'Height':
+        self.height_combobox.setValue(int(value))
+      elif key == 'AcquisitionFrameRate':
+        if abs(self.framerate_spinbox.value() - value) >= 1:
+          self.framerate_spinbox.setValue(value)
+    elif source is self.camera:
+      self.camera_combobox.setCamera(source)

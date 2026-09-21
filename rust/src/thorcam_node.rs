@@ -5,9 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::api::{
-    AnalogData, ImageData, ImageFormat, MainThreadToken, MocapData, Node, NodeData, NodeToken,
-    OnDrop, PredropToken, Request, Json, State, StateAction, StateKey, StateValue, ThalamusAPI,
-    ThalamusAPIThreadSafe, THALAMUS_MODALITY_IMAGE, run_task, TaskScope,
+    AnalogData, ImageData, ImageFormat, Json, MainThreadToken, MocapData, Node, NodeData, NodeToken, OffMainSignaler, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, TaskScope, ThalamusAPI, ThalamusAPIThreadSafe, run_task,
 };
 use crate::image_viewer::{ImageFrame, ImageViewer};
 
@@ -192,27 +190,15 @@ struct ThorcamNodeInner {
     state:             State,
     state_connection:  Option<OnDrop>,
     camera_thread:     Option<std::thread::JoinHandle<()>>,
-    stop_flag:         Arc<AtomicBool>,
     main_thread_token: MainThreadToken,
     viewer:            Option<ImageViewer>,
     viewer_task:       Option<TaskScope>,
     shared_frame:      Arc<Mutex<Option<FrameSnapshot>>>,
+    signaler:          Arc<OffMainSignaler>
 }
 
 pub struct ThorcamNode {
     inner: Rc<RefCell<ThorcamNodeInner>>,
-}
-
-
-fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-    let inner_clone = Rc::clone(inner);
-    // Don't spawn the new capture thread until the old one (if any) has fully
-    // exited: stop_camera's join happens off the main thread, so without this
-    // hand-off a stale thread could still be mid-shutdown (e.g. still holding
-    // the device open) when a new one tries to start.
-    stop_camera(inner, move || {
-        start_camera_impl(&inner_clone);
-    });
 }
 
 /// Reads `view_geometry` as `(x, y, w, h)` if the key exists and is a list
@@ -372,14 +358,14 @@ fn close_viewer(inner: &Rc<RefCell<ThorcamNodeInner>>) {
     inner.borrow_mut().viewer = None;
 }
 
-fn start_camera_impl(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-    let (api, device_id, node_token, shared_frame) = {
+fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
+    let (api, device_id, shared_frame, signaler) = {
         let borrow = inner.borrow();
         let device_id = UC480.get()
             .and_then(|r| r.as_ref().ok())
             .and_then(|(_, cameras)| cameras.first())
             .map(|c| c.device_id);
-        (borrow.api, device_id, borrow.node_token.clone(), borrow.shared_frame.clone())
+        (borrow.api, device_id, borrow.shared_frame.clone(), borrow.signaler.clone())
     };
 
     let Some(device_id) = device_id else {
@@ -387,36 +373,25 @@ fn start_camera_impl(inner: &Rc<RefCell<ThorcamNodeInner>>) {
         return;
     };
 
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let stop_clone = Arc::clone(&stop_flag);
-
     let mt_api = api.thread_safe();
+    signaler.unblock();
     let handle = std::thread::spawn(move || {
-        run_camera(mt_api, node_token, stop_clone, device_id, shared_frame);
+        run_camera(mt_api, signaler, device_id, shared_frame);
     });
 
     let mut borrow = inner.borrow_mut();
-    borrow.stop_flag = stop_flag;
     borrow.camera_thread = Some(handle);
 }
 
-fn stop_camera<F: FnOnce() + 'static>(inner: &Rc<RefCell<ThorcamNodeInner>>, on_stopped: F) {
-    let (handle, api, main_thread_token) = {
-        let mut borrow = inner.borrow_mut();
-        borrow.stop_flag.store(true, Ordering::Relaxed);
-        (borrow.camera_thread.take(), borrow.api, borrow.main_thread_token)
-    };
-    // Never join on the main thread: the capture thread's ready_offmain call
-    // synchronously posts to and blocks on the main thread, so a blocking join
-    // here could deadlock against it. join_then hands the join off to a
-    // threadpool thread and runs on_stopped once back on the main thread.
-    api.join_then(handle, main_thread_token, on_stopped);
+fn stop_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
+    let mut borrow = inner.borrow_mut();
+    borrow.signaler.block();
+    borrow.camera_thread.take().map(|h| h.join());
 }
 
 fn run_camera(
     api: ThalamusAPIThreadSafe,
-    node_token: NodeToken,
-    stop: Arc<AtomicBool>,
+    signaler: Arc<OffMainSignaler>,
     device_id: u32,
     shared_frame: Arc<Mutex<Option<FrameSnapshot>>>,
 ) {
@@ -508,7 +483,7 @@ fn run_camera(
 
     let frame_size = (width * height) as usize;
 
-    while !stop.load(Ordering::Relaxed) {
+    loop {
         let mut next_mem: *mut i8 = std::ptr::null_mut();
         let mut next_id: i32 = 0;
         let ret = unsafe { (lib.wait_for_next_image)(h_cam, 1000, &mut next_mem, &mut next_id) };
@@ -526,7 +501,12 @@ fn run_camera(
 
         // Publishes directly from this thread; subscribers read plane() synchronously
         // before this call returns. Ignore if the node was destroyed concurrently.
-        let _ = api.ready_offmain(&data, &node_token);
+        match signaler.ready(&data) {
+            Ok(v) => {
+                if !v { break }
+            },
+            Err(_) => { break }
+        };
 
         // Copied out before unlock_seq_buf below hands the buffer back to the
         // driver (which may overwrite it): the main-thread preview window
@@ -589,6 +569,10 @@ impl Node for ThorcamNode {
       THALAMUS_MODALITY_IMAGE
     }
 
+    fn signals_offmain(&self) -> bool {
+        true
+    }
+
     fn process(&self, handle: Request, request: Json) {
         let api = self.inner.borrow().api;
         let response = match serde_json::from_str::<serde_json::Value>(&request.to_string()) {
@@ -624,17 +608,18 @@ impl Node for ThorcamNode {
             Err(e) => println!("ThorcamNode: uc480 init failed: {}", e),
         }
 
+        let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
         let inner = Rc::new(RefCell::new(ThorcamNodeInner {
             api,
             node_token,
             state: state.clone(),
             state_connection: None,
             camera_thread: None,
-            stop_flag: Arc::new(AtomicBool::new(false)),
             main_thread_token: token,
             viewer: None,
             viewer_task: None,
             shared_frame: Arc::new(Mutex::new(None)),
+            signaler,
         }));
 
         let change_ref = Rc::clone(&inner);
@@ -642,10 +627,9 @@ impl Node for ThorcamNode {
             let StateValue::String(key_str) = key else { return };
             match key_str.as_str() {
                 "Running" => {
+                    stop_camera(&change_ref);
                     if value == StateValue::Bool(true) {
                         start_camera(&change_ref);
-                    } else {
-                        stop_camera(&change_ref, || {});
                     }
                 }
                 "View" => {
@@ -664,18 +648,11 @@ impl Node for ThorcamNode {
 
         ThorcamNode { inner }
     }
-
-    fn predrop(&self, token: PredropToken) {
-        close_viewer(&self.inner);
-        stop_camera(&self.inner, move || {
-            token.ready();
-        });
-    }
 }
 
 impl Drop for ThorcamNode {
     fn drop(&mut self) {
         close_viewer(&self.inner);
-        stop_camera(&self.inner, || {});
+        stop_camera(&self.inner);
     }
 }

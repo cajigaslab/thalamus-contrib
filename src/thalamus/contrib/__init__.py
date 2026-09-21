@@ -32,9 +32,10 @@ def widgets():
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
     ]),
-    'WEBCAM': Factory(None, [
+    'WEBCAM': Factory(lambda c, s: WebcamWidget(c, s), [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
+      UserData(UserDataType.COMBO_BOX, 'View Rotation', '0', ['0', '90', '180', '270']),
     ]),
     'RTMPS': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),

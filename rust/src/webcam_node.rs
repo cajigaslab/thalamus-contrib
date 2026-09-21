@@ -57,9 +57,44 @@ impl<'a> ImageData for Frame<'a> {
   }
 }
 
+/// Snapshot of the node's config, read on the main thread and handed to the webcam thread.
+struct WebcamSettings {
+  index: Option<nokhwa::utils::CameraIndex>,
+  width: u32,
+  height: u32,
+  frame_rate: f64,
+}
+
+impl WebcamSettings {
+  fn read(state: &State) -> WebcamSettings {
+    let number = |key: &str, default: f64| -> f64 {
+      state.get(api::StateKey::String(key.to_string()))
+        .and_then(|v| f64::try_from(v).ok())
+        .unwrap_or(default)
+    };
+
+    // The widget stores the object returned by get_cameras, index is -1 when
+    // nothing has been selected.
+    let index = match state.get(api::StateKey::String("Camera".to_string())) {
+      Some(StateValue::Dict(camera)) => match camera.get(api::StateKey::String("index".to_string())) {
+        Some(StateValue::Int(i)) => u32::try_from(i).ok().map(nokhwa::utils::CameraIndex::Index),
+        _ => None,
+      },
+      _ => None,
+    };
+
+    WebcamSettings {
+      index,
+      width: number("Width", 640.0) as u32,
+      height: number("Height", 480.0) as u32,
+      frame_rate: number("AcquisitionFrameRate", 30.0),
+    }
+  }
+}
+
 struct WebcamNodeInner {
   api:              ThalamusAPI,
-  _state_connection: OnDrop,
+  _state_connection: Option<OnDrop>,
   main_thread_token: MainThreadToken,
   state: State,
   signaler: Arc<OffMainSignaler>,
@@ -72,15 +107,20 @@ pub struct WebcamNode {
 
 impl WebcamNodeInner {
   fn stop_webcam(&mut self) {
-    let _ = self.signaler.block();
+    self.signaler.block();
     self.webcam_thread.take().map(|h| {
       h.join()
     });
   }
 
-  fn webcam(api: ThalamusAPIThreadSafe, signaler: Arc<OffMainSignaler>) {
-    let index = nokhwa::utils::CameraIndex::Index(0);
-    let format = nokhwa::utils::RequestedFormat::new::<RgbFormat>(nokhwa::utils::RequestedFormatType::AbsoluteHighestResolution);
+  fn webcam(api: ThalamusAPIThreadSafe, signaler: Arc<OffMainSignaler>, settings: WebcamSettings) {
+    println!("webcam start");
+    let Some(index) = settings.index else {
+      println!("No camera selected");
+      return;
+    };
+    // The format is chosen below, this request only has to get the camera open.
+    let format = nokhwa::utils::RequestedFormat::new::<RgbFormat>(nokhwa::utils::RequestedFormatType::None);
     let mut camera =  match nokhwa::Camera::new(index, format) {
       Ok(c) => {
         c
@@ -90,6 +130,41 @@ impl WebcamNodeInner {
         return;
       }
     };
+
+    // nokhwa's RequestedFormatType::Closest requires an exact frame format match, so pick the
+    // closest format ourselves.  Resolution takes priority over frame rate.
+    match camera.compatible_camera_formats() {
+      Ok(formats) => {
+        let best = formats.into_iter().min_by_key(|f| {
+          let width_diff = f.width() as i64 - settings.width as i64;
+          let height_diff = f.height() as i64 - settings.height as i64;
+          let resolution_distance = width_diff*width_diff + height_diff*height_diff;
+          let frame_rate_distance = ((f.frame_rate() as f64 - settings.frame_rate).abs()*1000.0) as u64;
+          (resolution_distance, frame_rate_distance)
+        });
+        match best {
+          Some(best) => {
+            println!("Requested {}x{} @ {} Hz, using {}", settings.width, settings.height, settings.frame_rate, best);
+            let allowed = [best.format()];
+            let exact = nokhwa::utils::RequestedFormat::with_formats(
+              nokhwa::utils::RequestedFormatType::Exact(best), &allowed);
+            if let Err(e) = camera.set_camera_requset(exact) {
+              println!("Camera Format Selection failed: {:?}", e);
+              return;
+            }
+          },
+          None => {
+            println!("Camera reported no formats");
+            return;
+          }
+        }
+      },
+      Err(e) => {
+        println!("Camera Format Query failed: {:?}", e);
+        return;
+      }
+    }
+
     match camera.open_stream() {
       Ok(_) => {},
       Err(e) => {
@@ -136,23 +211,24 @@ impl WebcamNodeInner {
         Err(_) => {break}
       }
     }
+    println!("webcam end");
   }
 
-  fn on_state(me: Arc<Mutex<WebcamNodeInner>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
+  fn on_state(&mut self, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
     let StateValue::String(key_str) = key else {
       return;
     };
     match key_str.as_str() {
       "Running" => {
-        me.lock().unwrap().stop_webcam();
+        self.stop_webcam();
         if value == StateValue::Bool(true) {
-          let mut lock = me.lock().unwrap();
-          let api = lock.api.thread_safe();
-          let signaler = lock.signaler.clone();
-          let _ = signaler.unblock();
-          let wrapped_state = MainThreadOnly::new(lock.state.clone(), lock.main_thread_token);
-          lock.webcam_thread = Some(std::thread::spawn(move || {
-            WebcamNodeInner::webcam(api, signaler);
+          let api = self.api.thread_safe();
+          let signaler = self.signaler.clone();
+          signaler.unblock();
+          let wrapped_state = MainThreadOnly::new(self.state.clone(), self.main_thread_token);
+          let settings = WebcamSettings::read(&self.state);
+          self.webcam_thread = Some(std::thread::spawn(move || {
+            WebcamNodeInner::webcam(api, signaler, settings);
             api.post_to_main(|main_thread_token| {
                 let state = wrapped_state.take(main_thread_token);
                 state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
@@ -174,9 +250,30 @@ impl Node for WebcamNode {
     true
   }
 
-  fn process(&self, handle: Request, _request: Json) {
+  fn process(&self, handle: Request, request: Json) {
     let api = self.inner.lock().unwrap().api;
-    handle.respond(&Json::from_string(api, "null"));
+    let response = match serde_json::from_str::<serde_json::Value>(&request.to_string()) {
+      Ok(serde_json::Value::String(s)) if s == "get_cameras" => {
+        let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
+          Ok(cameras) => cameras,
+          Err(e) => {
+            println!("Camera query failed: {:?}", e);
+            Vec::new()
+          }
+        };
+        let cameras: Vec<serde_json::Value> = cameras.iter().filter_map(|camera| {
+          let index = camera.index().as_index().ok()?;
+          Some(serde_json::json!({
+            "index": index,
+            "name": camera.human_name(),
+            "description": camera.description(),
+          }))
+        }).collect();
+        serde_json::to_string(&cameras).unwrap()
+      }
+      _ => "null".to_string(),
+    };
+    handle.respond(&Json::from_string(api, &response));
   }
 
   fn new(api: ThalamusAPI, node_token: NodeToken, state: State, main_thread_token: MainThreadToken) -> Self {
@@ -184,11 +281,11 @@ impl Node for WebcamNode {
       let weak2 = weak.clone();
       let state_callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
         if let Some(strong) = weak2.upgrade() {
-          WebcamNodeInner::on_state(strong, source, action, key, value);
+          strong.lock().unwrap().on_state(source, action, key, value);
         }
       };
 
-      let _state_connection = state.connect(state_callback);
+      let _state_connection = Some(state.connect(state_callback));
       let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
       Mutex::new(WebcamNodeInner {
         api, _state_connection, main_thread_token,
@@ -198,7 +295,7 @@ impl Node for WebcamNode {
     });
 
     state.recap_with(|source: State, action: StateAction, key: StateValue, value: StateValue| {
-      WebcamNodeInner::on_state(inner.clone(), source, action, key, value);
+      inner.lock().unwrap().on_state(source, action, key, value);
     });
 
     WebcamNode {
@@ -211,6 +308,7 @@ impl Drop for WebcamNode {
   fn drop(&mut self) {
     let mut lock = self.inner.lock().unwrap();
     lock.stop_webcam();
+    lock._state_connection.take();
     lock.state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
   }
 }
