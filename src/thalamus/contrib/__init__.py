@@ -11,6 +11,7 @@ import importlib.resources
 
 from thalamus.pipeline.thalamus_window import Factory, UserData, UserDataType, get_node_names
 
+from .thorcam_widget import ThorcamWidget
 from .webcam_widget import WebcamWidget
 
 print(__package__, type(__package__))
@@ -28,7 +29,7 @@ def widgets():
       UserData(UserDataType.SPINBOX, 'Dead Zone', 3, []),
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
     ]),
-    'THORCAM': Factory(None, [
+    'THORCAM': Factory(lambda c, s: ThorcamWidget(c, s), [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
     ]),

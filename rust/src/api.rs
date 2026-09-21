@@ -1975,6 +1975,13 @@ impl State {
     State { api, state }
   }
 
+  /// Creates a new, detached dict state. Like `make_list()` it comes back
+  /// already at refcount 1. Attach it with `set()` via `StateValue::Dict`.
+  pub fn make_dict(api: ThalamusAPI) -> State {
+    let state = unsafe { (&*api.raw).state_make_dict.unwrap()() };
+    State { api, state }
+  }
+
   /// Appends an int to a list state built via `make_list()`. Fire-and-forget
   /// (no completion callback) -- fine for local plugin state, same as the
   /// existing scalar setters.
