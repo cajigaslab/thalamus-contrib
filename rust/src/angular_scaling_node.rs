@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::api::{
-  AnalogData, ImageData, Json, MainThreadToken, MocapData, Node, NodeData, NodeSelector,
+  AnalogData, ImageData, Json, MainThreadToken, MocapData, Node, NodeConsts, NodeData, NodeSelector,
   NodeToken, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue,
   THALAMUS_MODALITY_ANALOG, ThalamusAPI,
 };
@@ -372,11 +372,11 @@ fn resolve_source(inner: &Rc<RefCell<Inner>>) {
   inner.borrow_mut().source_connection = Some(source_connection);
 }
 
-impl Node for AngularScalingNode {
-  fn modalities(&self) -> u32 {
-    THALAMUS_MODALITY_ANALOG
-  }
+impl NodeConsts for AngularScalingNode {
+  const MODALITIES: u32 = THALAMUS_MODALITY_ANALOG;
+}
 
+impl Node for AngularScalingNode {
   fn process(&self, handle: Request, _request: Json) {
     let api = self.inner.borrow().api;
     handle.respond(&Json::from_string(api, "null"));

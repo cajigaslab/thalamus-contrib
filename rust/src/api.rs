@@ -2284,16 +2284,84 @@ impl PredropToken {
   }
 }
 
+/// Which modality wrappers (analog/mocap/image/text) to install on the
+/// C-side node, and whether it signals off the main thread. Fixed per node
+/// type, so these are constants rather than Node methods -- read once,
+/// straight off T, before the node is type-erased. Kept as a separate trait
+/// from Node because an associated const makes a trait dyn-incompatible,
+/// and Node has to stay usable as dyn Node for NodeHandle's type erasure.
+pub trait NodeConsts {
+  const MODALITIES: u32 = 0;
+  const SIGNALS_OFFMAIN: bool = false;
+}
+
 pub trait Node {
   fn process(&self, handle: Request, request: Json);
-  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self where Self: Sized;
+  /// Most nodes just return Self, which is freshly boxed by the framework.
+  /// A node that needs to hand out a pointer it already shares elsewhere
+  /// (e.g. with a background thread started during construction) can
+  /// instead return Arc<Self> or Rc<Self> -- Node dispatch (process/predrop/
+  /// etc.) only ever happens on the main thread, so Rc is sound here even
+  /// though it isn't Send.
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> impl IntoNodeHandle where Self: Sized;
   fn prepare() -> bool where Self: Sized { true }
   fn cleanup() where Self: Sized {}
   fn predrop(&self, token: PredropToken) {
     token.ready()
   }
-  fn modalities(&self) -> u32 { 0 }
-  fn signals_offmain(&self) -> bool { false }
+}
+
+/// Converts whatever Node::new() returned (Self, Arc<Self>, Rc<Self>,
+/// Arc<Mutex<Self>>, or Rc<RefCell<Self>>) into the uniform NodeHandle
+/// storage the framework keeps per node.
+pub trait IntoNodeHandle {
+  /// Lets the framework read modalities()/signals_offmain() before
+  /// consuming self into a NodeHandle. Takes a closure rather than
+  /// returning &dyn Node because the Mutex/RefCell-backed impls below can
+  /// only hand out a reference for the duration of a lock()/borrow() call.
+  fn with_node<R>(&self, f: impl FnOnce(&dyn Node) -> R) -> R;
+  fn into_node_handle(self) -> crate::ffi::NodeHandle;
+}
+
+impl<T: Node + 'static> IntoNodeHandle for T {
+  fn with_node<R>(&self, f: impl FnOnce(&dyn Node) -> R) -> R { f(self) }
+  fn into_node_handle(self) -> crate::ffi::NodeHandle {
+    crate::ffi::NodeHandle::Owned(Box::new(self))
+  }
+}
+
+impl<T: Node + 'static> IntoNodeHandle for Arc<T> {
+  fn with_node<R>(&self, f: impl FnOnce(&dyn Node) -> R) -> R { f(self.as_ref()) }
+  fn into_node_handle(self) -> crate::ffi::NodeHandle {
+    crate::ffi::NodeHandle::Shared(self)
+  }
+}
+
+impl<T: Node + 'static> IntoNodeHandle for Rc<T> {
+  fn with_node<R>(&self, f: impl FnOnce(&dyn Node) -> R) -> R { f(self.as_ref()) }
+  fn into_node_handle(self) -> crate::ffi::NodeHandle {
+    crate::ffi::NodeHandle::Local(self)
+  }
+}
+
+/// Lets a node's new() return Arc<Mutex<Self>> -- e.g. because a background
+/// thread started during construction needs to mutate the node, not just
+/// read it.
+impl<T: Node + 'static> IntoNodeHandle for Arc<Mutex<T>> {
+  fn with_node<R>(&self, f: impl FnOnce(&dyn Node) -> R) -> R { f(&*self.lock().unwrap()) }
+  fn into_node_handle(self) -> crate::ffi::NodeHandle {
+    crate::ffi::NodeHandle::SharedLocked(self)
+  }
+}
+
+/// Lets a node's new() return Rc<RefCell<Self>> -- the single-threaded
+/// analog of Arc<Mutex<Self>> above, for shared mutable-via-borrow_mut
+/// access without paying for a lock.
+impl<T: Node + 'static> IntoNodeHandle for Rc<RefCell<T>> {
+  fn with_node<R>(&self, f: impl FnOnce(&dyn Node) -> R) -> R { f(&*self.borrow()) }
+  fn into_node_handle(self) -> crate::ffi::NodeHandle {
+    crate::ffi::NodeHandle::LocalLocked(self)
+  }
 }
 
 //impl<'a, REF, VAL: ?Sized, FUNC: Fn(&Ref<'a, REF>) -> &'a VAL> RefCellGuard<'a, REF, VAL, FUNC> {

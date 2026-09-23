@@ -1,8 +1,8 @@
-use std::{sync::{Arc, Mutex}, time::Duration};
+use std::{cell::RefCell, rc::{Rc, Weak}, sync::{Arc, Mutex}, time::Duration};
 use nokhwa::pixel_format::RgbFormat;
 
 use crate::api::{
-  self, ImageData, Json, MainThreadOnly, MainThreadToken, Node, NodeData, NodeToken, OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI, ThalamusAPIThreadSafe
+  self, ImageData, Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI, ThalamusAPIThreadSafe
 };
 
 struct Frame<'a> {
@@ -92,7 +92,7 @@ impl WebcamSettings {
   }
 }
 
-struct WebcamNodeInner {
+pub struct WebcamNode {
   api:              ThalamusAPI,
   _state_connection: Option<OnDrop>,
   main_thread_token: MainThreadToken,
@@ -101,11 +101,7 @@ struct WebcamNodeInner {
   webcam_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-pub struct WebcamNode {
-    inner: Arc<Mutex<WebcamNodeInner>>,
-}
-
-impl WebcamNodeInner {
+impl WebcamNode {
   fn stop_webcam(&mut self) {
     self.signaler.block();
     self.webcam_thread.take().map(|h| {
@@ -228,7 +224,7 @@ impl WebcamNodeInner {
           let wrapped_state = MainThreadOnly::new(self.state.clone(), self.main_thread_token);
           let settings = WebcamSettings::read(&self.state);
           self.webcam_thread = Some(std::thread::spawn(move || {
-            WebcamNodeInner::webcam(api, signaler, settings);
+            WebcamNode::webcam(api, signaler, settings);
             api.post_to_main(|main_thread_token| {
                 let state = wrapped_state.take(main_thread_token);
                 state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
@@ -241,17 +237,14 @@ impl WebcamNodeInner {
   }
 }
 
+impl NodeConsts for WebcamNode {
+  const MODALITIES: u32 = THALAMUS_MODALITY_IMAGE;
+  const SIGNALS_OFFMAIN: bool = true;
+}
+
 impl Node for WebcamNode {
-  fn modalities(&self) -> u32 {
-    THALAMUS_MODALITY_IMAGE
-  }
-
-  fn signals_offmain(&self) -> bool {
-    true
-  }
-
   fn process(&self, handle: Request, request: Json) {
-    let api = self.inner.lock().unwrap().api;
+    let api = self.api;
     let response = match serde_json::from_str::<serde_json::Value>(&request.to_string()) {
       Ok(serde_json::Value::String(s)) if s == "get_cameras" => {
         let cameras = match nokhwa::query(nokhwa::utils::ApiBackend::Auto) {
@@ -276,39 +269,33 @@ impl Node for WebcamNode {
     handle.respond(&Json::from_string(api, &response));
   }
 
-  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, main_thread_token: MainThreadToken) -> Self {
-    let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Mutex<WebcamNodeInner>>| {
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, main_thread_token: MainThreadToken) -> Rc<RefCell<Self>> {
+    let result = Rc::new_cyclic(|weak: &Weak<RefCell<WebcamNode>>| {
+      let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
+
       let weak2 = weak.clone();
-      let state_callback = move |source: State, action: StateAction, key: StateValue, value: StateValue| {
+      let callback = move |source, action, key, value| {
         if let Some(strong) = weak2.upgrade() {
-          strong.lock().unwrap().on_state(source, action, key, value);
+          strong.borrow_mut().on_state(source, action, key, value);
         }
       };
-
-      let _state_connection = Some(state.connect(state_callback));
-      let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
-      Mutex::new(WebcamNodeInner {
+      let _state_connection = Some(state.connect(callback));
+      RefCell::new(WebcamNode {
         api, _state_connection, main_thread_token,
         state: state.clone(),
         signaler, webcam_thread: None
       })
     });
 
-    state.recap_with(|source: State, action: StateAction, key: StateValue, value: StateValue| {
-      inner.lock().unwrap().on_state(source, action, key, value);
-    });
-
-    WebcamNode {
-      inner
-    }
+    state.recap();
+    result
   }
 }
 
 impl Drop for WebcamNode {
   fn drop(&mut self) {
-    let mut lock = self.inner.lock().unwrap();
-    lock.stop_webcam();
-    lock._state_connection.take();
-    lock.state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
+    self.stop_webcam();
+    self._state_connection.take();
+    self.state.set(api::StateKey::String("Running".to_string()), api::StateValue::Bool(false));
   }
 }

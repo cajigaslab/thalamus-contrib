@@ -1,5 +1,5 @@
 use std::ptr;
-use crate::api::{ThalamusAPI, PredropToken, NodeData};
+use crate::api::{ThalamusAPI, PredropToken, NodeData, IntoNodeHandle};
 use crate::api::ImageFormat;
 
 pub const THALAMUS_MODALITY_ANALOG: u32 = 1;
@@ -899,10 +899,38 @@ pub struct ThalamusNodeFactory {
     >,
 }
 
+/// Holds the Node trait object however Node::new() produced it: freshly
+/// boxed by the framework (the common case, when new() returns Self), or as
+/// the Arc/Rc/Arc<Mutex<_>>/Rc<RefCell<_>> a node's own new() handed back
+/// (e.g. because it already shared that pointer with a background thread or
+/// another owner during construction). See IntoNodeHandle.
+pub enum NodeHandle {
+  Owned(Box<dyn crate::api::Node>),
+  Shared(std::sync::Arc<dyn crate::api::Node>),
+  Local(std::rc::Rc<dyn crate::api::Node>),
+  SharedLocked(std::sync::Arc<std::sync::Mutex<dyn crate::api::Node>>),
+  LocalLocked(std::rc::Rc<std::cell::RefCell<dyn crate::api::Node>>),
+}
+
+impl NodeHandle {
+  /// Calls f with a reference to the underlying Node. Takes a closure
+  /// rather than returning &dyn Node because the locked variants can only
+  /// hand out a reference for the duration of a lock()/borrow() call.
+  fn with_node<R>(&self, f: impl FnOnce(&dyn crate::api::Node) -> R) -> R {
+    match self {
+      NodeHandle::Owned(b) => f(b.as_ref()),
+      NodeHandle::Shared(a) => f(a.as_ref()),
+      NodeHandle::Local(r) => f(r.as_ref()),
+      NodeHandle::SharedLocked(m) => f(&*m.lock().unwrap()),
+      NodeHandle::LocalLocked(c) => f(&*c.borrow()),
+    }
+  }
+}
+
 pub(crate) struct PluginImpl {
   api: crate::api::ThalamusAPI,
   node_token: crate::api::NodeToken,
-  node: Box<dyn crate::api::Node>,
+  node: NodeHandle,
   pub(crate) data: Option<&'static dyn NodeData>,
 }
 
@@ -1034,7 +1062,7 @@ pub extern "C" fn c_node_process(raw_node: *mut ThalamusNode, arg1: *mut Thalamu
 
   let handle = crate::api::Request{ api: _impl.api, handle: arg1};
   let json = crate::api::Json::new(_impl.api, arg2);
-  _impl.node.process(handle, json);
+  _impl.node.with_node(|node| node.process(handle, json));
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_predrop(raw_node: *mut ThalamusNode) {
@@ -1042,7 +1070,7 @@ pub extern "C" fn c_node_predrop(raw_node: *mut ThalamusNode) {
   let _impl = deref_plugin_impl(c_node);
 
   let token = PredropToken{api: _impl.api.raw, node: raw_node};
-  _impl.node.predrop(token);
+  _impl.node.with_node(|node| node.predrop(token));
 }
 
 pub extern "C" fn c_node_image_plane(output: *mut ThalamusByteSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
@@ -1196,11 +1224,11 @@ fn wrap_text(c_node: &mut ThalamusNode) {
   }
 }
 
-extern "C" fn create_node_template<T: crate::api::Node + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, io_context: *mut ThalamusIoContext, graph: *mut ThalamusNodeGraph) -> *mut ThalamusNode {
+extern "C" fn create_node_template<T: crate::api::Node + crate::api::NodeConsts + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, io_context: *mut ThalamusIoContext, graph: *mut ThalamusNodeGraph) -> *mut ThalamusNode {
   create2_node_template::<T>(factory, state, io_context, graph, ptr::null_mut())
 }
 
-extern "C" fn create2_node_template<T: crate::api::Node + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, _io_context: *mut ThalamusIoContext, _graph: *mut ThalamusNodeGraph, c_impl: *mut ::std::os::raw::c_void) -> *mut ThalamusNode {
+extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, _io_context: *mut ThalamusIoContext, _graph: *mut ThalamusNodeGraph, c_impl: *mut ::std::os::raw::c_void) -> *mut ThalamusNode {
   println!("create_node_template");
   let api_raw = unsafe { (*factory).api };
   let c_node = Box::into_raw(Box::new(ThalamusNode {
@@ -1220,14 +1248,14 @@ extern "C" fn create2_node_template<T: crate::api::Node + 'static>(factory: *mut
   let node_token = crate::api::NodeToken::new(c_node);
 
   let token = unsafe { crate::api::MainThreadToken::new_in_main_thread_callback() };
-  let node = T::new(api, node_token.clone(), crate::api::State::new(api, state), token);
-  c_node_ref.signals_offmain = if node.signals_offmain() { 1 } else { 0 };
-  let modalities = node.modalities();
+  let ctor = T::new(api, node_token.clone(), crate::api::State::new(api, state), token);
+  let modalities = T::MODALITIES;
+  c_node_ref.signals_offmain = if T::SIGNALS_OFFMAIN { 1 } else { 0 };
 
   let result = Box::new(PluginImpl {
     api,
     node_token,
-    node: Box::new(node) as Box<dyn crate::api::Node>,
+    node: ctor.into_node_handle(),
     data: None,
   });
 
@@ -1275,7 +1303,7 @@ extern "C" fn cleanup_node_template<T: crate::api::Node>(_factory: *mut Thalamus
 }
 
 impl ThalamusNodeFactory {
-  pub fn new<T: crate::api::Node + 'static>(name: &'static str, api: *mut ThalamusAPIRaw) -> *mut ThalamusNodeFactory {
+  pub fn new<T: crate::api::Node + crate::api::NodeConsts + 'static>(name: &'static str, api: *mut ThalamusAPIRaw) -> *mut ThalamusNodeFactory {
     println!("ThalamusNodeFactory::new {}", name);
     let result = Box::into_raw(Box::new(ThalamusNodeFactory {
       type_: ThalamusCharSpan { data: name.as_ptr() as *const i8, size: name.len() as u64, owns_data: 0 },

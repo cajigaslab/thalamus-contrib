@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::api::{
-    AnalogData, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node, NodeData, NodeToken, OffMainSignaler, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, TaskScope, ThalamusAPI, ThalamusAPIThreadSafe, run_task,
+    AnalogData, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node, NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, TaskScope, ThalamusAPI, ThalamusAPIThreadSafe, run_task,
 };
 use crate::image_viewer::{ImageFrame, ImageViewer};
 
@@ -946,15 +946,12 @@ impl ImageData for ThorcamFrame {
     fn frame_interval(&self) -> Duration { self.frame_interval }
 }
 
+impl NodeConsts for ThorcamNode {
+    const MODALITIES: u32 = THALAMUS_MODALITY_IMAGE;
+    const SIGNALS_OFFMAIN: bool = true;
+}
+
 impl Node for ThorcamNode {
-    fn modalities(&self) -> u32 {
-      THALAMUS_MODALITY_IMAGE
-    }
-
-    fn signals_offmain(&self) -> bool {
-        true
-    }
-
     fn process(&self, handle: Request, request: Json) {
         let api = self.inner.borrow().api;
         let response = match serde_json::from_str::<serde_json::Value>(&request.to_string()) {

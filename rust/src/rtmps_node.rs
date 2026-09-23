@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 
 use crate::api::{
-  Json, MainThreadOnly, MainThreadToken, Node, NodeData, NodeSelector, NodeToken, OnDrop,
+  Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OnDrop,
   PredropToken, Request, State, StateAction, StateKey, StateValue, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
@@ -179,6 +179,8 @@ fn stop_publishing<F: FnOnce() + 'static>(inner: &Rc<RefCell<RtmpsNodeInner>>, o
   // runs on_stopped once back on the main thread.
   api.join_then(handle, main_thread_token, on_stopped);
 }
+
+impl NodeConsts for RtmpsNode {}
 
 impl Node for RtmpsNode {
   fn process(&self, handle: Request, _request: Json) {

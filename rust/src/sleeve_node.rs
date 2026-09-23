@@ -8,7 +8,7 @@ use futures::stream::StreamExt;
 use bytebuffer::ByteReader;
 use tokio_util::sync::CancellationToken;
 use crate::api::{
-  self, THALAMUS_MODALITY_ANALOG, NodeData, AnalogData, Json, MainThreadToken, Node, NodeToken, OnDrop, Request,
+  self, THALAMUS_MODALITY_ANALOG, NodeData, AnalogData, Json, MainThreadToken, Node, NodeConsts, NodeToken, OnDrop, Request,
   State, StateAction, StateValue, ThalamusAPI, MainThreadOnly, OnDropSend
 };
 use btleplug::api::{
@@ -655,15 +655,12 @@ impl SleeveNodeInner {
   }
 }
 
+impl NodeConsts for SleeveNode {
+  const MODALITIES: u32 = THALAMUS_MODALITY_ANALOG;
+  const SIGNALS_OFFMAIN: bool = true;
+}
+
 impl Node for SleeveNode {
-  fn modalities(&self) -> u32 {
-    THALAMUS_MODALITY_ANALOG
-  }
-
-  fn signals_offmain(&self) -> bool {
-    true
-  }
-
   fn process(&self, handle: Request, _request: Json) {
     let api = self.inner.lock().unwrap().api;
     handle.respond(&Json::from_string(api, "null"));

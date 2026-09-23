@@ -1,3 +1,10 @@
+// Node::new() is declared as `-> impl IntoNodeHandle` so a node can opt into
+// returning Arc<Self>/Rc<Self> instead of Self; node impls are intentionally
+// allowed to name their concrete return type (Self, Arc<Self>, Rc<Self>)
+// instead of writing `impl IntoNodeHandle` themselves, so direct/test calls
+// to a node's new() see the concrete type rather than the opaque one.
+#![allow(refining_impl_trait)]
+
 use std::ptr;
 
 mod ffi;
