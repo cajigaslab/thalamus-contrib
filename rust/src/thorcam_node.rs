@@ -3,6 +3,7 @@ use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use std::os::raw::c_char;
 
 use crate::api::{
     AnalogData, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node, NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, TaskScope, ThalamusAPI, ThalamusAPIThreadSafe, run_task,
@@ -15,14 +16,14 @@ type IsInitCamera        = unsafe extern "C" fn(*mut u32, *mut std::ffi::c_void)
 type IsExitCamera        = unsafe extern "C" fn(u32) -> i32;
 type IsGetSensorInfo     = unsafe extern "C" fn(u32, *mut SensorInfoRaw) -> i32;
 type IsSetColorMode      = unsafe extern "C" fn(u32, i32) -> i32;
-type IsAllocImageMem     = unsafe extern "C" fn(u32, i32, i32, i32, *mut *mut i8, *mut i32) -> i32;
-type IsFreeImageMem      = unsafe extern "C" fn(u32, *mut i8, i32) -> i32;
-type IsAddToSequence     = unsafe extern "C" fn(u32, *mut i8, i32) -> i32;
+type IsAllocImageMem     = unsafe extern "C" fn(u32, i32, i32, i32, *mut *mut c_char, *mut i32) -> i32;
+type IsFreeImageMem      = unsafe extern "C" fn(u32, *mut c_char, i32) -> i32;
+type IsAddToSequence     = unsafe extern "C" fn(u32, *mut c_char, i32) -> i32;
 type IsClearSequence     = unsafe extern "C" fn(u32) -> i32;
-type IsUnlockSeqBuf      = unsafe extern "C" fn(u32, i32, *mut i8) -> i32;
+type IsUnlockSeqBuf      = unsafe extern "C" fn(u32, i32, *mut c_char) -> i32;
 type IsCaptureVideo      = unsafe extern "C" fn(u32, i32) -> i32;
 type IsStopLiveVideo     = unsafe extern "C" fn(u32, i32) -> i32;
-type IsWaitForNextImage  = unsafe extern "C" fn(u32, u32, *mut *mut i8, *mut i32) -> i32;
+type IsWaitForNextImage  = unsafe extern "C" fn(u32, u32, *mut *mut c_char, *mut i32) -> i32;
 type IsInitImageQueue    = unsafe extern "C" fn(u32, i32) -> i32;
 type IsExitImageQueue    = unsafe extern "C" fn(u32) -> i32;
 type IsSetFrameRate      = unsafe extern "C" fn(u32, f64, *mut f64) -> i32;
@@ -73,7 +74,7 @@ const _: () = assert!(std::mem::size_of::<Uc480CameraInfoRaw>() == 112);
 struct SensorInfoRaw {
     sensor_id: u16,
     str_sensor_name: [u8; 32],
-    n_color_mode: i8,
+    n_color_mode: c_char,
     _pad: u8,
     n_max_width: u32,
     n_max_height: u32,
@@ -83,8 +84,8 @@ struct SensorInfoRaw {
     b_b_gain: i32,
     b_glob_shutter: i32,
     w_pixel_size: u16,
-    n_upper_left_bayer_pixel: i8,
-    reserved: [i8; 13],
+    n_upper_left_bayer_pixel: c_char,
+    reserved: [c_char; 13],
 }
 const _: () = assert!(std::mem::size_of::<SensorInfoRaw>() == 80);
 
@@ -805,10 +806,10 @@ fn run_camera(
 
     // Allocate a ring buffer of 3 frames for is_WaitForNextImage
     const NUM_BUFS: usize = 3;
-    let mut bufs: Vec<(*mut i8, i32)> = Vec::with_capacity(NUM_BUFS);
+    let mut bufs: Vec<(*mut c_char, i32)> = Vec::with_capacity(NUM_BUFS);
     let mut alloc_ok = true;
     for _ in 0..NUM_BUFS {
-        let mut p_mem: *mut i8 = std::ptr::null_mut();
+        let mut p_mem: *mut c_char = std::ptr::null_mut();
         let mut mem_id: i32 = 0;
         let ret = unsafe { (lib.alloc_image_mem)(h_cam, width as i32, height as i32, 8, &mut p_mem, &mut mem_id) };
         if ret != 0 {
@@ -861,7 +862,7 @@ fn run_camera(
     *live_handle.lock().unwrap() = Some(h_cam);
 
     loop {
-        let mut next_mem: *mut i8 = std::ptr::null_mut();
+        let mut next_mem: *mut c_char = std::ptr::null_mut();
         let mut next_id: i32 = 0;
         let ret = unsafe { (lib.wait_for_next_image)(h_cam, 1000, &mut next_mem, &mut next_id) };
         if ret != 0 {

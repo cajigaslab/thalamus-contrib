@@ -1936,6 +1936,7 @@ name = "thalamus-contrib"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "bindgen 0.72.1",
  "btleplug",
  "bytebuffer",
  "chrono",

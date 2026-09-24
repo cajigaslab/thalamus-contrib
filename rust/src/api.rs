@@ -9,7 +9,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
-use std::{os::raw::c_void, sync::OnceLock};
+use std::{os::raw::{c_char, c_void}, sync::OnceLock};
 use std::time::Duration;
 
 use futures::future::FusedFuture;
@@ -295,12 +295,14 @@ impl<'a> AnalogData for ExtNodeData<'a> {
     }
   }
   fn name(&self, channel: i32) -> &str {
-    let mut span = ThalamusByteSpan { data : null(), size: 0 };
+    let mut span = ThalamusCharSpan { data : null(), size: 0, owns_data: 0 };
     unsafe {
       let analog = (*self.node.node).analog;
       let name_func = (*analog).name.unwrap();
-      name_func(&mut span as *mut ThalamusByteSpan, self.node.node, channel);
-      let slice = std::slice::from_raw_parts(span.data, span.size as usize);
+      name_func(&mut span as *mut ThalamusCharSpan, self.node.node, channel);
+      // The returned &str borrows from the node, so the name must be owned by it.
+      debug_assert!(span.owns_data == 0);
+      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap()
     }
   }
@@ -374,6 +376,7 @@ impl<'a> ImageData for ExtNodeData<'a> {
         ThalamusImageFormat::NV12 => ImageFormat::NV12,
         ThalamusImageFormat::BGR => ImageFormat::BGR,
         ThalamusImageFormat::MJPEG => ImageFormat::MJPEG,
+        other => panic!("Unknown ThalamusImageFormat {}", other.0),
       }
     }
   }
@@ -746,17 +749,17 @@ impl ThalamusAPI {
   pub fn get_node<T: FnMut(ExtNode) + 'static>(&self, selector: NodeSelector, callback: T) -> OnDrop {
     let mut c_selector = ThalamusNodeSelector {
       name: ThalamusCharSpan { data: null(), size: 0, owns_data: 0 },
-      _type: ThalamusCharSpan { data: null(), size: 0, owns_data: 0 }
+      type_: ThalamusCharSpan { data: null(), size: 0, owns_data: 0 }
     };
 
     match &selector {
       NodeSelector::Name(val) => {
-        c_selector.name.data = val.as_ptr() as *const i8;
+        c_selector.name.data = val.as_ptr() as *const c_char;
         c_selector.name.size = val.len() as u64;
       },
       NodeSelector::Type(val) => {
-        c_selector._type.data = val.as_ptr() as *const i8;
-        c_selector._type.size = val.len() as u64;
+        c_selector.type_.data = val.as_ptr() as *const c_char;
+        c_selector.type_.size = val.len() as u64;
       }
     };
 
@@ -970,7 +973,7 @@ impl ThalamusAPI {
   /// bitor of the `THALAMUS_SDL_WINDOW_*` constants (e.g. `THALAMUS_SDL_WINDOW_VULKAN`).
   pub fn create_sdl_window(&self, title: &str, width: i32, height: i32, flags: u64) -> Result<SDLWindow, String> {
     unsafe {
-      let mut span = ThalamusCharSpan { data: title.as_ptr() as *const i8, size: title.len() as u64, owns_data: 0 };
+      let mut span = ThalamusCharSpan { data: title.as_ptr() as *const c_char, size: title.len() as u64, owns_data: 0 };
       let window = ((&*self.raw).sdl_create_window.unwrap())(&mut span as *mut ThalamusCharSpan, width, height, flags);
       if window.is_null() {
         Err(self.sdl_error())
@@ -999,7 +1002,7 @@ impl ThalamusAPI {
 
   pub fn set_clipboard_text(&self, text: &str) -> bool {
     unsafe {
-      let span = ThalamusCharSpan { data: text.as_ptr() as *const i8, size: text.len() as u64, owns_data: 0 };
+      let span = ThalamusCharSpan { data: text.as_ptr() as *const c_char, size: text.len() as u64, owns_data: 0 };
       ((&*self.raw).sdl_set_clipboard_text.unwrap())(&span as *const ThalamusCharSpan) != 0
     }
   }
@@ -1031,7 +1034,7 @@ impl ThalamusAPI {
   /// Subscribes to every SDL event Thalamus's central pump sees (from any
   /// window, including ones this plugin created via `create_sdl_window`).
   /// Dropping the returned `OnDrop` unsubscribes.
-  pub fn subscribe_sdl_events<T: FnMut(&ThalamusSDLEvent) + 'static>(&self, callback: T) -> OnDrop {
+  pub fn subscribe_sdl_events<T: FnMut(&THALAMUS_SDL_Event) + 'static>(&self, callback: T) -> OnDrop {
     let call_ptr = Box::into_raw(Box::new(SDLEventArgs { callback }));
     let void_ptr = call_ptr as *mut std::os::raw::c_void;
     let subscription = unsafe {
@@ -1052,7 +1055,7 @@ struct SDLEventArgs<T> {
   callback: T,
 }
 
-unsafe extern "C" fn sdl_event_callback<T: FnMut(&ThalamusSDLEvent)>(event: *mut ThalamusSDLEvent, data: *mut ::std::os::raw::c_void) {
+unsafe extern "C" fn sdl_event_callback<T: FnMut(&THALAMUS_SDL_Event)>(event: *mut THALAMUS_SDL_Event, data: *mut ::std::os::raw::c_void) {
   let args = unsafe { &mut *(data as *mut SDLEventArgs<T>) };
   (args.callback)(unsafe { &*event });
 }
@@ -1086,7 +1089,7 @@ impl Drop for VulkanQueueGuard {
 /// itself. Destroyed via `sdl_destroy_window` when dropped.
 pub struct SDLWindow {
   api: ThalamusAPI,
-  window: *mut ThalamusSDLWindow,
+  window: *mut THALAMUS_SDL_Window,
 }
 unsafe impl Send for SDLWindow {}
 
@@ -1100,7 +1103,7 @@ impl SDLWindow {
   }
 
   pub fn set_title(&self, title: &str) {
-    let mut span = ThalamusCharSpan { data: title.as_ptr() as *const i8, size: title.len() as u64, owns_data: 0 };
+    let mut span = ThalamusCharSpan { data: title.as_ptr() as *const c_char, size: title.len() as u64, owns_data: 0 };
     unsafe { ((&*self.api.raw).sdl_set_window_title.unwrap())(self.window, &mut span as *mut ThalamusCharSpan); }
   }
 
@@ -1157,7 +1160,7 @@ impl Drop for SDLWindow {
 /// has already been dropped.
 pub struct SDLCursor {
   api: ThalamusAPI,
-  cursor: *mut ThalamusSDLCursor,
+  cursor: *mut THALAMUS_SDL_Cursor,
 }
 unsafe impl Send for SDLCursor {}
 
@@ -1196,7 +1199,7 @@ impl Json {
   }
 
   pub fn from_string(api: ThalamusAPI, text: &str) -> Json {
-      let mut span = ThalamusCharSpan { data: text.as_ptr() as *const i8, size: text.len() as u64, owns_data: 0};
+      let mut span = ThalamusCharSpan { data: text.as_ptr() as *const c_char, size: text.len() as u64, owns_data: 0};
 
 
       let handle = unsafe { ((&*api.raw).json_from_string.unwrap())(&mut span as *mut ThalamusCharSpan) };
@@ -1424,7 +1427,7 @@ impl SerialPort {
   pub fn open(&self, name: &str) -> Result<(), ErrorCode> {
     unsafe {
       let api = &*self.api.raw;
-      let name_span = ThalamusCharSpan { data: name.as_ptr() as *const i8, size: name.len() as u64, owns_data: 0 };
+      let name_span = ThalamusCharSpan { data: name.as_ptr() as *const c_char, size: name.len() as u64, owns_data: 0 };
       (api.serial_port_open.unwrap())(self.port, &name_span as *const ThalamusCharSpan);
       match self.error() {
         None => Ok(()),
@@ -1514,7 +1517,7 @@ impl SerialPort {
         callback
       });
       let args = Box::into_raw(boxed)  as *mut std::os::raw::c_void;
-      let delimiter_span = ThalamusCharSpan { data: delimiter.as_ptr() as *const i8, size: delimiter.len() as u64, owns_data: 0 };
+      let delimiter_span = ThalamusCharSpan { data: delimiter.as_ptr() as *const c_char, size: delimiter.len() as u64, owns_data: 0 };
       (api.serial_port_read_until.unwrap())(self.port, buffer.buffer, &delimiter_span as *const ThalamusCharSpan, Some(io_callback::<T>), args);
     }
   }
@@ -1750,9 +1753,9 @@ fn wrap_state_key(api: ThalamusAPI, arg: *mut ThalamusState) -> StateKey {
   }
 }
 
-unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateValue, StateValue)>(source_raw: *mut ThalamusState, action: i32, key_raw: *mut ThalamusState, value_raw: *mut ThalamusState, data: *mut ::std::os::raw::c_void) {
+unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateValue, StateValue)>(source_raw: *mut ThalamusState, action: ThalamusStateAction, key_raw: *mut ThalamusState, value_raw: *mut ThalamusState, data: *mut ::std::os::raw::c_void) {
   let args = unsafe { &mut *(data as *mut StateConnectionCallbackArgs<T>) };
-  let action = if action == 0 { StateAction::Set } else { StateAction::Delete };
+  let action = if action == ThalamusStateAction::Set { StateAction::Set } else { StateAction::Delete };
 
   let key = wrap_state(args.api, key_raw);
   let value = wrap_state(args.api, value_raw);
@@ -2048,7 +2051,7 @@ impl State {
         }
       },
       StateKey::String(key_raw) => {
-        let span = ThalamusCharSpan { data: key_raw.as_ptr() as *const i8, size: key_raw.len() as u64, owns_data: 0 };
+        let span = ThalamusCharSpan { data: key_raw.as_ptr() as *const c_char, size: key_raw.len() as u64, owns_data: 0 };
         unsafe {
           ((&*self.api.raw).state_get_at_name.unwrap())(self.state, &span)
         }
@@ -2088,7 +2091,7 @@ impl State {
               (api.state_set_at_index_state.unwrap())(self.state, key, value.state);
             },
             StateValue::String(rust_value) => {
-              let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const i8, size: rust_value.len() as u64, owns_data: 0 };
+              let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const c_char, size: rust_value.len() as u64, owns_data: 0 };
               (api.state_set_at_index_string.unwrap())(self.state, key, &value_span as *const ThalamusCharSpan);
             },
             StateValue::Null => {
@@ -2098,7 +2101,7 @@ impl State {
         }
       },
       StateKey::String(key_raw) => {
-        let key_span = ThalamusCharSpan { data: key_raw.as_ptr() as *const i8, size: key_raw.len() as u64, owns_data: 0 };
+        let key_span = ThalamusCharSpan { data: key_raw.as_ptr() as *const c_char, size: key_raw.len() as u64, owns_data: 0 };
         let key = &key_span as *const ThalamusCharSpan;
         unsafe {
           match raw_value {
@@ -2118,7 +2121,7 @@ impl State {
               (api.state_set_at_name_state.unwrap())(self.state, key, value.state);
             },
             StateValue::String(rust_value) => {
-              let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const i8, size: rust_value.len() as u64, owns_data: 0 };
+              let value_span = ThalamusCharSpan { data: rust_value.as_ptr() as *const c_char, size: rust_value.len() as u64, owns_data: 0 };
               (api.state_set_at_name_string.unwrap())(self.state, key, &value_span as *const ThalamusCharSpan);
             },
             StateValue::Null => {
@@ -2479,9 +2482,12 @@ pub fn tokio_runtime() -> std::sync::MutexGuard<'static, Option<tokio::runtime::
   TOKIO_RUNTIME.lock().unwrap()
 }
 
-pub fn setup(api_raw: *mut ThalamusAPIRaw) {
+/// Initializes the crate and returns the ThalamusAPIRaw every node should use:
+/// a leaked, Rust-owned copy of `host_api` (see ThalamusAPIRaw::copy_from_host)
+/// rather than Thalamus's own struct, which may be smaller than ours.
+pub fn setup(host_api: *const ThalamusAPIRaw) -> *mut ThalamusAPIRaw {
+  let api_raw = Box::into_raw(Box::new(unsafe { ThalamusAPIRaw::copy_from_host(host_api) }));
   unsafe {
-    (*api_raw).sanitize();
     let api = &*api_raw;
     OPERATION_ABORTED.set((api.error_code_operation_aborted.unwrap())())
       .expect("Failed to initialize constant: OPERATION_ABORTED");
@@ -2494,6 +2500,7 @@ pub fn setup(api_raw: *mut ThalamusAPIRaw) {
       .build()
       .expect("Failed to build Tokio runtime")
   );
+  api_raw
 }
 
 #[unsafe(no_mangle)]
@@ -2516,7 +2523,8 @@ use $crate::api::{
 #[unsafe(no_mangle)]
 pub extern "C" fn thalamus_get_node_factories(api: *mut ThalamusAPIRaw) -> *const *const ThalamusNodeFactory {
   println!("thalamus_get_node_factories");
-  $crate::api::setup(api);
+  // From here on use the crate's own copy; never touch Thalamus's struct again.
+  let api = $crate::api::setup(api);
   let mut vec = Vec::<*const ThalamusNodeFactory>::new();
   $(
     vec.push(ThalamusNodeFactory::new::<$type>($name, api));

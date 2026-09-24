@@ -1,4 +1,58 @@
+/// Names bindgen emits differently from plugin.h.
+#[derive(Debug)]
+struct ThalamusCallbacks;
+
+impl bindgen::callbacks::ParseCallbacks for ThalamusCallbacks {
+  fn item_name(&self, item: bindgen::callbacks::ItemInfo) -> Option<String> {
+    // crate::api::ThalamusAPI is the safe wrapper; the raw table keeps the
+    // Raw suffix it has always had on the Rust side.
+    (item.name == "ThalamusAPI").then(|| "ThalamusAPIRaw".to_string())
+  }
+
+  fn int_macro(&self, name: &str, _value: i64) -> Option<bindgen::callbacks::IntKind> {
+    // Match the C types the macros are written with (UINT64_C / INT32_C).
+    if name.starts_with("THALAMUS_SDL_WINDOW_") {
+      Some(bindgen::callbacks::IntKind::U64)
+    } else if name.starts_with("THALAMUS_MODALITY_") {
+      Some(bindgen::callbacks::IntKind::U32)
+    } else if name.starts_with("THALAMUS_SDL_SYSTEM_CURSOR_") || name == "THALAMUS_OPERATION_ABORTED" {
+      Some(bindgen::callbacks::IntKind::I32)
+    } else {
+      None
+    }
+  }
+}
+
+/// Generates Rust declarations for everything in Thalamus's plugin.h and
+/// modalities.h (vendored under include/thalamus from the Thalamus devel branch).
+fn generate_thalamus_api() {
+  let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+  bindgen::Builder::default()
+    .header("include/thalamus/plugin.h")
+    .header("include/thalamus/modalities.h")
+    .clang_args(["-x", "c", "-std=c99", "-Iinclude"])
+    .allowlist_type("Thalamus.*|THALAMUS_.*|Vk.*")
+    .allowlist_var("THALAMUS_.*")
+    // Thalamus's own enums may gain values this build doesn't know about, so
+    // they must not be Rust enums (an unknown discriminant would be UB).
+    .newtype_enum("Thalamus.*")
+    .prepend_enum_name(false)
+    // Evaluates macros like UINT64_C(...) that bindgen can't parse itself.
+    .clang_macro_fallback()
+    .clang_macro_fallback_build_dir(&out_dir)
+    .derive_debug(true)
+    .derive_default(true)
+    .parse_callbacks(Box::new(ThalamusCallbacks))
+    .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+    .generate()
+    .expect("failed to generate bindings from the Thalamus headers")
+    .write_to_file(out_dir.join("thalamus_api.rs"))
+    .expect("failed to write Thalamus bindings");
+}
+
 fn main() {
+  generate_thalamus_api();
+
   let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
   match target_os.as_str() {

@@ -29,7 +29,7 @@ impl ClipboardBackend for ThalamusClipboard {
 pub struct ImguiPlatform {
   api: ThalamusAPI,
   window_id: u32,
-  events: Rc<RefCell<VecDeque<ThalamusSDLEvent>>>,
+  events: Rc<RefCell<VecDeque<THALAMUS_SDL_Event>>>,
   _subscription: OnDrop,
   cursors: HashMap<usize, SDLCursor>,
   last_cursor: Option<Option<imgui::MouseCursor>>,
@@ -46,7 +46,7 @@ impl ImguiPlatform {
     ctx.io_mut().backend_flags.insert(imgui::BackendFlags::HAS_MOUSE_CURSORS);
     ctx.set_clipboard_backend(ThalamusClipboard { api });
 
-    let events: Rc<RefCell<VecDeque<ThalamusSDLEvent>>> = Rc::new(RefCell::new(VecDeque::new()));
+    let events: Rc<RefCell<VecDeque<THALAMUS_SDL_Event>>> = Rc::new(RefCell::new(VecDeque::new()));
     let events_for_cb = events.clone();
     let subscription = api.subscribe_sdl_events(move |event| {
       events_for_cb.borrow_mut().push_back(*event);
@@ -90,7 +90,7 @@ impl ImguiPlatform {
   pub fn new_frame(&mut self, ctx: &mut Context, delta_time: f32) {
     ctx.io_mut().delta_time = delta_time.max(1.0 / 1000.0);
 
-    let pending: Vec<ThalamusSDLEvent> = self.events.borrow_mut().drain(..).collect();
+    let pending: Vec<THALAMUS_SDL_Event> = self.events.borrow_mut().drain(..).collect();
     for event in &pending {
       self.apply_event(ctx, event);
     }
@@ -131,45 +131,48 @@ impl ImguiPlatform {
     }) as usize
   }
 
-  fn apply_event(&mut self, ctx: &mut Context, event: &ThalamusSDLEvent) {
-    match event.event_type() {
+  fn apply_event(&mut self, ctx: &mut Context, event: &THALAMUS_SDL_Event) {
+    // SAFETY: every variant of the union starts with the Uint32 type tag, and
+    // each arm below only reads the variant that tag says is active.
+    let event_type = unsafe { event.type_ } as THALAMUS_SDL_EventType;
+    match event_type {
       THALAMUS_SDL_EVENT_QUIT => {
         self.should_close = true;
       }
       THALAMUS_SDL_EVENT_WINDOW_CLOSE_REQUESTED => {
-        if unsafe { event.as_window() }.window_id == self.window_id {
+        if unsafe { event.window }.windowID == self.window_id {
           self.should_close = true;
         }
       }
-      THALAMUS_SDL_EVENT_WINDOW_FOCUS_LOST if unsafe { event.as_window() }.window_id == self.window_id => {
+      THALAMUS_SDL_EVENT_WINDOW_FOCUS_LOST if unsafe { event.window }.windowID == self.window_id => {
         ctx.io_mut().app_focus_lost = true;
       }
-      THALAMUS_SDL_EVENT_WINDOW_FOCUS_GAINED if unsafe { event.as_window() }.window_id == self.window_id => {
+      THALAMUS_SDL_EVENT_WINDOW_FOCUS_GAINED if unsafe { event.window }.windowID == self.window_id => {
         ctx.io_mut().app_focus_lost = false;
       }
       THALAMUS_SDL_EVENT_MOUSE_MOTION => {
-        let motion = unsafe { event.as_mouse_motion() };
-        if motion.window_id == self.window_id {
+        let motion = unsafe { event.motion };
+        if motion.windowID == self.window_id {
           ctx.io_mut().add_mouse_pos_event([motion.x, motion.y]);
         }
       }
       t @ (THALAMUS_SDL_EVENT_MOUSE_BUTTON_DOWN | THALAMUS_SDL_EVENT_MOUSE_BUTTON_UP) => {
-        let button_event = unsafe { event.as_mouse_button() };
-        if button_event.window_id == self.window_id {
+        let button_event = unsafe { event.button };
+        if button_event.windowID == self.window_id {
           if let Some(button) = Self::mouse_button(button_event.button) {
             ctx.io_mut().add_mouse_button_event(button, t == THALAMUS_SDL_EVENT_MOUSE_BUTTON_DOWN);
           }
         }
       }
       THALAMUS_SDL_EVENT_MOUSE_WHEEL => {
-        let wheel = unsafe { event.as_mouse_wheel() };
-        if wheel.window_id == self.window_id {
+        let wheel = unsafe { event.wheel };
+        if wheel.windowID == self.window_id {
           ctx.io_mut().add_mouse_wheel_event([wheel.x, wheel.y]);
         }
       }
       t @ (THALAMUS_SDL_EVENT_KEY_DOWN | THALAMUS_SDL_EVENT_KEY_UP) => {
-        let key_event = unsafe { event.as_key() };
-        if key_event.window_id == self.window_id {
+        let key_event = unsafe { event.key };
+        if key_event.windowID == self.window_id {
           if let Some(key) = Self::map_key(key_event.scancode) {
             ctx.io_mut().add_key_event(key, t == THALAMUS_SDL_EVENT_KEY_DOWN);
           }
@@ -191,7 +194,7 @@ impl ImguiPlatform {
   /// Scancode values match THALAMUS_SDL_Scancode in plugin_window_event.h
   /// (an exact mirror of SDL3's own scancodes). Only a representative subset
   /// is mapped here -- extend as needed.
-  fn map_key(scancode: u32) -> Option<Key> {
+  fn map_key(scancode: THALAMUS_SDL_Scancode) -> Option<Key> {
     Some(match scancode {
       4 => Key::A, 5 => Key::B, 6 => Key::C, 7 => Key::D, 8 => Key::E,
       9 => Key::F, 10 => Key::G, 11 => Key::H, 12 => Key::I, 13 => Key::J,
