@@ -17,7 +17,11 @@ fn channels_for_format(format: ImageFormat) -> Option<u32> {
   match format {
     ImageFormat::Gray => Some(1),
     ImageFormat::RGB | ImageFormat::BGR => Some(3),
-    ImageFormat::YUYV422 | ImageFormat::YUV420P | ImageFormat::YUVJ420P | ImageFormat::NV12 | ImageFormat::MJPEG => None,
+    ImageFormat::YUYV422
+    | ImageFormat::YUV420P
+    | ImageFormat::YUVJ420P
+    | ImageFormat::NV12
+    | ImageFormat::MJPEG => None,
   }
 }
 
@@ -37,7 +41,11 @@ fn find_mem_type(
 ) -> u32 {
   let mem_props = unsafe { instance.get_physical_device_memory_properties(phys) };
   for i in 0..mem_props.memory_type_count {
-    if (type_bits & (1 << i)) != 0 && mem_props.memory_types[i as usize].property_flags.contains(props) {
+    if (type_bits & (1 << i)) != 0
+      && mem_props.memory_types[i as usize]
+        .property_flags
+        .contains(props)
+    {
       return i;
     }
   }
@@ -54,7 +62,13 @@ fn make_buffer(
 ) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
   unsafe {
     let buf = device
-      .create_buffer(&vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE), None)
+      .create_buffer(
+        &vk::BufferCreateInfo::default()
+          .size(size)
+          .usage(usage)
+          .sharing_mode(vk::SharingMode::EXCLUSIVE),
+        None,
+      )
       .map_err(|e| format!("{e:?}"))?;
     let req = device.get_buffer_memory_requirements(buf);
     let mem = device
@@ -65,7 +79,9 @@ fn make_buffer(
         None,
       )
       .map_err(|e| format!("{e:?}"))?;
-    device.bind_buffer_memory(buf, mem, 0).map_err(|e| format!("{e:?}"))?;
+    device
+      .bind_buffer_memory(buf, mem, 0)
+      .map_err(|e| format!("{e:?}"))?;
     Ok((buf, mem))
   }
 }
@@ -97,7 +113,15 @@ fn record_barrier(
     .src_access_mask(src_access)
     .dst_access_mask(dst_access);
   unsafe {
-    device.cmd_pipeline_barrier(cb, src_stage, dst_stage, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
+    device.cmd_pipeline_barrier(
+      cb,
+      src_stage,
+      dst_stage,
+      vk::DependencyFlags::empty(),
+      &[],
+      &[],
+      &[barrier],
+    );
   }
 }
 
@@ -162,25 +186,51 @@ fn transition_layout(
 ) -> Result<(), String> {
   unsafe {
     let cb = device
-      .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(cmd_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1))
+      .allocate_command_buffers(
+        &vk::CommandBufferAllocateInfo::default()
+          .command_pool(cmd_pool)
+          .level(vk::CommandBufferLevel::PRIMARY)
+          .command_buffer_count(1),
+      )
       .map_err(|e| format!("{e:?}"))?[0];
     device
-      .begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))
+      .begin_command_buffer(
+        cb,
+        &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+      )
       .map_err(|e| format!("{e:?}"))?;
 
     let (src_access, dst_access, src_stage, dst_stage) = if from == vk::ImageLayout::UNDEFINED {
-      (vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER)
+      (
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TOP_OF_PIPE,
+        vk::PipelineStageFlags::TRANSFER,
+      )
     } else {
-      (vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::FRAGMENT_SHADER)
+      (
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::SHADER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+      )
     };
-    record_barrier(device, cb, image, from, to, src_access, dst_access, src_stage, dst_stage);
+    record_barrier(
+      device, cb, image, from, to, src_access, dst_access, src_stage, dst_stage,
+    );
 
-    device.end_command_buffer(cb).map_err(|e| format!("{e:?}"))?;
+    device
+      .end_command_buffer(cb)
+      .map_err(|e| format!("{e:?}"))?;
     let guard = api.lock_vulkan_queue();
     let cmd_buffers = [cb];
     let submit = vk::SubmitInfo::default().command_buffers(&cmd_buffers);
-    device.queue_submit(guard.queue(), &[submit], vk::Fence::null()).map_err(|e| format!("{e:?}"))?;
-    device.queue_wait_idle(guard.queue()).map_err(|e| format!("{e:?}"))?;
+    device
+      .queue_submit(guard.queue(), &[submit], vk::Fence::null())
+      .map_err(|e| format!("{e:?}"))?;
+    device
+      .queue_wait_idle(guard.queue())
+      .map_err(|e| format!("{e:?}"))?;
     device.free_command_buffers(cmd_pool, &[cb]);
   }
   Ok(())
@@ -204,7 +254,11 @@ fn build_texture(
   tex.destroy(device);
 
   let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * (channels as vk::DeviceSize);
-  let format = if channels == 1 { vk::Format::R8_UNORM } else { vk::Format::R8G8B8A8_UNORM };
+  let format = if channels == 1 {
+    vk::Format::R8_UNORM
+  } else {
+    vk::Format::R8G8B8A8_UNORM
+  };
 
   let (stage_buf, stage_mem) = make_buffer(
     device,
@@ -214,14 +268,19 @@ fn build_texture(
     vk::BufferUsageFlags::TRANSFER_SRC,
     vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
   )?;
-  let stage_mapped = unsafe { device.map_memory(stage_mem, 0, size, vk::MemoryMapFlags::empty()) }.map_err(|e| format!("{e:?}"))?;
+  let stage_mapped = unsafe { device.map_memory(stage_mem, 0, size, vk::MemoryMapFlags::empty()) }
+    .map_err(|e| format!("{e:?}"))?;
 
   let image = unsafe {
     device.create_image(
       &vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
-        .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+        .extent(vk::Extent3D {
+          width: w,
+          height: h,
+          depth: 1,
+        })
         .mip_levels(1)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
@@ -238,17 +297,34 @@ fn build_texture(
     device.allocate_memory(
       &vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
-        .memory_type_index(find_mem_type(instance, physical_device, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)),
+        .memory_type_index(find_mem_type(
+          instance,
+          physical_device,
+          req.memory_type_bits,
+          vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )),
       None,
     )
   }
   .map_err(|e| format!("{e:?}"))?;
   unsafe { device.bind_image_memory(image, memory, 0) }.map_err(|e| format!("{e:?}"))?;
 
-  transition_layout(api, device, cmd_pool, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)?;
+  transition_layout(
+    api,
+    device,
+    cmd_pool,
+    image,
+    vk::ImageLayout::UNDEFINED,
+    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+  )?;
 
   let components = if channels == 1 {
-    vk::ComponentMapping { r: vk::ComponentSwizzle::R, g: vk::ComponentSwizzle::R, b: vk::ComponentSwizzle::R, a: vk::ComponentSwizzle::ONE }
+    vk::ComponentMapping {
+      r: vk::ComponentSwizzle::R,
+      g: vk::ComponentSwizzle::R,
+      b: vk::ComponentSwizzle::R,
+      a: vk::ComponentSwizzle::ONE,
+    }
   } else {
     vk::ComponentMapping::default()
   };
@@ -259,13 +335,29 @@ fn build_texture(
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
         .components(components)
-        .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 }),
+        .subresource_range(vk::ImageSubresourceRange {
+          aspect_mask: vk::ImageAspectFlags::COLOR,
+          base_mip_level: 0,
+          level_count: 1,
+          base_array_layer: 0,
+          layer_count: 1,
+        }),
       None,
     )
   }
   .map_err(|e| format!("{e:?}"))?;
 
-  *tex = Texture { w, h, channels, image, memory, view, stage_buf, stage_mem, stage_mapped };
+  *tex = Texture {
+    w,
+    h,
+    channels,
+    image,
+    memory,
+    view,
+    stage_buf,
+    stage_mem,
+    stage_mapped,
+  };
   Ok(())
 }
 
@@ -290,7 +382,17 @@ fn upload_texture(
   let channels = if src_channels == 1 { 1 } else { 4 };
   let rebuilt = w != tex.w || h != tex.h || channels != tex.channels;
   if rebuilt {
-    build_texture(api, device, instance, physical_device, cmd_pool, tex, w, h, channels)?;
+    build_texture(
+      api,
+      device,
+      instance,
+      physical_device,
+      cmd_pool,
+      tex,
+      w,
+      h,
+      channels,
+    )?;
   }
 
   unsafe {
@@ -322,10 +424,25 @@ fn upload_texture(
   );
 
   let region = vk::BufferImageCopy::default()
-    .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
-    .image_extent(vk::Extent3D { width: w, height: h, depth: 1 });
+    .image_subresource(vk::ImageSubresourceLayers {
+      aspect_mask: vk::ImageAspectFlags::COLOR,
+      mip_level: 0,
+      base_array_layer: 0,
+      layer_count: 1,
+    })
+    .image_extent(vk::Extent3D {
+      width: w,
+      height: h,
+      depth: 1,
+    });
   unsafe {
-    device.cmd_copy_buffer_to_image(cb, tex.stage_buf, tex.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+    device.cmd_copy_buffer_to_image(
+      cb,
+      tex.stage_buf,
+      tex.image,
+      vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+      &[region],
+    );
   }
 
   record_barrier(
@@ -357,7 +474,14 @@ pub struct ImageViewer {
 }
 
 impl ImageViewer {
-  pub fn new(api: ThalamusAPI, title: &str, x: i32, y: i32, width: i32, height: i32) -> Result<Self, String> {
+  pub fn new(
+    api: ThalamusAPI,
+    title: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+  ) -> Result<Self, String> {
     let mut window = ImguiWindow::new(api, title, x, y, width, height)?;
     let instance = window.instance().clone();
     let physical_device = window.physical_device();
@@ -383,7 +507,17 @@ impl ImageViewer {
     let mut texture_ids = [imgui::TextureId::from(usize::MAX); MAX_FRAMES_IN_FLIGHT];
     let mut descriptor_sets = [vk::DescriptorSet::null(); MAX_FRAMES_IN_FLIGHT];
     for i in 0..MAX_FRAMES_IN_FLIGHT {
-      build_texture(api, &device, &instance, physical_device, cmd_pool, &mut textures[i], 1, 1, 1)?;
+      build_texture(
+        api,
+        &device,
+        &instance,
+        physical_device,
+        cmd_pool,
+        &mut textures[i],
+        1,
+        1,
+        1,
+      )?;
       let (id, set) = window.register_texture(textures[i].view, sampler)?;
       texture_ids[i] = id;
       descriptor_sets[i] = set;
@@ -446,9 +580,24 @@ impl ImageViewer {
           return (tex.w, tex.h);
         };
         let tex = &mut textures[frame_idx];
-        match upload_texture(api, device, instance, physical_device, cmd_pool, tex, cmd, frame.data, frame.width, frame.height, src_channels) {
+        match upload_texture(
+          api,
+          device,
+          instance,
+          physical_device,
+          cmd_pool,
+          tex,
+          cmd,
+          frame.data,
+          frame.width,
+          frame.height,
+          src_channels,
+        ) {
           Ok(true) => {
-            let image_info = [vk::DescriptorImageInfo::default().sampler(sampler).image_view(tex.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let image_info = [vk::DescriptorImageInfo::default()
+              .sampler(sampler)
+              .image_view(tex.view)
+              .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
             let write = [vk::WriteDescriptorSet::default()
               .dst_set(descriptor_sets[frame_idx])
               .dst_binding(0)
@@ -480,7 +629,11 @@ impl ImageViewer {
             }
             let img_aspect = (tex_w.max(1) as f32) / (tex_h.max(1) as f32);
             let avail_aspect = avail[0] / avail[1];
-            let (dw, dh) = if avail_aspect > img_aspect { (avail[1] * img_aspect, avail[1]) } else { (avail[0], avail[0] / img_aspect) };
+            let (dw, dh) = if avail_aspect > img_aspect {
+              (avail[1] * img_aspect, avail[1])
+            } else {
+              (avail[0], avail[0] / img_aspect)
+            };
 
             let origin = ui.cursor_screen_pos();
             let (cx, cy) = (origin[0] + dw / 2.0, origin[1] + dh / 2.0);
@@ -498,7 +651,13 @@ impl ImageViewer {
             let draw_list = ui.get_window_draw_list();
             draw_list.with_clip_rect_intersect(origin, clip_max, || {
               draw_list
-                .add_image_quad(texture_ids[frame_idx], rotate(-hw, -hh), rotate(hw, -hh), rotate(hw, hh), rotate(-hw, hh))
+                .add_image_quad(
+                  texture_ids[frame_idx],
+                  rotate(-hw, -hh),
+                  rotate(hw, -hh),
+                  rotate(hw, hh),
+                  rotate(-hw, hh),
+                )
                 .build();
             });
 

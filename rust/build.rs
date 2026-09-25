@@ -15,7 +15,9 @@ impl bindgen::callbacks::ParseCallbacks for ThalamusCallbacks {
       Some(bindgen::callbacks::IntKind::U64)
     } else if name.starts_with("THALAMUS_MODALITY_") {
       Some(bindgen::callbacks::IntKind::U32)
-    } else if name.starts_with("THALAMUS_SDL_SYSTEM_CURSOR_") || name == "THALAMUS_OPERATION_ABORTED" {
+    } else if name.starts_with("THALAMUS_SDL_SYSTEM_CURSOR_")
+      || name == "THALAMUS_OPERATION_ABORTED"
+    {
       Some(bindgen::callbacks::IntKind::I32)
     } else {
       None
@@ -58,8 +60,9 @@ fn main() {
   match target_os.as_str() {
     "windows" => {
       for lib in [
-        "Ws2_32", "Secur32", "Bcrypt", "Ncrypt", "Crypt32", "Mfplat", "Ole32", "User32", "dxguid", "uuid", "Mfuuid",
-        "strmiids", "Kernel32", "Psapi", "Gdi32", "Vfw32", "OleAut32", "Shlwapi", "oldnames"
+        "Ws2_32", "Secur32", "Bcrypt", "Ncrypt", "Crypt32", "Mfplat", "Ole32", "User32", "dxguid",
+        "uuid", "Mfuuid", "strmiids", "Kernel32", "Psapi", "Gdi32", "Vfw32", "OleAut32", "Shlwapi",
+        "oldnames",
       ] {
         println!("cargo:rustc-link-lib=dylib={}", lib);
       }

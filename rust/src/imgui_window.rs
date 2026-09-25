@@ -76,8 +76,20 @@ pub struct ImguiWindow {
 const MAX_CUSTOM_TEXTURES: u32 = 16;
 
 impl ImguiWindow {
-  pub fn new(api: ThalamusAPI, title: &str, x: i32, y: i32, width: i32, height: i32) -> Result<Self, String> {
-    let window = api.create_sdl_window(title, width, height, THALAMUS_SDL_WINDOW_VULKAN | THALAMUS_SDL_WINDOW_RESIZABLE)?;
+  pub fn new(
+    api: ThalamusAPI,
+    title: &str,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+  ) -> Result<Self, String> {
+    let window = api.create_sdl_window(
+      title,
+      width,
+      height,
+      THALAMUS_SDL_WINDOW_VULKAN | THALAMUS_SDL_WINDOW_RESIZABLE,
+    )?;
     window.set_position(x, y);
     let window_id = window.id();
 
@@ -101,7 +113,8 @@ impl ImguiWindow {
         .unwrap_or(formats[0])
     };
 
-    let render_pass = unsafe { Self::create_render_pass(&device, surface_format.format) }.map_err(|e| format!("{e:?}"))?;
+    let render_pass = unsafe { Self::create_render_pass(&device, surface_format.format) }
+      .map_err(|e| format!("{e:?}"))?;
     let cmd_pool = api.create_vulkan_command_pool();
 
     let mut ctx = Context::create();
@@ -117,21 +130,31 @@ impl ImguiWindow {
         cmd_pool,
         render_pass,
         &mut ctx,
-        Some(Options { in_flight_frames: MAX_FRAMES_IN_FLIGHT, ..Default::default() }),
+        Some(Options {
+          in_flight_frames: MAX_FRAMES_IN_FLIGHT,
+          ..Default::default()
+        }),
       )
       .map_err(|e| e.to_string())?
     };
 
-    let custom_desc_layout = imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_set_layout(&device).map_err(|e| e.to_string())?;
+    let custom_desc_layout =
+      imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_set_layout(&device)
+        .map_err(|e| e.to_string())?;
     // Not imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_pool:
     // it hardcodes descriptor_count to 1 regardless of the max_sets argument,
     // so the pool it returns can only ever satisfy a single allocation no
     // matter what's passed -- every registration after the first fails
     // (VUID-VkDescriptorSetAllocateInfo-apiVersion-07896, pool exhausted).
     let custom_desc_pool = unsafe {
-      let sizes = [vk::DescriptorPoolSize::default().ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(MAX_CUSTOM_TEXTURES)];
+      let sizes = [vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(MAX_CUSTOM_TEXTURES)];
       device.create_descriptor_pool(
-        &vk::DescriptorPoolCreateInfo::default().pool_sizes(&sizes).max_sets(MAX_CUSTOM_TEXTURES).flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+        &vk::DescriptorPoolCreateInfo::default()
+          .pool_sizes(&sizes)
+          .max_sets(MAX_CUSTOM_TEXTURES)
+          .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
         None,
       )
     }
@@ -148,7 +171,8 @@ impl ImguiWindow {
     .map_err(|e| format!("{e:?}"))?;
 
     let (image_available, in_flight) =
-      unsafe { Self::create_sync_objects(&device, MAX_FRAMES_IN_FLIGHT) }.map_err(|e| format!("{e:?}"))?;
+      unsafe { Self::create_sync_objects(&device, MAX_FRAMES_IN_FLIGHT) }
+        .map_err(|e| format!("{e:?}"))?;
 
     let mut result = ImguiWindow {
       api,
@@ -218,9 +242,19 @@ impl ImguiWindow {
   /// `ash::Device::update_descriptor_sets`, using the `&ash::Device` `prepare`
   /// already receives, rather than calling back into this window (which is
   /// already mutably borrowed as the `render_frame` receiver at that point).
-  pub fn register_texture(&mut self, image_view: vk::ImageView, sampler: vk::Sampler) -> Result<(imgui::TextureId, vk::DescriptorSet), String> {
-    let set = imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_set(&self.device, self.custom_desc_layout, self.custom_desc_pool, image_view, sampler)
-      .map_err(|e| e.to_string())?;
+  pub fn register_texture(
+    &mut self,
+    image_view: vk::ImageView,
+    sampler: vk::Sampler,
+  ) -> Result<(imgui::TextureId, vk::DescriptorSet), String> {
+    let set = imgui_rs_vulkan_renderer::vulkan::create_vulkan_descriptor_set(
+      &self.device,
+      self.custom_desc_layout,
+      self.custom_desc_pool,
+      image_view,
+      sampler,
+    )
+    .map_err(|e| e.to_string())?;
     let id = self.renderer.textures().insert(set);
     Ok((id, set))
   }
@@ -291,7 +325,10 @@ impl ImguiWindow {
         Err(e) => return Err(format!("{e:?}")),
       };
 
-      self.device.reset_fences(&[self.in_flight[frame_idx]]).map_err(|e| format!("{e:?}"))?;
+      self
+        .device
+        .reset_fences(&[self.in_flight[frame_idx]])
+        .map_err(|e| format!("{e:?}"))?;
 
       let cmd = self.cmd_buffers[frame_idx];
       self
@@ -305,21 +342,36 @@ impl ImguiWindow {
 
       let prepared = prepare(&self.device, cmd, frame_idx);
 
-      let clear = [vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] } }];
+      let clear = [vk::ClearValue {
+        color: vk::ClearColorValue {
+          float32: [0.0, 0.0, 0.0, 1.0],
+        },
+      }];
       let rp_begin = vk::RenderPassBeginInfo::default()
         .render_pass(self.render_pass)
         .framebuffer(self.framebuffers[image_index as usize])
-        .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: self.extent })
+        .render_area(vk::Rect2D {
+          offset: vk::Offset2D { x: 0, y: 0 },
+          extent: self.extent,
+        })
         .clear_values(&clear);
-      self.device.cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
+      self
+        .device
+        .cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
 
       let ui = self.ctx.frame();
       build_ui(ui, frame_idx, prepared);
       let draw_data = self.ctx.render();
-      self.renderer.cmd_draw(cmd, draw_data).map_err(|e| e.to_string())?;
+      self
+        .renderer
+        .cmd_draw(cmd, draw_data)
+        .map_err(|e| e.to_string())?;
 
       self.device.cmd_end_render_pass(cmd);
-      self.device.end_command_buffer(cmd).map_err(|e| format!("{e:?}"))?;
+      self
+        .device
+        .end_command_buffer(cmd)
+        .map_err(|e| format!("{e:?}"))?;
 
       let guard = self.api.lock_vulkan_queue();
       let wait_semaphores = [self.image_available[frame_idx]];
@@ -342,7 +394,10 @@ impl ImguiWindow {
         .wait_semaphores(&signal_semaphores)
         .swapchains(&swapchains)
         .image_indices(&image_indices);
-      match self.swapchain_loader.queue_present(guard.queue(), &present_info) {
+      match self
+        .swapchain_loader
+        .queue_present(guard.queue(), &present_info)
+      {
         Ok(suboptimal) => {
           if suboptimal {
             self.dirty = true;
@@ -359,7 +414,10 @@ impl ImguiWindow {
 
   fn recreate_swapchain(&mut self) -> Result<(), String> {
     unsafe {
-      self.device.device_wait_idle().map_err(|e| format!("{e:?}"))?;
+      self
+        .device
+        .device_wait_idle()
+        .map_err(|e| format!("{e:?}"))?;
       self.destroy_swapchain_deps();
 
       let caps = self
@@ -372,8 +430,14 @@ impl ImguiWindow {
         caps.current_extent
       } else {
         vk::Extent2D {
-          width: (pw as u32).clamp(caps.min_image_extent.width, caps.max_image_extent.width.max(1)),
-          height: (ph as u32).clamp(caps.min_image_extent.height, caps.max_image_extent.height.max(1)),
+          width: (pw as u32).clamp(
+            caps.min_image_extent.width,
+            caps.max_image_extent.width.max(1),
+          ),
+          height: (ph as u32).clamp(
+            caps.min_image_extent.height,
+            caps.max_image_extent.height.max(1),
+          ),
         }
       };
       if self.extent.width == 0 || self.extent.height == 0 {
@@ -402,12 +466,18 @@ impl ImguiWindow {
         .clipped(true)
         .old_swapchain(old_swapchain);
 
-      self.swapchain = self.swapchain_loader.create_swapchain(&create_info, None).map_err(|e| format!("{e:?}"))?;
+      self.swapchain = self
+        .swapchain_loader
+        .create_swapchain(&create_info, None)
+        .map_err(|e| format!("{e:?}"))?;
       if old_swapchain != vk::SwapchainKHR::null() {
         self.swapchain_loader.destroy_swapchain(old_swapchain, None);
       }
 
-      let images = self.swapchain_loader.get_swapchain_images(self.swapchain).map_err(|e| format!("{e:?}"))?;
+      let images = self
+        .swapchain_loader
+        .get_swapchain_images(self.swapchain)
+        .map_err(|e| format!("{e:?}"))?;
       self.image_views = images
         .iter()
         .map(|&image| {
@@ -444,7 +514,11 @@ impl ImguiWindow {
         .map_err(|e| format!("{e:?}"))?;
 
       self.render_finished = (0..images.len())
-        .map(|_| self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
+        .map(|_| {
+          self
+            .device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("{e:?}"))?;
 
@@ -470,7 +544,10 @@ impl ImguiWindow {
     }
   }
 
-  unsafe fn create_render_pass(device: &ash::Device, format: vk::Format) -> Result<vk::RenderPass, vk::Result> {
+  unsafe fn create_render_pass(
+    device: &ash::Device,
+    format: vk::Format,
+  ) -> Result<vk::RenderPass, vk::Result> {
     let attachment = vk::AttachmentDescription::default()
       .format(format)
       .samples(vk::SampleCountFlags::TYPE_1)
@@ -479,7 +556,9 @@ impl ImguiWindow {
       .initial_layout(vk::ImageLayout::UNDEFINED)
       .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
     let attachments = [attachment];
-    let color_ref = [vk::AttachmentReference::default().attachment(0).layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+    let color_ref = [vk::AttachmentReference::default()
+      .attachment(0)
+      .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
     let subpass = [vk::SubpassDescription::default()
       .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
       .color_attachments(&color_ref)];
@@ -491,7 +570,10 @@ impl ImguiWindow {
       .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
     unsafe {
       device.create_render_pass(
-        &vk::RenderPassCreateInfo::default().attachments(&attachments).subpasses(&subpass).dependencies(&dependency),
+        &vk::RenderPassCreateInfo::default()
+          .attachments(&attachments)
+          .subpasses(&subpass)
+          .dependencies(&dependency),
         None,
       )
     }
@@ -504,9 +586,13 @@ impl ImguiWindow {
     let mut image_available = Vec::with_capacity(count);
     let mut in_flight = Vec::with_capacity(count);
     for _ in 0..count {
-      image_available.push(unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?);
+      image_available
+        .push(unsafe { device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }?);
       in_flight.push(unsafe {
-        device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)
+        device.create_fence(
+          &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+          None,
+        )
       }?);
     }
     Ok((image_available, in_flight))
@@ -527,10 +613,16 @@ impl Drop for ImguiWindow {
       // field doc comment for why it isn't alongside image_available/in_flight).
       self.destroy_swapchain_deps();
       if self.swapchain != vk::SwapchainKHR::null() {
-        self.swapchain_loader.destroy_swapchain(self.swapchain, None);
+        self
+          .swapchain_loader
+          .destroy_swapchain(self.swapchain, None);
       }
-      self.device.destroy_descriptor_pool(self.custom_desc_pool, None);
-      self.device.destroy_descriptor_set_layout(self.custom_desc_layout, None);
+      self
+        .device
+        .destroy_descriptor_pool(self.custom_desc_pool, None);
+      self
+        .device
+        .destroy_descriptor_set_layout(self.custom_desc_layout, None);
       self.device.destroy_render_pass(self.render_pass, None);
       self.device.destroy_command_pool(self.cmd_pool, None);
       self.surface_loader.destroy_surface(self.surface, None);

@@ -1,5 +1,5 @@
-use tokio::sync::OnceCell;
 use btleplug::platform::Manager;
+use tokio::sync::OnceCell;
 
 // btleplug's Manager::new() opens a fresh BlueZ D-Bus connection and spawns a detached task to
 // pump it that is never torn down, so it must be created once and shared -- otherwise every node
@@ -8,5 +8,8 @@ use btleplug::platform::Manager;
 static MANAGER: OnceCell<Manager> = OnceCell::const_new();
 
 pub async fn get_manager() -> btleplug::Result<Manager> {
-  MANAGER.get_or_try_init(Manager::new).await.map(Clone::clone)
+  MANAGER
+    .get_or_try_init(Manager::new)
+    .await
+    .map(Clone::clone)
 }

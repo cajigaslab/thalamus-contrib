@@ -1,53 +1,58 @@
-use std::ptr;
-use std::os::raw::c_char;
-use crate::api::{ThalamusAPI, PredropToken, NodeData, IntoNodeHandle};
 use crate::api::ImageFormat;
+use crate::api::{IntoNodeHandle, NodeData, PredropToken, ThalamusAPI};
+use std::os::raw::c_char;
+use std::ptr;
 
 /// Bindgen output for Thalamus's plugin.h and modalities.h (see build.rs).
 mod generated {
-    #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
-    include!(concat!(env!("OUT_DIR"), "/thalamus_api.rs"));
+  #![allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+  )]
+  include!(concat!(env!("OUT_DIR"), "/thalamus_api.rs"));
 }
 
 pub use generated::*;
 
 impl ThalamusAPIRaw {
-    /// Copies the function table Thalamus passed in into a Rust-owned struct,
-    /// leaving every function field Thalamus didn't provide as `None`.
-    ///
-    /// `version` is filled in by Thalamus as a count of how many of these
-    /// functions it actually initialized. Since this struct is only ever
-    /// appended to, a thalamus-contrib build newer than the running Thalamus
-    /// knows about fields that don't exist in Thalamus's (smaller) struct at
-    /// all, so only `version` and the first `version` function pointers are
-    /// read from `host`; nothing past that is read or written.
-    ///
-    /// # Safety
-    /// `host` must point to a ThalamusAPI whose `version` field is accurate.
-    pub unsafe fn copy_from_host(host: *const ThalamusAPIRaw) -> ThalamusAPIRaw {
-        type Slot = ::std::option::Option<unsafe extern "C" fn()>;
-        const FIRST: usize = ::std::mem::offset_of!(ThalamusAPIRaw, state_is_dict);
-        const TAIL: usize = ::std::mem::size_of::<ThalamusAPIRaw>() - FIRST;
-        const COUNT: usize = TAIL / ::std::mem::size_of::<Slot>();
-        // Everything after `version` must be a function pointer for the
-        // slot-wise copy below to be valid.
-        const _: () = assert!(TAIL % ::std::mem::size_of::<Slot>() == 0);
+  /// Copies the function table Thalamus passed in into a Rust-owned struct,
+  /// leaving every function field Thalamus didn't provide as `None`.
+  ///
+  /// `version` is filled in by Thalamus as a count of how many of these
+  /// functions it actually initialized. Since this struct is only ever
+  /// appended to, a thalamus-contrib build newer than the running Thalamus
+  /// knows about fields that don't exist in Thalamus's (smaller) struct at
+  /// all, so only `version` and the first `version` function pointers are
+  /// read from `host`; nothing past that is read or written.
+  ///
+  /// # Safety
+  /// `host` must point to a ThalamusAPI whose `version` field is accurate.
+  pub unsafe fn copy_from_host(host: *const ThalamusAPIRaw) -> ThalamusAPIRaw {
+    type Slot = ::std::option::Option<unsafe extern "C" fn()>;
+    const FIRST: usize = ::std::mem::offset_of!(ThalamusAPIRaw, state_is_dict);
+    const TAIL: usize = ::std::mem::size_of::<ThalamusAPIRaw>() - FIRST;
+    const COUNT: usize = TAIL / ::std::mem::size_of::<Slot>();
+    // Everything after `version` must be a function pointer for the
+    // slot-wise copy below to be valid.
+    const _: () = assert!(TAIL % ::std::mem::size_of::<Slot>() == 0);
 
-        unsafe {
-            // Read through a raw pointer rather than a reference: `host` may
-            // point to fewer bytes than size_of::<ThalamusAPIRaw>().
-            let version = ::std::ptr::addr_of!((*host).version).read();
-            let initialized = version.clamp(0, COUNT as i32) as usize;
-            // All-zero is valid: version 0 and every function field None.
-            let mut api: ThalamusAPIRaw = ::std::mem::zeroed();
-            ::std::ptr::copy_nonoverlapping(
-                host as *const u8,
-                &mut api as *mut ThalamusAPIRaw as *mut u8,
-                FIRST + initialized * ::std::mem::size_of::<Slot>(),
-            );
-            api
-        }
+    unsafe {
+      // Read through a raw pointer rather than a reference: `host` may
+      // point to fewer bytes than size_of::<ThalamusAPIRaw>().
+      let version = ::std::ptr::addr_of!((*host).version).read();
+      let initialized = version.clamp(0, COUNT as i32) as usize;
+      // All-zero is valid: version 0 and every function field None.
+      let mut api: ThalamusAPIRaw = ::std::mem::zeroed();
+      ::std::ptr::copy_nonoverlapping(
+        host as *const u8,
+        &mut api as *mut ThalamusAPIRaw as *mut u8,
+        FIRST + initialized * ::std::mem::size_of::<Slot>(),
+      );
+      api
     }
+  }
 }
 
 /// Holds the Node trait object however Node::new() produced it: freshly
@@ -86,14 +91,18 @@ pub(crate) struct PluginImpl {
 }
 
 fn deref_plugin_impl(c_node: &ThalamusNode) -> &PluginImpl {
-    unsafe { &*(c_node.plugin_impl as *const PluginImpl) }
+  unsafe { &*(c_node.plugin_impl as *const PluginImpl) }
 }
 
 pub(crate) fn plugin_impl_ptr(c_node: *mut ThalamusNode) -> *mut PluginImpl {
-    unsafe { (*c_node).plugin_impl as *mut PluginImpl }
+  unsafe { (*c_node).plugin_impl as *mut PluginImpl }
 }
 
-pub extern "C" fn c_node_analog_data(output: *mut ThalamusDoubleSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+pub extern "C" fn c_node_analog_data(
+  output: *mut ThalamusDoubleSpan,
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
 
@@ -104,7 +113,11 @@ pub extern "C" fn c_node_analog_data(output: *mut ThalamusDoubleSpan, raw_node: 
   }
 }
 
-pub extern "C" fn c_node_analog_short_data(output: *mut ThalamusShortSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+pub extern "C" fn c_node_analog_short_data(
+  output: *mut ThalamusShortSpan,
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
 
@@ -115,7 +128,11 @@ pub extern "C" fn c_node_analog_short_data(output: *mut ThalamusShortSpan, raw_n
   }
 }
 
-pub extern "C" fn c_node_analog_int_data(output: *mut ThalamusIntSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+pub extern "C" fn c_node_analog_int_data(
+  output: *mut ThalamusIntSpan,
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
 
@@ -126,7 +143,11 @@ pub extern "C" fn c_node_analog_int_data(output: *mut ThalamusIntSpan, raw_node:
   }
 }
 
-pub extern "C" fn c_node_analog_ulong_data(output: *mut ThalamusULongSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+pub extern "C" fn c_node_analog_ulong_data(
+  output: *mut ThalamusULongSpan,
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
 
@@ -143,13 +164,20 @@ pub extern "C" fn c_node_analog_num_channels(raw_node: *mut ThalamusNode) -> i32
   analog.num_channels()
 }
 
-pub extern "C" fn c_node_analog_sample_interval_ns(raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) -> u64 {
+pub extern "C" fn c_node_analog_sample_interval_ns(
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) -> u64 {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
   analog.sample_interval(channel).as_nanos() as u64
 }
 
-pub extern "C" fn c_node_analog_name(output: *mut ThalamusCharSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+pub extern "C" fn c_node_analog_name(
+  output: *mut ThalamusCharSpan,
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
   let result = analog.name(channel);
@@ -162,32 +190,34 @@ pub extern "C" fn c_node_analog_name(output: *mut ThalamusCharSpan, raw_node: *m
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_analog_has_analog_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
-  let analog = deref_plugin_impl(c_node).data.and_then(|data| data.analog());
-  if analog.is_some() {1}else{0}
+  let analog = deref_plugin_impl(c_node)
+    .data
+    .and_then(|data| data.analog());
+  if analog.is_some() { 1 } else { 0 }
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_analog_is_short_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
-  if analog.is_short_data() {1}else{0}
+  if analog.is_short_data() { 1 } else { 0 }
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_analog_is_int_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
-  if analog.is_int_data() {1}else{0}
+  if analog.is_int_data() { 1 } else { 0 }
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_analog_is_ulong_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
-  if analog.is_ulong_data() {1}else{0}
+  if analog.is_ulong_data() { 1 } else { 0 }
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_analog_is_transformed(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
-  if analog.is_transformed() {1}else{0}
+  if analog.is_transformed() { 1 } else { 0 }
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_analog_scale(raw_node: *mut ThalamusNode, channel: i32) -> f64 {
@@ -208,11 +238,18 @@ pub extern "C" fn c_node_time_ns(raw_node: *mut ThalamusNode) -> u64 {
   data.time().as_nanos() as u64
 }
 #[allow(non_snake_case)]
-pub extern "C" fn c_node_process(raw_node: *mut ThalamusNode, arg1: *mut ThalamusRequestHandle, arg2: *mut ThalamusJson) {
+pub extern "C" fn c_node_process(
+  raw_node: *mut ThalamusNode,
+  arg1: *mut ThalamusRequestHandle,
+  arg2: *mut ThalamusJson,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let _impl = deref_plugin_impl(c_node);
 
-  let handle = crate::api::Request{ api: _impl.api, handle: arg1};
+  let handle = crate::api::Request {
+    api: _impl.api,
+    handle: arg1,
+  };
   let json = crate::api::Json::new(_impl.api, arg2);
   _impl.node.with_node(|node| node.process(handle, json));
 }
@@ -221,11 +258,18 @@ pub extern "C" fn c_node_predrop(raw_node: *mut ThalamusNode) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let _impl = deref_plugin_impl(c_node);
 
-  let token = PredropToken{api: _impl.api.raw, node: raw_node};
+  let token = PredropToken {
+    api: _impl.api.raw,
+    node: raw_node,
+  };
   _impl.node.with_node(|node| node.predrop(token));
 }
 
-pub extern "C" fn c_node_image_plane(output: *mut ThalamusByteSpan, raw_node: *mut ThalamusNode, channel: ::std::os::raw::c_int) {
+pub extern "C" fn c_node_image_plane(
+  output: *mut ThalamusByteSpan,
+  raw_node: *mut ThalamusNode,
+  channel: ::std::os::raw::c_int,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let image = deref_plugin_impl(c_node).data.unwrap().image().unwrap();
 
@@ -279,10 +323,13 @@ pub extern "C" fn c_node_image_frame_interval_ns(raw_node: *mut ThalamusNode) ->
 pub extern "C" fn c_node_image_has_image_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let image = deref_plugin_impl(c_node).data.and_then(|data| data.image());
-  if image.is_some() {1}else{0}
+  if image.is_some() { 1 } else { 0 }
 }
 
-pub extern "C" fn c_node_mocap_segments(output: *mut ThalamusMocapSegmentSpan, raw_node: *mut ThalamusNode) {
+pub extern "C" fn c_node_mocap_segments(
+  output: *mut ThalamusMocapSegmentSpan,
+  raw_node: *mut ThalamusNode,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let mocap = deref_plugin_impl(c_node).data.unwrap().mocap().unwrap();
   let result = mocap.segments();
@@ -292,7 +339,10 @@ pub extern "C" fn c_node_mocap_segments(output: *mut ThalamusMocapSegmentSpan, r
   }
 }
 
-pub extern "C" fn c_node_mocap_pose_name(output: *mut ThalamusCharSpan, raw_node: *mut ThalamusNode) {
+pub extern "C" fn c_node_mocap_pose_name(
+  output: *mut ThalamusCharSpan,
+  raw_node: *mut ThalamusNode,
+) {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let mocap = deref_plugin_impl(c_node).data.unwrap().mocap().unwrap();
   let result = mocap.pose_name();
@@ -306,7 +356,7 @@ pub extern "C" fn c_node_mocap_pose_name(output: *mut ThalamusCharSpan, raw_node
 pub extern "C" fn c_node_mocap_has_motion_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let mocap = deref_plugin_impl(c_node).data.and_then(|data| data.mocap());
-  if mocap.is_some() {1}else{0}
+  if mocap.is_some() { 1 } else { 0 }
 }
 
 pub extern "C" fn c_node_text_text(output: *mut ThalamusCharSpan, raw_node: *mut ThalamusNode) {
@@ -323,7 +373,7 @@ pub extern "C" fn c_node_text_text(output: *mut ThalamusCharSpan, raw_node: *mut
 pub extern "C" fn c_node_text_has_text_data(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let text = deref_plugin_impl(c_node).data.and_then(|data| data.text());
-  if text.is_some() {1}else{0}
+  if text.is_some() { 1 } else { 0 }
 }
 
 fn wrap_analog(c_node: &mut ThalamusNode) {
@@ -376,11 +426,22 @@ fn wrap_text(c_node: &mut ThalamusNode) {
   }
 }
 
-extern "C" fn create_node_template<T: crate::api::Node + crate::api::NodeConsts + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, io_context: *mut ThalamusIoContext, graph: *mut ThalamusNodeGraph) -> *mut ThalamusNode {
+extern "C" fn create_node_template<T: crate::api::Node + crate::api::NodeConsts + 'static>(
+  factory: *mut ThalamusNodeFactory,
+  state: *mut ThalamusState,
+  io_context: *mut ThalamusIoContext,
+  graph: *mut ThalamusNodeGraph,
+) -> *mut ThalamusNode {
   create2_node_template::<T>(factory, state, io_context, graph, ptr::null_mut())
 }
 
-extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts + 'static>(factory: *mut ThalamusNodeFactory, state: *mut ThalamusState, _io_context: *mut ThalamusIoContext, _graph: *mut ThalamusNodeGraph, c_impl: *mut ::std::os::raw::c_void) -> *mut ThalamusNode {
+extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts + 'static>(
+  factory: *mut ThalamusNodeFactory,
+  state: *mut ThalamusState,
+  _io_context: *mut ThalamusIoContext,
+  _graph: *mut ThalamusNodeGraph,
+  c_impl: *mut ::std::os::raw::c_void,
+) -> *mut ThalamusNode {
   println!("create_node_template");
   let api_raw = unsafe { (*factory).plugin_impl as *mut ThalamusAPIRaw };
   let c_node = Box::into_raw(Box::new(ThalamusNode {
@@ -395,12 +456,17 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
     predrop: None,
     signals_offmain: 0,
   }));
-  let c_node_ref = unsafe {&mut*c_node};
-  let api = ThalamusAPI{raw: api_raw};
+  let c_node_ref = unsafe { &mut *c_node };
+  let api = ThalamusAPI { raw: api_raw };
   let node_token = crate::api::NodeToken::new(c_node);
 
   let token = unsafe { crate::api::MainThreadToken::new_in_main_thread_callback() };
-  let ctor = T::new(api, node_token.clone(), crate::api::State::new(api, state), token);
+  let ctor = T::new(
+    api,
+    node_token.clone(),
+    crate::api::State::new(api, state),
+    token,
+  );
   let modalities = T::MODALITIES;
   c_node_ref.signals_offmain = if T::SIGNALS_OFFMAIN { 1 } else { 0 };
 
@@ -432,7 +498,10 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
   c_node
 }
 
-unsafe extern "C" fn destroy_node_template(_factory: *mut ThalamusNodeFactory, node_raw: *mut ThalamusNode) {
+unsafe extern "C" fn destroy_node_template(
+  _factory: *mut ThalamusNodeFactory,
+  node_raw: *mut ThalamusNode,
+) {
   println!("destroy_node_template");
   unsafe {
     let node = &*node_raw;
@@ -446,7 +515,9 @@ unsafe extern "C" fn destroy_node_template(_factory: *mut ThalamusNodeFactory, n
   }
 }
 
-extern "C" fn prepare_node_template<T: crate::api::Node>(_factory: *mut ThalamusNodeFactory) -> ::std::os::raw::c_char {
+extern "C" fn prepare_node_template<T: crate::api::Node>(
+  _factory: *mut ThalamusNodeFactory,
+) -> ::std::os::raw::c_char {
   if T::prepare() { 1 } else { 0 }
 }
 
@@ -455,10 +526,17 @@ extern "C" fn cleanup_node_template<T: crate::api::Node>(_factory: *mut Thalamus
 }
 
 impl ThalamusNodeFactory {
-  pub fn new<T: crate::api::Node + crate::api::NodeConsts + 'static>(name: &'static str, api: *mut ThalamusAPIRaw) -> *mut ThalamusNodeFactory {
+  pub fn new<T: crate::api::Node + crate::api::NodeConsts + 'static>(
+    name: &'static str,
+    api: *mut ThalamusAPIRaw,
+  ) -> *mut ThalamusNodeFactory {
     println!("ThalamusNodeFactory::new {}", name);
     let result = Box::into_raw(Box::new(ThalamusNodeFactory {
-      type_: ThalamusCharSpan { data: name.as_ptr() as *const c_char, size: name.len() as u64, owns_data: 0 },
+      type_: ThalamusCharSpan {
+        data: name.as_ptr() as *const c_char,
+        size: name.len() as u64,
+        owns_data: 0,
+      },
       create: Some(create_node_template::<T>),
       destroy: Some(destroy_node_template),
       prepare: Some(prepare_node_template::<T>),

@@ -17,8 +17,69 @@ VIEW_ROTATIONS = {
   270: 270,
 }
 
-WIDTHS = (320, 640, 800, 1024, 1280, 1600, 1920, 2560, 3840)
-HEIGHTS = (240, 480, 600, 720, 768, 900, 1080, 1440, 2160)
+FORMAT_KEYS = ('width', 'height', 'frame_rate', 'format')
+
+def format_text(camera_format):
+  return (f'{camera_format["width"]}x{camera_format["height"]} @ {camera_format["frame_rate"]} Hz '
+          f'({camera_format["format"]})')
+
+def same_format(a, b):
+  return all(a.get(k) == b.get(k) for k in FORMAT_KEYS)
+
+class FormatComboBox(QComboBox):
+  """Lists the formats reported by get_formats for the selected camera."""
+  def __init__(self, config, stub):
+    super().__init__()
+    self.stub = stub
+    self.config = config
+    self.request_id = 0
+    self.currentIndexChanged.connect(self.on_index_changed)
+
+  def on_index_changed(self, index):
+    camera_format = self.itemData(index)
+    if camera_format is not None and not same_format(camera_format, self.config.get('Format', {})):
+      self.config['Format'] = camera_format
+
+  def load_formats(self, camera):
+    self.request_id += 1
+    create_task_with_exc_handling(self.async_load_formats(camera, self.request_id))
+
+  async def async_load_formats(self, camera, request_id):
+    formats = []
+    index = camera.get('index', -1) if camera is not None else -1
+    if index >= 0:
+      request = json.dumps({'type': 'get_formats', 'index': index})
+      response = await self.stub.node_request(thalamus_pb2.NodeRequest(node=self.config['name'], json=request))
+      formats = json.loads(response.json) or []
+    # The camera changed again while this request was in flight
+    if request_id != self.request_id:
+      return
+
+    self.blockSignals(True)
+    try:
+      self.clear()
+      for camera_format in formats:
+        self.addItem(format_text(camera_format), camera_format)
+    finally:
+      self.blockSignals(False)
+    self.setFormat(self.config.get('Format', None))
+
+  def setFormat(self, camera_format):
+    self.blockSignals(True)
+    try:
+      if camera_format is None:
+        self.setCurrentIndex(-1)
+        return
+      for i in range(self.count()):
+        if same_format(self.itemData(i), camera_format):
+          self.setCurrentIndex(i)
+          return
+      # Keep showing the configured format even if the camera doesn't list it,
+      # the node will use the closest format the camera has.
+      self.addItem(format_text(camera_format), {k: camera_format[k] for k in FORMAT_KEYS})
+      self.setCurrentIndex(self.count() - 1)
+    finally:
+      self.blockSignals(False)
 
 class WebcamComboBox(QComboBox):
   def __init__(self, config, stub):
@@ -79,12 +140,13 @@ class WebcamWidget(QWidget):
 
     if 'Running' not in config:
       config['Running'] = False
-    if 'Width' not in config:
-      config['Width'] = 640
-    if 'Height' not in config:
-      config['Height'] = 480
-    if 'AcquisitionFrameRate' not in config:
-      config['AcquisitionFrameRate'] = 30
+    if 'Format' not in config:
+      config['Format'] = {
+        'width': 640,
+        'height': 480,
+        'frame_rate': 30,
+        'format': 'MJPEG',
+      }
     if 'Camera' not in config:
       config['Camera'] = {'index': -1, 'name': 'NULL', 'description': 'NULL'}
     self.camera = config['Camera']
@@ -101,26 +163,9 @@ class WebcamWidget(QWidget):
     self.running_checkbox.toggled.connect(lambda value: config.update({'Running': value}))
     layout.addWidget(self.running_checkbox)
 
-    layout.addWidget(QLabel('Width:'))
-    self.width_combobox = QSpinBox()
-    self.width_combobox.setRange(0, 1000000)
-    self.width_combobox.valueChanged.connect(
-      lambda _: config.update({'Width': self.width_combobox.value()}))
-    layout.addWidget(self.width_combobox)
-
-    layout.addWidget(QLabel('Height:'))
-    self.height_combobox = QSpinBox()
-    self.height_combobox.setRange(0, 1000000)
-    self.height_combobox.valueChanged.connect(
-      lambda _: config.update({'Height': self.height_combobox.value()}))
-    layout.addWidget(self.height_combobox)
-
-    layout.addWidget(QLabel('Frame Rate:'))
-    self.framerate_spinbox = QDoubleSpinBox()
-    self.framerate_spinbox.setRange(0, 1000000)
-    self.framerate_spinbox.setSuffix(' Hz')
-    self.framerate_spinbox.editingFinished.connect(lambda: config.update({'AcquisitionFrameRate': self.framerate_spinbox.value()}))
-    layout.addWidget(self.framerate_spinbox)
+    layout.addWidget(QLabel('Format:'))
+    self.format_combobox = FormatComboBox(config, stub)
+    layout.addWidget(self.format_combobox)
 
     layout.addStretch(1)
 
@@ -131,16 +176,17 @@ class WebcamWidget(QWidget):
   def on_change(self, source, action, key, value):
     if source is self.config:
       if key == 'Camera':
+        self.camera = value
         self.camera_combobox.setCamera(value)
+        self.format_combobox.load_formats(value)
       elif key == 'Running':
         if self.running_checkbox.isChecked() != value:
           self.running_checkbox.setChecked(value)
-      elif key == 'Width':
-        self.width_combobox.setValue(int(value))
-      elif key == 'Height':
-        self.height_combobox.setValue(int(value))
-      elif key == 'AcquisitionFrameRate':
-        if abs(self.framerate_spinbox.value() - value) >= 1:
-          self.framerate_spinbox.setValue(value)
+      elif key == 'Format':
+        self.format_combobox.setFormat(value)
     elif source is self.camera:
       self.camera_combobox.setCamera(source)
+      if key == 'index':
+        self.format_combobox.load_formats(source)
+    elif source is self.config.get('Format', None):
+      self.format_combobox.setFormat(source)

@@ -2,10 +2,10 @@ use std::io::Error;
 
 use bytebuffer::{ByteBuffer, ByteReader};
 
-#[derive(PartialEq,Debug)]
+#[derive(PartialEq, Debug)]
 pub enum BlockType {
   DATA,
-  CMD
+  CMD,
 }
 pub const ID_ENABLE: u8 = 0;
 pub const ID_SET_SAMPLE_RATE: u8 = 1;
@@ -23,7 +23,7 @@ pub struct Block<'a> {
   pub block_id: u8,
   pub data: &'a [u8],
   pub first_point_idx: i16,
-  pub first_channel_sampled: u8
+  pub first_channel_sampled: u8,
 }
 
 impl<'a> Block<'a> {
@@ -33,7 +33,7 @@ impl<'a> Block<'a> {
       block_id,
       data,
       first_point_idx: -1,
-      first_channel_sampled: 0
+      first_channel_sampled: 0,
     }
   }
 
@@ -42,7 +42,7 @@ impl<'a> Block<'a> {
     reader.set_endian(bytebuffer::Endian::BigEndian);
 
     let len = reader.read_u8()? as usize;
-    
+
     let id_byte = reader.read_u8()?;
     let is_command_block = (id_byte & 0b10000000) != 0;
     let block_id = id_byte & 0x7F;
@@ -52,25 +52,43 @@ impl<'a> Block<'a> {
     if is_command_block {
       let pos = reader.get_rpos();
       let data = &data[pos..len];
-      Ok(Block{ block_type: BlockType::CMD, block_id, data, first_point_idx: -1, first_channel_sampled: 0 })
+      Ok(Block {
+        block_type: BlockType::CMD,
+        block_id,
+        data,
+        first_point_idx: -1,
+        first_channel_sampled: 0,
+      })
     } else {
       //Block(BlockType.CMD, block_id, data[2..])
       let first_point_idx = reader.read_i16()?;
       let pos = reader.get_rpos();
       let data = &data[pos..len];
       if new_block_id == 4 {
-        Ok(Block{ block_type: BlockType::CMD, block_id: new_block_id, data: data, first_point_idx, first_channel_sampled: new_first_channel })
+        Ok(Block {
+          block_type: BlockType::CMD,
+          block_id: new_block_id,
+          data: data,
+          first_point_idx,
+          first_channel_sampled: new_first_channel,
+        })
       } else {
-        Ok(Block{ block_type: BlockType::CMD, block_id, data, first_point_idx, first_channel_sampled: 0 })
+        Ok(Block {
+          block_type: BlockType::CMD,
+          block_id,
+          data,
+          first_point_idx,
+          first_channel_sampled: 0,
+        })
       }
     }
   }
 
   pub fn encode(&self) -> Vec<u8> {
     let prefix_size = if self.block_type == BlockType::DATA {
-        4
+      4
     } else {
-        2
+      2
     };
     let total_size = prefix_size + self.data.len();
     let mut buffer = ByteBuffer::new();
@@ -84,7 +102,7 @@ impl<'a> Block<'a> {
       buffer.write_u8(self.block_id | 0x80);
     }
     buffer.write_bytes(self.data);
-    
+
     buffer.into_vec()
   }
 }

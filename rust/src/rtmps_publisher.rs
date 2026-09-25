@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use ffmpeg_sys_next as ffi;
-use skia_safe::{AlphaType, Color, ColorType, Font, FontMgr, ImageInfo, Paint, Point, Rect, surfaces};
+use skia_safe::{
+  AlphaType, Color, ColorType, Font, FontMgr, ImageInfo, Paint, Point, Rect, surfaces,
+};
 
 use crate::api::ImageFormat;
 
@@ -44,14 +46,20 @@ fn av_pixel_format(format: ImageFormat) -> Result<ffi::AVPixelFormat, String> {
     ImageFormat::YUVJ420P => Ok(ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P),
     ImageFormat::NV12 => Ok(ffi::AVPixelFormat::AV_PIX_FMT_NV12),
     ImageFormat::BGR => Ok(ffi::AVPixelFormat::AV_PIX_FMT_BGR24),
-    ImageFormat::MJPEG => Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string()),
+    ImageFormat::MJPEG => {
+      Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string())
+    }
   }
 }
 
 // (bytes per row, rows) of each plane, tightly packed (no linesize padding) as
 // every NodeData image producer in this codebase does (see plane_layout in
 // ffmpeg_devices.rs).
-fn plane_layout(format: ImageFormat, width: u32, height: u32) -> Result<Vec<(usize, usize)>, String> {
+fn plane_layout(
+  format: ImageFormat,
+  width: u32,
+  height: u32,
+) -> Result<Vec<(usize, usize)>, String> {
   let (w, h) = (width as usize, height as usize);
   match format {
     ImageFormat::Gray => Ok(vec![(w, h)]),
@@ -61,8 +69,10 @@ fn plane_layout(format: ImageFormat, width: u32, height: u32) -> Result<Vec<(usi
     ImageFormat::YUV420P | ImageFormat::YUVJ420P => {
       let (chroma_w, chroma_h) = (w.div_ceil(2), h.div_ceil(2));
       Ok(vec![(w, h), (chroma_w, chroma_h), (chroma_w, chroma_h)])
-    },
-    ImageFormat::MJPEG => Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string()),
+    }
+    ImageFormat::MJPEG => {
+      Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string())
+    }
   }
 }
 
@@ -79,7 +89,12 @@ fn source_planes(buf: &FrameBuf) -> Result<([*const u8; 4], [i32; 4]), String> {
     for (i, ((stride, rows), plane)) in layout.iter().zip(&buf.planes).enumerate() {
       if plane.len() < stride * rows {
         return Err(format!(
-          "{:?} plane {} has {} bytes, expected {}", buf.format, i, plane.len(), stride * rows));
+          "{:?} plane {} has {} bytes, expected {}",
+          buf.format,
+          i,
+          plane.len(),
+          stride * rows
+        ));
       }
       pointers[i] = plane.as_ptr();
       strides[i] = *stride as i32;
@@ -89,7 +104,11 @@ fn source_planes(buf: &FrameBuf) -> Result<([*const u8; 4], [i32; 4]), String> {
     let plane = &buf.planes[0];
     if plane.len() < total {
       return Err(format!(
-        "{:?} frame has {} bytes, expected {}", buf.format, plane.len(), total));
+        "{:?} frame has {} bytes, expected {}",
+        buf.format,
+        plane.len(),
+        total
+      ));
     }
     let mut offset = 0;
     for (i, (stride, rows)) in layout.iter().enumerate() {
@@ -99,7 +118,11 @@ fn source_planes(buf: &FrameBuf) -> Result<([*const u8; 4], [i32; 4]), String> {
     }
   } else {
     return Err(format!(
-      "{:?} frame has {} planes, expected {} or 1", buf.format, buf.planes.len(), layout.len()));
+      "{:?} frame has {} planes, expected {} or 1",
+      buf.format,
+      buf.planes.len(),
+      layout.len()
+    ));
   }
   Ok((pointers, strides))
 }
@@ -142,7 +165,12 @@ fn draw_overlay_text(frame: *mut ffi::AVFrame, text: &str) {
   let y_len = linesize as usize * frame_h as usize;
   let y_plane = unsafe { std::slice::from_raw_parts_mut(y_data, y_len) };
 
-  let info = ImageInfo::new((frame_w, frame_h), ColorType::Gray8, AlphaType::Opaque, None);
+  let info = ImageInfo::new(
+    (frame_w, frame_h),
+    ColorType::Gray8,
+    AlphaType::Opaque,
+    None,
+  );
   let Some(mut surface) = surfaces::wrap_pixels(&info, y_plane, linesize as usize, None) else {
     return;
   };
@@ -312,7 +340,8 @@ impl RtmpsPublisher {
     println!(
       "RtmpsPublisher: encoder {} opened, {}x{}, extradata {} bytes",
       unsafe { std::ffi::CStr::from_ptr((*codec).name) }.to_string_lossy(),
-      width, height,
+      width,
+      height,
       unsafe { (*codec_ctx).extradata_size }
     );
 
@@ -451,7 +480,9 @@ impl RtmpsPublisher {
       (*self.frame).pts = pts;
     }
 
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string();
+    let now = chrono::Local::now()
+      .format("%Y-%m-%d %H:%M:%S%.3f")
+      .to_string();
     draw_overlay_text(self.frame, &now);
 
     self.encode_and_write(self.frame)
@@ -464,7 +495,10 @@ impl RtmpsPublisher {
   fn encode_and_write(&mut self, frame: *mut ffi::AVFrame) -> Result<(), String> {
     let ret = unsafe { ffi::avcodec_send_frame(self.codec_ctx, frame) };
     if ret < 0 {
-      return Err(format!("avcodec_send_frame failed: {}", av_error_string(ret)));
+      return Err(format!(
+        "avcodec_send_frame failed: {}",
+        av_error_string(ret)
+      ));
     }
 
     loop {
@@ -562,12 +596,7 @@ mod tests {
 
       let path = std::env::temp_dir().join("rtmps_overlay_test.png");
       std::fs::write(&path, data.as_bytes()).unwrap();
-      println!(
-        "wrote {} ({}x{})",
-        path.display(),
-        width,
-        height
-      );
+      println!("wrote {} ({}x{})", path.display(), width, height);
 
       ffi::av_frame_free(&mut frame);
     }

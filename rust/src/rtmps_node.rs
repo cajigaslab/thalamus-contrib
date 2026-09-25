@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 
 use crate::api::{
-  Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OnDrop,
-  PredropToken, Request, State, StateAction, StateKey, StateValue, ThalamusAPI,
+  Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken,
+  OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
 use crate::rtmps_publisher::{FrameBuf, RtmpsPublisher};

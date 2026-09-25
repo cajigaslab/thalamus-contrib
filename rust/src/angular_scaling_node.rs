@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::api::{
-  AnalogData, ImageData, Json, MainThreadToken, MocapData, Node, NodeConsts, NodeData, NodeSelector,
-  NodeToken, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue,
+  AnalogData, ImageData, Json, MainThreadToken, MocapData, Node, NodeConsts, NodeData,
+  NodeSelector, NodeToken, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue,
   THALAMUS_MODALITY_ANALOG, ThalamusAPI,
 };
 
@@ -74,11 +74,14 @@ fn root_state(state: &State) -> State {
 /// `eye_tracking::refresh_angular_scaling` in rust-executor's
 /// `src/eye_tracking.rs`.
 fn parse_angular_scaling(eye_scaling: &State) -> AngularScaling {
-  let model =
-    state_get_dict(eye_scaling, "Models").and_then(|models| state_get_dict(&models, "Angular Scaling"));
+  let model = state_get_dict(eye_scaling, "Models")
+    .and_then(|models| state_get_dict(&models, "Angular Scaling"));
 
   let Some(model) = model else {
-    return AngularScaling { pins: Vec::new(), scale_default: 100.0 };
+    return AngularScaling {
+      pins: Vec::new(),
+      scale_default: 100.0,
+    };
   };
 
   let scale_default = state_get_f64(&model, "Scale Default").unwrap_or(100.0);
@@ -86,12 +89,16 @@ fn parse_angular_scaling(eye_scaling: &State) -> AngularScaling {
   let mut pins = Vec::new();
   if let Some(pin_list) = state_get_list(&model, "Pins") {
     for entry in &pin_list {
-      let StateValue::Dict(pin) = entry.val else { continue };
+      let StateValue::Dict(pin) = entry.val else {
+        continue;
+      };
 
       let mut notches = vec![(0.0, 0.0)];
       if let Some(notch_list) = state_get_list(&pin, "Notches") {
         for notch_entry in &notch_list {
-          let StateValue::Dict(notch) = notch_entry.val else { continue };
+          let StateValue::Dict(notch) = notch_entry.val else {
+            continue;
+          };
           notches.push((
             state_get_f64(&notch, "Eye").unwrap_or(0.0),
             state_get_f64(&notch, "Screen").unwrap_or(0.0),
@@ -107,7 +114,10 @@ fn parse_angular_scaling(eye_scaling: &State) -> AngularScaling {
     }
   }
 
-  AngularScaling { pins, scale_default }
+  AngularScaling {
+    pins,
+    scale_default,
+  }
 }
 
 /// Piecewise-linear interpolation matching `numpy.interp`: `xp` must be
@@ -386,7 +396,10 @@ impl Node for AngularScalingNode {
     let eye_scaling_state = state_get_dict(&root_state(&state), "eye_scaling");
     let angular_scaling = Arc::new(Mutex::new(match &eye_scaling_state {
       Some(eye_scaling_state) => parse_angular_scaling(eye_scaling_state),
-      None => AngularScaling { pins: Vec::new(), scale_default: 100.0 },
+      None => AngularScaling {
+        pins: Vec::new(),
+        scale_default: 100.0,
+      },
     }));
 
     let inner = Rc::new(RefCell::new(Inner {
@@ -404,9 +417,10 @@ impl Node for AngularScalingNode {
     if let Some(eye_scaling_state) = eye_scaling_state {
       let refresh_ref = Arc::clone(&angular_scaling);
       let eye_scaling_for_refresh = eye_scaling_state.clone();
-      let eye_scaling_connection = eye_scaling_state.connect(move |_source, _action, _key, _value| {
-        *refresh_ref.lock().unwrap() = parse_angular_scaling(&eye_scaling_for_refresh);
-      });
+      let eye_scaling_connection =
+        eye_scaling_state.connect(move |_source, _action, _key, _value| {
+          *refresh_ref.lock().unwrap() = parse_angular_scaling(&eye_scaling_for_refresh);
+        });
       inner.borrow_mut().eye_scaling_connection = Some(eye_scaling_connection);
     }
 

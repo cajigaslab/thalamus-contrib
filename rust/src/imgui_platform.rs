@@ -43,7 +43,10 @@ impl ImguiPlatform {
   /// the process-wide QUIT event.
   pub fn new(api: ThalamusAPI, ctx: &mut Context, window_id: u32) -> ImguiPlatform {
     ctx.set_ini_filename(None);
-    ctx.io_mut().backend_flags.insert(imgui::BackendFlags::HAS_MOUSE_CURSORS);
+    ctx
+      .io_mut()
+      .backend_flags
+      .insert(imgui::BackendFlags::HAS_MOUSE_CURSORS);
     ctx.set_clipboard_backend(ThalamusClipboard { api });
 
     let events: Rc<RefCell<VecDeque<THALAMUS_SDL_Event>>> = Rc::new(RefCell::new(VecDeque::new()));
@@ -99,7 +102,11 @@ impl ImguiPlatform {
   }
 
   fn sync_cursor(&mut self, ctx: &mut Context) {
-    let cursor = if ctx.io().mouse_draw_cursor { None } else { ctx.mouse_cursor() };
+    let cursor = if ctx.io().mouse_draw_cursor {
+      None
+    } else {
+      ctx.mouse_cursor()
+    };
     if self.last_cursor == Some(cursor) {
       return;
     }
@@ -144,10 +151,14 @@ impl ImguiPlatform {
           self.should_close = true;
         }
       }
-      THALAMUS_SDL_EVENT_WINDOW_FOCUS_LOST if unsafe { event.window }.windowID == self.window_id => {
+      THALAMUS_SDL_EVENT_WINDOW_FOCUS_LOST
+        if unsafe { event.window }.windowID == self.window_id =>
+      {
         ctx.io_mut().app_focus_lost = true;
       }
-      THALAMUS_SDL_EVENT_WINDOW_FOCUS_GAINED if unsafe { event.window }.windowID == self.window_id => {
+      THALAMUS_SDL_EVENT_WINDOW_FOCUS_GAINED
+        if unsafe { event.window }.windowID == self.window_id =>
+      {
         ctx.io_mut().app_focus_lost = false;
       }
       THALAMUS_SDL_EVENT_MOUSE_MOTION => {
@@ -160,7 +171,9 @@ impl ImguiPlatform {
         let button_event = unsafe { event.button };
         if button_event.windowID == self.window_id {
           if let Some(button) = Self::mouse_button(button_event.button) {
-            ctx.io_mut().add_mouse_button_event(button, t == THALAMUS_SDL_EVENT_MOUSE_BUTTON_DOWN);
+            ctx
+              .io_mut()
+              .add_mouse_button_event(button, t == THALAMUS_SDL_EVENT_MOUSE_BUTTON_DOWN);
           }
         }
       }
@@ -174,7 +187,9 @@ impl ImguiPlatform {
         let key_event = unsafe { event.key };
         if key_event.windowID == self.window_id {
           if let Some(key) = Self::map_key(key_event.scancode) {
-            ctx.io_mut().add_key_event(key, t == THALAMUS_SDL_EVENT_KEY_DOWN);
+            ctx
+              .io_mut()
+              .add_key_event(key, t == THALAMUS_SDL_EVENT_KEY_DOWN);
           }
         }
       }
@@ -196,15 +211,49 @@ impl ImguiPlatform {
   /// is mapped here -- extend as needed.
   fn map_key(scancode: THALAMUS_SDL_Scancode) -> Option<Key> {
     Some(match scancode {
-      4 => Key::A, 5 => Key::B, 6 => Key::C, 7 => Key::D, 8 => Key::E,
-      9 => Key::F, 10 => Key::G, 11 => Key::H, 12 => Key::I, 13 => Key::J,
-      14 => Key::K, 15 => Key::L, 16 => Key::M, 17 => Key::N, 18 => Key::O,
-      19 => Key::P, 20 => Key::Q, 21 => Key::R, 22 => Key::S, 23 => Key::T,
-      24 => Key::U, 25 => Key::V, 26 => Key::W, 27 => Key::X, 28 => Key::Y, 29 => Key::Z,
-      40 => Key::Enter, 41 => Key::Escape, 42 => Key::Backspace, 43 => Key::Tab, 44 => Key::Space,
-      79 => Key::RightArrow, 80 => Key::LeftArrow, 81 => Key::DownArrow, 82 => Key::UpArrow,
-      224 => Key::LeftCtrl, 225 => Key::LeftShift, 226 => Key::LeftAlt, 227 => Key::LeftSuper,
-      228 => Key::RightCtrl, 229 => Key::RightShift, 230 => Key::RightAlt, 231 => Key::RightSuper,
+      4 => Key::A,
+      5 => Key::B,
+      6 => Key::C,
+      7 => Key::D,
+      8 => Key::E,
+      9 => Key::F,
+      10 => Key::G,
+      11 => Key::H,
+      12 => Key::I,
+      13 => Key::J,
+      14 => Key::K,
+      15 => Key::L,
+      16 => Key::M,
+      17 => Key::N,
+      18 => Key::O,
+      19 => Key::P,
+      20 => Key::Q,
+      21 => Key::R,
+      22 => Key::S,
+      23 => Key::T,
+      24 => Key::U,
+      25 => Key::V,
+      26 => Key::W,
+      27 => Key::X,
+      28 => Key::Y,
+      29 => Key::Z,
+      40 => Key::Enter,
+      41 => Key::Escape,
+      42 => Key::Backspace,
+      43 => Key::Tab,
+      44 => Key::Space,
+      79 => Key::RightArrow,
+      80 => Key::LeftArrow,
+      81 => Key::DownArrow,
+      82 => Key::UpArrow,
+      224 => Key::LeftCtrl,
+      225 => Key::LeftShift,
+      226 => Key::LeftAlt,
+      227 => Key::LeftSuper,
+      228 => Key::RightCtrl,
+      229 => Key::RightShift,
+      230 => Key::RightAlt,
+      231 => Key::RightSuper,
       _ => return None,
     })
   }

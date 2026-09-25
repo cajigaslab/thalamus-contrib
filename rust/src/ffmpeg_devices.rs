@@ -290,7 +290,12 @@ pub fn list_formats(device_name: &str) -> Result<String, String> {
   let opt_key_cstr = CString::new(opt_key).unwrap();
   let opt_val_cstr = CString::new(opt_val).unwrap();
   unsafe {
-    ffi::av_dict_set(&mut options, opt_key_cstr.as_ptr(), opt_val_cstr.as_ptr(), 0);
+    ffi::av_dict_set(
+      &mut options,
+      opt_key_cstr.as_ptr(),
+      opt_val_cstr.as_ptr(),
+      0,
+    );
   }
 
   *PROBE_LOG.lock().unwrap() = String::new();
@@ -326,13 +331,13 @@ fn plane_layout(format: ImageFormat, width: u64, height: u64) -> Vec<(u64, u64)>
     ImageFormat::Gray => vec![(width, height)],
     ImageFormat::RGB | ImageFormat::BGR => vec![(width * 3, height)],
     ImageFormat::YUYV422 => vec![(width * 2, height)],
-    ImageFormat::NV12 => vec![(width, height*3/2)],
+    ImageFormat::NV12 => vec![(width, height * 3 / 2)],
     ImageFormat::YUV420P | ImageFormat::YUVJ420P => {
       let chroma_w = width.div_ceil(2);
       let chroma_h = height.div_ceil(2);
       vec![(width, height), (chroma_w, chroma_h), (chroma_w, chroma_h)]
-    },
-    ImageFormat::MJPEG => panic!("Unsupported Format: MJPEG")
+    }
+    ImageFormat::MJPEG => panic!("Unsupported Format: MJPEG"),
   }
 }
 
