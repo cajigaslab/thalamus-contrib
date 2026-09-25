@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
 
 use crate::api::{
-  Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken,
-  OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue, ThalamusAPI,
+  MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken,
+  OnDrop, PredropToken, State, StateAction, StateKey, StateValue, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
 use crate::rtmps_publisher::{FrameBuf, RtmpsPublisher};
@@ -183,11 +183,6 @@ fn stop_publishing<F: FnOnce() + 'static>(inner: &Rc<RefCell<RtmpsNodeInner>>, o
 impl NodeConsts for RtmpsNode {}
 
 impl Node for RtmpsNode {
-  fn process(&self, handle: Request, _request: Json) {
-    let api = self.inner.borrow().api;
-    handle.respond(&Json::from_string(api, "null"));
-  }
-
   fn new(api: ThalamusAPI, _node_token: NodeToken, state: State, token: MainThreadToken) -> Self {
     let inner = Rc::new(RefCell::new(RtmpsNodeInner {
       api,

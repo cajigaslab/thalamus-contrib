@@ -1,12 +1,13 @@
 use std::cell::RefCell;
 use std::os::raw::c_char;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::api::{
-  AnalogData, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node,
+  AnalogData, DialogType, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node,
   NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, PredropToken, Request, State,
   StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, TaskScope, ThalamusAPI,
   ThalamusAPIThreadSafe, run_task,
@@ -147,6 +148,29 @@ unsafe impl Sync for Uc480Lib {}
 
 static UC480: OnceLock<Result<(Uc480Lib, Vec<CameraInfo>), String>> = OnceLock::new();
 
+/// Cameras (by device ID) with a capture thread, across all Thorcam nodes.
+/// Each maps to the ID of the run that flagged it, so a finished run's
+/// post_to_main cleanup can't clear the flag of a newer run of the same camera.
+static RUNNING_CAMERAS: Mutex<BTreeMap<u32, u64>> = Mutex::new(BTreeMap::new());
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(0);
+
+fn camera_running(camera: &CameraInfo) -> bool {
+  RUNNING_CAMERAS.lock().unwrap().contains_key(&camera.device_id)
+}
+
+fn mark_camera_running(camera: &CameraInfo) -> u64 {
+  let run_id = NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed);
+  RUNNING_CAMERAS.lock().unwrap().insert(camera.device_id, run_id);
+  run_id
+}
+
+fn mark_camera_stopped(device_id: u32, run_id: u64) {
+  let mut running = RUNNING_CAMERAS.lock().unwrap();
+  if running.get(&device_id) == Some(&run_id) {
+    running.remove(&device_id);
+  }
+}
+
 fn cstr_bytes_to_string(bytes: &[u8]) -> String {
   let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
   String::from_utf8_lossy(&bytes[..end]).to_string()
@@ -259,53 +283,6 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
   ))
 }
 
-/// The camera's actual settings, mirrored into the node's "Camera Values" dict
-/// (and, on a sync, the config keys of the same name) like GenicamNode does.
-/// ExposureTime is in microseconds, as in the genicam widget.
-#[derive(Clone, Copy, Debug)]
-struct CameraValues {
-  width_max: i64,
-  height_max: i64,
-  width: i64,
-  height: i64,
-  offset_x: i64,
-  offset_y: i64,
-  exposure_time: f64,
-  frame_rate: f64,
-  gain: f64,
-}
-
-/// What the config asks for; `None` for keys that aren't set.
-#[derive(Clone, Copy, Debug, Default)]
-struct RequestedValues {
-  width: Option<i64>,
-  height: Option<i64>,
-  offset_x: Option<i64>,
-  offset_y: Option<i64>,
-  exposure_time: Option<f64>,
-  frame_rate: Option<f64>,
-  gain: Option<f64>,
-}
-
-impl RequestedValues {
-  fn read(state: &State) -> RequestedValues {
-    let number = |key: &str| -> Option<f64> {
-      state
-        .get(StateKey::String(key.to_string()))
-        .and_then(|v| f64::try_from(v).ok())
-    };
-    RequestedValues {
-      width: number("Width").map(|v| v as i64),
-      height: number("Height").map(|v| v as i64),
-      offset_x: number("OffsetX").map(|v| v as i64),
-      offset_y: number("OffsetY").map(|v| v as i64),
-      exposure_time: number("ExposureTime"),
-      frame_rate: number("AcquisitionFrameRate"),
-      gain: number("Gain"),
-    }
-  }
-}
-
 impl Uc480Lib {
   /// Opens the camera just long enough to run `f`. Only valid while the camera
   /// thread isn't holding the camera.
@@ -333,265 +310,10 @@ impl Uc480Lib {
     };
     if ret == 0 { Some(value) } else { None }
   }
-
-  /// Same as GenicamNode::sanitize_camera: manual gain/exposure/frame rate.
-  fn sanitize(&self, h_cam: u32) {
-    for param in [
-      IS_SET_ENABLE_AUTO_GAIN,
-      IS_SET_ENABLE_AUTO_SHUTTER,
-      IS_SET_ENABLE_AUTO_FRAMERATE,
-    ] {
-      let mut off = 0.0f64;
-      let mut unused = 0.0f64;
-      // Not every camera has every auto mode, so errors are expected and ignored.
-      unsafe { (self.set_auto_parameter)(h_cam, param, &mut off, &mut unused) };
-    }
-  }
-
-  fn read_values(&self, h_cam: u32) -> Option<CameraValues> {
-    let mut info = unsafe { std::mem::zeroed::<SensorInfoRaw>() };
-    let ret = unsafe { (self.get_sensor_info)(h_cam, &mut info) };
-    if ret != 0 {
-      println!("ThorcamNode: is_GetSensorInfo failed: {}", ret);
-      return None;
-    }
-    let Some(rect) = self.aoi_query::<IsRect>(h_cam, IS_AOI_IMAGE_GET_AOI) else {
-      println!("ThorcamNode: is_AOI(GET_AOI) failed");
-      return None;
-    };
-
-    let mut exposure_ms = 0.0f64;
-    let ret = unsafe {
-      (self.exposure)(
-        h_cam,
-        IS_EXPOSURE_CMD_GET_EXPOSURE,
-        &mut exposure_ms as *mut f64 as *mut std::ffi::c_void,
-        8,
-      )
-    };
-    if ret != 0 {
-      println!("ThorcamNode: is_Exposure(GET_EXPOSURE) failed: {}", ret);
-    }
-
-    let mut frame_rate = 0.0f64;
-    let ret = unsafe { (self.set_frame_rate)(h_cam, IS_GET_FRAMERATE, &mut frame_rate) };
-    if ret != 0 {
-      println!("ThorcamNode: is_SetFrameRate(GET) failed: {}", ret);
-    }
-
-    let gain = unsafe {
-      (self.set_hardware_gain)(
-        h_cam,
-        IS_GET_MASTER_GAIN,
-        IS_IGNORE_PARAMETER,
-        IS_IGNORE_PARAMETER,
-        IS_IGNORE_PARAMETER,
-      )
-    };
-
-    Some(CameraValues {
-      width_max: info.n_max_width as i64,
-      height_max: info.n_max_height as i64,
-      width: rect.width as i64,
-      height: rect.height as i64,
-      offset_x: rect.x as i64,
-      offset_y: rect.y as i64,
-      exposure_time: exposure_ms * 1000.0,
-      frame_rate,
-      gain: gain as f64,
-    })
-  }
-
-  /// Sets the region of interest, rounding to what the sensor supports. Only
-  /// valid while the camera isn't streaming, the image buffers are sized to it.
-  fn write_aoi(&self, h_cam: u32, requested: &RequestedValues) {
-    if requested.width.is_none()
-      && requested.height.is_none()
-      && requested.offset_x.is_none()
-      && requested.offset_y.is_none()
-    {
-      return;
-    }
-    let Some(current) = self.aoi_query::<IsRect>(h_cam, IS_AOI_IMAGE_GET_AOI) else {
-      return;
-    };
-    let mut info = unsafe { std::mem::zeroed::<SensorInfoRaw>() };
-    if unsafe { (self.get_sensor_info)(h_cam, &mut info) } != 0 {
-      return;
-    }
-    let size_min = self
-      .aoi_query::<IsSize2d>(h_cam, IS_AOI_IMAGE_GET_SIZE_MIN)
-      .unwrap_or(IsSize2d {
-        width: 1,
-        height: 1,
-      });
-    let size_inc = self
-      .aoi_query::<IsSize2d>(h_cam, IS_AOI_IMAGE_GET_SIZE_INC)
-      .unwrap_or(IsSize2d {
-        width: 1,
-        height: 1,
-      });
-    let pos_inc = self
-      .aoi_query::<IsPoint2d>(h_cam, IS_AOI_IMAGE_GET_POS_INC)
-      .unwrap_or(IsPoint2d { x: 1, y: 1 });
-
-    let fit_size = |wanted: i64, min: i32, inc: i32, max: i64| -> i64 {
-      let inc = inc.max(1) as i64;
-      let min = (min.max(1) as i64).min(max);
-      (wanted.clamp(min, max) / inc * inc).max(min)
-    };
-    let fit_offset = |wanted: i64, inc: i32, size: i64, max: i64| -> i64 {
-      let inc = inc.max(1) as i64;
-      (wanted.clamp(0, (max - size).max(0)) / inc) * inc
-    };
-
-    let width = fit_size(
-      requested.width.unwrap_or(current.width as i64),
-      size_min.width,
-      size_inc.width,
-      info.n_max_width as i64,
-    );
-    let height = fit_size(
-      requested.height.unwrap_or(current.height as i64),
-      size_min.height,
-      size_inc.height,
-      info.n_max_height as i64,
-    );
-    let mut rect = IsRect {
-      x: fit_offset(
-        requested.offset_x.unwrap_or(current.x as i64),
-        pos_inc.x,
-        width,
-        info.n_max_width as i64,
-      ) as i32,
-      y: fit_offset(
-        requested.offset_y.unwrap_or(current.y as i64),
-        pos_inc.y,
-        height,
-        info.n_max_height as i64,
-      ) as i32,
-      width: width as i32,
-      height: height as i32,
-    };
-    let ret = unsafe {
-      (self.aoi)(
-        h_cam,
-        IS_AOI_IMAGE_SET_AOI,
-        &mut rect as *mut IsRect as *mut std::ffi::c_void,
-        std::mem::size_of::<IsRect>() as u32,
-      )
-    };
-    if ret != 0 {
-      println!("ThorcamNode: is_AOI(SET_AOI) failed: {}", ret);
-    }
-  }
-
-  /// Writes the requested values to the camera. The region of interest is
-  /// first since it limits the frame rate, and the frame rate limits exposure.
-  fn write_values(&self, h_cam: u32, requested: &RequestedValues, allow_aoi: bool) {
-    if allow_aoi {
-      self.write_aoi(h_cam, requested);
-    }
-    if let Some(frame_rate) = requested.frame_rate {
-      let mut actual = 0.0f64;
-      let ret = unsafe { (self.set_frame_rate)(h_cam, frame_rate, &mut actual) };
-      if ret != 0 {
-        println!("ThorcamNode: is_SetFrameRate failed: {}", ret);
-      }
-    }
-    if let Some(exposure_time) = requested.exposure_time {
-      let mut exposure_ms = exposure_time / 1000.0;
-      let ret = unsafe {
-        (self.exposure)(
-          h_cam,
-          IS_EXPOSURE_CMD_SET_EXPOSURE,
-          &mut exposure_ms as *mut f64 as *mut std::ffi::c_void,
-          8,
-        )
-      };
-      if ret != 0 {
-        println!("ThorcamNode: is_Exposure(SET_EXPOSURE) failed: {}", ret);
-      }
-    }
-    if let Some(gain) = requested.gain {
-      let master = gain.round().clamp(0.0, 100.0) as i32;
-      let ret = unsafe {
-        (self.set_hardware_gain)(
-          h_cam,
-          master,
-          IS_IGNORE_PARAMETER,
-          IS_IGNORE_PARAMETER,
-          IS_IGNORE_PARAMETER,
-        )
-      };
-      if ret != 0 {
-        println!("ThorcamNode: is_SetHardwareGain failed: {}", ret);
-      }
-    }
-  }
 }
 
 fn camera_label(camera: &CameraInfo) -> String {
   format!("{}:{}", camera.model, camera.serial_number)
-}
-
-/// The camera named by the "Camera" key (as listed by get_cameras), or the
-/// first camera when none is chosen yet.
-fn selected_device_id(state: &State) -> Option<u32> {
-  let (_, cameras) = UC480.get()?.as_ref().ok()?;
-  match state.get(StateKey::String("Camera".to_string())) {
-    Some(StateValue::String(name)) if !name.is_empty() => {
-      let found = cameras.iter().find(|c| camera_label(c) == name);
-      if found.is_none() {
-        println!("ThorcamNode: camera '{}' not found", name);
-      }
-      found.map(|c| c.device_id)
-    }
-    _ => cameras.first().map(|c| c.device_id),
-  }
-}
-
-enum Number {
-  Int(i64),
-  Float(f64),
-}
-
-impl Number {
-  fn value(&self) -> StateValue {
-    match self {
-      Number::Int(i) => StateValue::Int(*i),
-      Number::Float(f) => StateValue::Float(*f),
-    }
-  }
-}
-
-/// Writes `values` to "Camera Values", and to the config keys of the same name,
-/// either always (`overwrite`, a sync) or only where the config has no value yet.
-/// Main thread only.
-fn publish_values(state: &State, values: &CameraValues, overwrite: bool) {
-  let camera_values = match state.get(StateKey::String("Camera Values".to_string())) {
-    Some(StateValue::Dict(dict)) => Some(dict),
-    _ => None,
-  };
-  let numbers = [
-    ("WidthMax", Number::Int(values.width_max)),
-    ("HeightMax", Number::Int(values.height_max)),
-    ("Width", Number::Int(values.width)),
-    ("Height", Number::Int(values.height)),
-    ("OffsetX", Number::Int(values.offset_x)),
-    ("OffsetY", Number::Int(values.offset_y)),
-    ("ExposureTime", Number::Float(values.exposure_time)),
-    ("AcquisitionFrameRate", Number::Float(values.frame_rate)),
-    ("Gain", Number::Float(values.gain)),
-  ];
-  for (key, number) in numbers.iter() {
-    if let Some(dict) = &camera_values {
-      dict.set(StateKey::String(key.to_string()), number.value());
-    }
-    if overwrite || !state.contains_key(StateKey::String(key.to_string())) {
-      state.set(StateKey::String(key.to_string()), number.value());
-    }
-  }
 }
 
 /// Latest camera frame handed off from the capture thread to the main
@@ -604,24 +326,16 @@ struct FrameSnapshot {
   height: u32,
 }
 
-struct ThorcamNodeInner {
+pub struct ThorcamNode {
   api: ThalamusAPI,
-  node_token: NodeToken,
   state: State,
-  state_connection: Option<OnDrop>,
+  _state_connection: OnDrop,
   camera_thread: Option<std::thread::JoinHandle<()>>,
   main_thread_token: MainThreadToken,
   viewer: Option<ImageViewer>,
   viewer_task: Option<TaskScope>,
   shared_frame: Arc<Mutex<Option<FrameSnapshot>>>,
   signaler: Arc<OffMainSignaler>,
-  /// The camera thread's handle while it is streaming, so a sync can adjust the
-  /// running camera. Held locked by a sync so the thread can't close it mid-call.
-  live_handle: Arc<Mutex<Option<u32>>>,
-}
-
-pub struct ThorcamNode {
-  inner: Rc<RefCell<ThorcamNodeInner>>,
 }
 
 /// Reads `view_geometry` as `(x, y, w, h)` if the key exists and is a list
@@ -672,7 +386,7 @@ fn write_geometry(api: ThalamusAPI, state: &State, x: i32, y: i32, w: i32, h: i3
 /// alive by itself; see close_viewer for why.
 async fn viewer_tick_loop(
   api: ThalamusAPI,
-  inner: Weak<RefCell<ThorcamNodeInner>>,
+  inner: Weak<RefCell<ThorcamNode>>,
   initial_geometry: (i32, i32, i32, i32),
 ) {
   let timer = api.create_timer();
@@ -754,7 +468,7 @@ async fn viewer_tick_loop(
 /// Opens the preview window if it isn't already open, seeding its position
 /// from `view_geometry` (writing a default there first if it doesn't exist
 /// yet, matching the C++ ImageViewer constructor).
-fn open_viewer(inner: &Rc<RefCell<ThorcamNodeInner>>) {
+fn open_viewer(inner: &Rc<RefCell<ThorcamNode>>) {
   if inner.borrow().viewer.is_some() {
     return;
   }
@@ -805,287 +519,8 @@ fn open_viewer(inner: &Rc<RefCell<ThorcamNodeInner>>) {
 /// `.viewer` is gone on its own next tick and ends itself; `viewer_task` is
 /// only ever replaced (by open_viewer) or dropped (with the rest of
 /// ThorcamNodeInner) from contexts that are never inside its own poll.
-fn close_viewer(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-  inner.borrow_mut().viewer = None;
-}
-
-fn start_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-  let (api, device_id, requested, wrapped_state, shared_frame, signaler, live_handle) = {
-    let borrow = inner.borrow();
-    (
-      borrow.api,
-      selected_device_id(&borrow.state),
-      RequestedValues::read(&borrow.state),
-      MainThreadOnly::new(borrow.state.clone(), borrow.main_thread_token),
-      borrow.shared_frame.clone(),
-      borrow.signaler.clone(),
-      borrow.live_handle.clone(),
-    )
-  };
-
-  let Some(device_id) = device_id else {
-    println!("ThorcamNode: no cameras available");
-    return;
-  };
-
-  let mt_api = api.thread_safe();
-  signaler.unblock();
-  let handle = std::thread::spawn(move || {
-    run_camera(
-      mt_api,
-      signaler,
-      device_id,
-      requested,
-      wrapped_state,
-      shared_frame,
-      live_handle,
-    );
-  });
-
-  let mut borrow = inner.borrow_mut();
-  borrow.camera_thread = Some(handle);
-}
-
-/// Writes the config to the camera and reads back what it accepted into
-/// "Camera Values" and the config, like GenicamNode::sync_config. While
-/// streaming only exposure, gain and frame rate are written, the region of
-/// interest is fixed by the image buffers until the camera is restarted.
-fn sync_config(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-  let (state, live_handle) = {
-    let borrow = inner.borrow();
-    (borrow.state.clone(), borrow.live_handle.clone())
-  };
-  let Some((lib, _)) = UC480.get().and_then(|r| r.as_ref().ok()) else {
-    println!("ThorcamNode: uc480 not initialized");
-    return;
-  };
-  let requested = RequestedValues::read(&state);
-
-  let live = live_handle.lock().unwrap();
-  let values = match *live {
-    Some(h_cam) => {
-      lib.write_values(h_cam, &requested, false);
-      lib.read_values(h_cam)
-    }
-    None => {
-      let Some(device_id) = selected_device_id(&state) else {
-        println!("ThorcamNode: no cameras available");
-        return;
-      };
-      lib
-        .with_camera(device_id, |h_cam| {
-          lib.sanitize(h_cam);
-          lib.write_values(h_cam, &requested, true);
-          lib.read_values(h_cam)
-        })
-        .flatten()
-    }
-  };
-  drop(live);
-
-  if let Some(values) = values {
-    publish_values(&state, &values, true);
-  }
-}
-
-/// Reads the camera's values into "Camera Values", and into the config keys
-/// when `overwrite` is set (a different camera was chosen), otherwise only where
-/// the config has no value yet. Skipped while the camera thread owns the camera.
-fn refresh_camera_values(inner: &Rc<RefCell<ThorcamNodeInner>>, overwrite: bool) {
-  let (state, running) = {
-    let borrow = inner.borrow();
-    (borrow.state.clone(), borrow.camera_thread.is_some())
-  };
-  if running {
-    return;
-  }
-  let Some((lib, _)) = UC480.get().and_then(|r| r.as_ref().ok()) else {
-    return;
-  };
-  let Some(device_id) = selected_device_id(&state) else {
-    return;
-  };
-  // Read only: choosing a camera must not change what is programmed on it. The
-  // camera is only written to by a sync or when it starts running.
-  let values = lib
-    .with_camera(device_id, |h_cam| lib.read_values(h_cam))
-    .flatten();
-  if let Some(values) = values {
-    publish_values(&state, &values, overwrite);
-  }
-}
-
-fn stop_camera(inner: &Rc<RefCell<ThorcamNodeInner>>) {
-  let mut borrow = inner.borrow_mut();
-  borrow.signaler.block();
-  borrow.camera_thread.take().map(|h| h.join());
-}
-
-fn run_camera(
-  api: ThalamusAPIThreadSafe,
-  signaler: Arc<OffMainSignaler>,
-  device_id: u32,
-  requested: RequestedValues,
-  state: MainThreadOnly<State>,
-  shared_frame: Arc<Mutex<Option<FrameSnapshot>>>,
-  live_handle: Arc<Mutex<Option<u32>>>,
-) {
-  let lib = match UC480.get().and_then(|r| r.as_ref().ok()) {
-    Some((lib, _)) => lib,
-    None => {
-      println!("ThorcamNode: uc480 not initialized");
-      return;
-    }
-  };
-
-  let mut h_cam = device_id | IS_USE_DEVICE_ID;
-  let ret = unsafe { (lib.init_camera)(&mut h_cam, std::ptr::null_mut()) };
-  if ret != 0 {
-    println!("ThorcamNode: is_InitCamera failed: {}", ret);
-    return;
-  }
-
-  unsafe { (lib.set_color_mode)(h_cam, 6) }; // IS_CM_MONO8
-
-  // Same as GenicamNode::start_stream: sync the config to the camera, then read
-  // back what the camera actually accepted.
-  lib.sanitize(h_cam);
-  lib.write_values(h_cam, &requested, true);
-  let Some(values) = lib.read_values(h_cam) else {
-    unsafe { (lib.exit_camera)(h_cam) };
-    return;
-  };
-  println!("ThorcamNode: {:?}", values);
-  api.post_to_main(move |main_thread_token| {
-    let state = state.take(main_thread_token);
-    publish_values(&state, &values, true);
-  });
-
-  let width = values.width as u64;
-  let height = values.height as u64;
-  let frame_interval = if values.frame_rate > 0.0 {
-    Duration::from_secs_f64(1.0 / values.frame_rate)
-  } else {
-    Duration::from_nanos(16_666_667)
-  };
-
-  // Allocate a ring buffer of 3 frames for is_WaitForNextImage
-  const NUM_BUFS: usize = 3;
-  let mut bufs: Vec<(*mut c_char, i32)> = Vec::with_capacity(NUM_BUFS);
-  let mut alloc_ok = true;
-  for _ in 0..NUM_BUFS {
-    let mut p_mem: *mut c_char = std::ptr::null_mut();
-    let mut mem_id: i32 = 0;
-    let ret = unsafe {
-      (lib.alloc_image_mem)(
-        h_cam,
-        width as i32,
-        height as i32,
-        8,
-        &mut p_mem,
-        &mut mem_id,
-      )
-    };
-    if ret != 0 {
-      println!("ThorcamNode: is_AllocImageMem failed: {}", ret);
-      alloc_ok = false;
-      break;
-    }
-    let ret = unsafe { (lib.add_to_sequence)(h_cam, p_mem, mem_id) };
-    if ret != 0 {
-      println!("ThorcamNode: is_AddToSequence failed: {}", ret);
-      unsafe { (lib.free_image_mem)(h_cam, p_mem, mem_id) };
-      alloc_ok = false;
-      break;
-    }
-    bufs.push((p_mem, mem_id));
-  }
-  if !alloc_ok {
-    for (p, id) in bufs {
-      unsafe { (lib.free_image_mem)(h_cam, p, id) };
-    }
-    unsafe { (lib.exit_camera)(h_cam) };
-    return;
-  }
-
-  let ret = unsafe { (lib.init_image_queue)(h_cam, 0) };
-  if ret != 0 {
-    println!("ThorcamNode: is_InitImageQueue failed: {}", ret);
-    unsafe { (lib.clear_sequence)(h_cam) };
-    for (p, id) in bufs {
-      unsafe { (lib.free_image_mem)(h_cam, p, id) };
-    }
-    unsafe { (lib.exit_camera)(h_cam) };
-    return;
-  }
-
-  let ret = unsafe { (lib.capture_video)(h_cam, 0) }; // IS_DONT_WAIT
-  if ret != 0 {
-    println!("ThorcamNode: is_CaptureVideo failed: {}", ret);
-    unsafe { (lib.exit_image_queue)(h_cam) };
-    unsafe { (lib.clear_sequence)(h_cam) };
-    for (p, id) in bufs {
-      unsafe { (lib.free_image_mem)(h_cam, p, id) };
-    }
-    unsafe { (lib.exit_camera)(h_cam) };
-    return;
-  }
-
-  let frame_size = (width * height) as usize;
-
-  *live_handle.lock().unwrap() = Some(h_cam);
-
-  loop {
-    let mut next_mem: *mut c_char = std::ptr::null_mut();
-    let mut next_id: i32 = 0;
-    let ret = unsafe { (lib.wait_for_next_image)(h_cam, 1000, &mut next_mem, &mut next_id) };
-    if ret != 0 {
-      continue;
-    }
-
-    let data = ThorcamFrame {
-      frame_ptr: next_mem as *const u8,
-      frame_len: frame_size,
-      width,
-      height,
-      time: crate::api::time(api.raw),
-      frame_interval,
-    };
-
-    // Publishes directly from this thread; subscribers read plane() synchronously
-    // before this call returns. Ignore if the node was destroyed concurrently.
-    match signaler.ready(&data) {
-      Ok(v) => {
-        if !v {
-          break;
-        }
-      }
-      Err(_) => break,
-    };
-
-    // Copied out before unlock_seq_buf below hands the buffer back to the
-    // driver (which may overwrite it): the main-thread preview window
-    // reads this asynchronously, well after this call returns.
-    *shared_frame.lock().unwrap() = Some(FrameSnapshot {
-      data: data.plane(0).to_vec(),
-      width: width as u32,
-      height: height as u32,
-    });
-
-    unsafe { (lib.unlock_seq_buf)(h_cam, next_id, next_mem) };
-  }
-
-  // Taken under the lock so an in-flight sync finishes before the camera closes.
-  *live_handle.lock().unwrap() = None;
-
-  unsafe { (lib.stop_live_video)(h_cam, 1) }; // IS_WAIT
-  unsafe { (lib.exit_image_queue)(h_cam) };
-  unsafe { (lib.clear_sequence)(h_cam) };
-  for (p, id) in bufs {
-    unsafe { (lib.free_image_mem)(h_cam, p, id) };
-  }
-  unsafe { (lib.exit_camera)(h_cam) };
-  println!("ThorcamNode: camera thread exited");
+fn close_viewer(inner: &mut ThorcamNode) {
+  inner.viewer = None;
 }
 
 struct ThorcamFrame {
@@ -1142,9 +577,553 @@ impl NodeConsts for ThorcamNode {
   const SIGNALS_OFFMAIN: bool = true;
 }
 
-impl Node for ThorcamNode {
-  fn process(&self, handle: Request, request: Json) {
-    let api = self.inner.borrow().api;
+struct CameraSettings {
+  x: i32,
+  y: i32,
+  width: i32,
+  height: i32,
+  framerate: f64,
+  exposure_us: f64,
+  gain: f64,
+  max_width: i32,
+  max_height: i32,
+}
+
+impl ThorcamNode {
+  fn stop_loop(&mut self) {
+    self.signaler.block();
+    self.camera_thread.take().map(|h| h.join());
+  }
+
+  fn state_to_settings(&self, state: &State) -> Option<CameraSettings> {
+    let Some(StateValue::Int(x)) = state.get("OffsetX") else {
+      return None;
+    };
+    let Some(StateValue::Int(y)) = state.get("OffsetY") else {
+      return None;
+    };
+    let Some(StateValue::Int(width)) = state.get("Width") else {
+      return None;
+    };
+    let Some(StateValue::Int(height)) = state.get("Height") else {
+      return None;
+    };
+    let Some(StateValue::Float(framerate)) = state.get("AcquisitionFrameRate") else {
+      return None;
+    };
+    let Some(StateValue::Float(exposure_us)) = state.get("ExposureTime") else {
+      return None;
+    };
+    let Some(StateValue::Float(gain)) = state.get("Gain") else {
+      return None;
+    };
+    let Some(StateValue::Int(max_width)) = state.get("WidthMax") else {
+      return None;
+    };
+    let Some(StateValue::Int(max_height)) = state.get("HeightMax") else {
+      return None;
+    };
+
+    Some(CameraSettings {
+      x: x.try_into().unwrap(),
+      y: y.try_into().unwrap(),
+      width: width.try_into().unwrap(),
+      height: height.try_into().unwrap(),
+      framerate: framerate,
+      exposure_us: exposure_us,
+      gain: gain,
+      max_width: max_width.try_into().unwrap(),
+      max_height: max_height.try_into().unwrap(),
+    })
+  }
+
+  fn settings_to_state(&self, settings: &CameraSettings, state: &State, overwrite: bool) {
+    if overwrite || !state.contains_key("OffsetX") {
+      state.set("OffsetX", settings.x);
+    }
+    if overwrite || !state.contains_key("OffsetY") {
+      state.set("OffsetY", settings.y);
+    }
+    if overwrite || !state.contains_key("Width") {
+      state.set("Width", settings.width);
+    }
+    if overwrite || !state.contains_key("Height") {
+      state.set("Height", settings.height);
+    }
+    if overwrite || !state.contains_key("AcquisitionFrameRate") {
+      state.set("AcquisitionFrameRate", settings.framerate);
+    }
+    if overwrite || !state.contains_key("ExposureTime") {
+      state.set("ExposureTime", settings.exposure_us);
+    }
+    if overwrite || !state.contains_key("Gain") {
+      state.set("Gain", settings.gain);
+    }
+    if overwrite || !state.contains_key("WidthMax") {
+      state.set("WidthMax", settings.max_width);
+    }
+    if overwrite || !state.contains_key("HeightMax") {
+      state.set("HeightMax", settings.max_height);
+    }
+  }
+
+  fn settings_to_camera(settings: &CameraSettings, h_cam: u32) {
+    let (lib, _) = UC480.get().unwrap().as_ref().unwrap();
+
+    let mut off = 0.0f64;
+    let mut unused = 0.0f64;
+    unsafe { (lib.set_auto_parameter)(h_cam, IS_SET_ENABLE_AUTO_GAIN, &mut off, &mut unused) };
+    unsafe { (lib.set_auto_parameter)(h_cam, IS_SET_ENABLE_AUTO_SHUTTER, &mut off, &mut unused) };
+    unsafe { (lib.set_auto_parameter)(h_cam, IS_SET_ENABLE_AUTO_FRAMERATE, &mut off, &mut unused) };
+
+    let CameraSettings {
+      x, 
+      y, 
+      width, 
+      height, 
+      framerate, 
+      exposure_us, 
+      gain, 
+      ..
+    } = settings;
+
+    ThorcamNode::sync_aoi(h_cam, *x as i64, *y as i64, *width as i64, *height as i64);
+
+    let mut actual = 0.0;
+    let ret = unsafe { (lib.set_frame_rate)(h_cam, *framerate, &mut actual) };
+    if ret != 0 {
+      println!("ThorcamNode: is_SetFrameRate failed: {}", ret);
+    }
+
+    let mut exposure_ms = exposure_us / 1000.0;
+    let ret = unsafe {
+      (lib.exposure)(
+        h_cam,
+        IS_EXPOSURE_CMD_SET_EXPOSURE,
+        &mut exposure_ms as *mut f64 as *mut std::ffi::c_void,
+        8,
+      )
+    };
+    if ret != 0 {
+      println!("ThorcamNode: is_Exposure(SET_EXPOSURE) failed: {}", ret);
+    }
+
+    let master = gain.round().clamp(0.0, 100.0) as i32;
+    let ret = unsafe {
+      (lib.set_hardware_gain)(
+        h_cam,
+        master,
+        IS_IGNORE_PARAMETER,
+        IS_IGNORE_PARAMETER,
+        IS_IGNORE_PARAMETER,
+      )
+    };
+    if ret != 0 {
+      println!("ThorcamNode: is_SetHardwareGain failed: {}", ret);
+    }
+  }
+
+  fn camera_to_settings(h_cam: u32) -> Option<CameraSettings> {
+    let (lib, _) = UC480.get().unwrap().as_ref().unwrap();
+
+    let mut info = unsafe { std::mem::zeroed::<SensorInfoRaw>() };
+    let ret = unsafe { (lib.get_sensor_info)(h_cam, &mut info) };
+    if ret != 0 {
+      println!("ThorcamNode: is_GetSensorInfo failed: {}", ret);
+      return None;
+    }
+
+    let Some(rect) = lib.aoi_query::<IsRect>(h_cam, IS_AOI_IMAGE_GET_AOI) else {
+      println!("ThorcamNode: is_AOI(GET_AOI) failed");
+      return None;
+    };
+
+    let mut exposure_us = 0.0;
+    let ret = unsafe {
+      (lib.exposure)(
+        h_cam,
+        IS_EXPOSURE_CMD_GET_EXPOSURE,
+        &mut exposure_us as *mut f64 as *mut std::ffi::c_void,
+        8,
+      )
+    };
+    exposure_us *= 1000.0;
+    if ret != 0 {
+      println!("ThorcamNode: is_Exposure(GET_EXPOSURE) failed: {}", ret);
+      return None;
+    }
+
+    let mut framerate = 0.0;
+    let ret = unsafe { (lib.set_frame_rate)(h_cam, IS_GET_FRAMERATE, &mut framerate) };
+    if ret != 0 {
+      println!("ThorcamNode: is_SetFrameRate(GET) failed: {}", ret);
+      return None;
+    }
+
+    let gain = unsafe {
+      (lib.set_hardware_gain)(
+        h_cam,
+        IS_GET_MASTER_GAIN,
+        IS_IGNORE_PARAMETER,
+        IS_IGNORE_PARAMETER,
+        IS_IGNORE_PARAMETER,
+      )
+    };
+
+    Some(CameraSettings { 
+      x: rect.x, 
+      y: rect.y, 
+      width: rect.width, 
+      height: rect.height, 
+      framerate, 
+      exposure_us, 
+      gain: gain as f64, 
+      max_width: info.n_max_width.try_into().unwrap(),
+      max_height: info.n_max_height.try_into().unwrap(),
+     })
+  }
+
+  fn sync_aoi(h_cam: u32, x: i64, y: i64, width: i64, height: i64) {
+    let (lib, _) = UC480.get().unwrap().as_ref().unwrap();
+    
+    let size_min = lib
+      .aoi_query::<IsSize2d>(h_cam, IS_AOI_IMAGE_GET_SIZE_MIN)
+      .unwrap_or(IsSize2d {
+        width: 1,
+        height: 1,
+      });
+    let size_inc = lib
+      .aoi_query::<IsSize2d>(h_cam, IS_AOI_IMAGE_GET_SIZE_INC)
+      .unwrap_or(IsSize2d {
+        width: 1,
+        height: 1,
+      });
+    let pos_inc = lib
+      .aoi_query::<IsPoint2d>(h_cam, IS_AOI_IMAGE_GET_POS_INC)
+      .unwrap_or(IsPoint2d { x: 1, y: 1 });
+
+    let x = (x as i32) / pos_inc.x * pos_inc.x;
+    let y = (y as i32) / pos_inc.y * pos_inc.y;
+    let width = size_min.width.max((width as i32) / size_inc.width * size_inc.width);
+    let height = size_min.height.max((height as i32) / size_inc.height * size_inc.height);
+    let mut rect= IsRect { x, y, width, height };
+    
+    let ret = unsafe {
+      (lib.aoi)(
+        h_cam,
+        IS_AOI_IMAGE_SET_AOI,
+        &mut rect as *mut IsRect as *mut std::ffi::c_void,
+        std::mem::size_of::<IsRect>() as u32,
+      )
+    };
+    if ret != 0 {
+      println!("ThorcamNode: is_AOI(SET_AOI) failed: {}", ret);
+    }
+  }
+
+  fn get_camera(&self) -> Option<CameraInfo> {
+    let (_, cameras) = UC480.get().unwrap().as_ref().unwrap();
+    let camera_id = match self.state.get("Camera") {
+      Some(StateValue::String(v)) => {
+        v
+      },
+      _ => return None,
+    };
+    let camera_opt = cameras.iter().find(|c| {
+      camera_label(c) == camera_id
+    });
+
+    match camera_opt {
+      Some(c) => Some(c.clone()),
+      None => None
+    }
+  }
+
+  fn init_camera(camera: &CameraInfo) -> (u32, OnDrop) {
+    let (lib, _) = UC480.get().unwrap().as_ref().unwrap();
+
+    let mut h_cam = camera.device_id | IS_USE_DEVICE_ID;
+    let ret = unsafe { (lib.init_camera)(&mut h_cam, std::ptr::null_mut()) };
+    if ret != 0 {
+      println!("ThorcamNode: is_InitCamera failed: {}", ret);
+      return (0, OnDrop::noop());
+    } else {
+      return (h_cam, OnDrop::new(move || {
+        unsafe { (lib.exit_camera)(h_cam) };
+      }))
+    }
+  }
+
+  fn sync(&mut self) -> Option<CameraSettings> {
+    let Some(StateValue::Dict(mut desired)) = self.state.get("Desired") else {
+      return None;
+    };
+    let Some(StateValue::Dict(actual)) = self.state.get("Actual") else {
+      return None;
+    };
+    let Some(camera) = self.get_camera() else {
+      return None;
+    };
+    if camera_running(&camera) {
+      println!("ThorcamNode: can't sync running camera {}", camera_label(&camera));
+      return None;
+    }
+
+    let (h_cam, _drop) = ThorcamNode::init_camera(&camera);
+
+    //Create d2, fill it with the camera's current settings, merge desired into in.
+    //This results in a d2 containing the camera's current settings with requested settings.
+    //d2 is then saved to the state and written to the camera.
+    let Some(current) = ThorcamNode::camera_to_settings(h_cam) else {
+      return None;
+    };
+    let mut d2 = State::make_dict(self.api);
+    self.settings_to_state(&current, &d2, true);
+    d2.merge(&desired);
+    desired.assign(&d2);
+
+    //Write the desired settings to the camera and read back the result.
+    let Some(settings) = self.state_to_settings(&d2) else {
+      return None;
+    };
+    ThorcamNode::settings_to_camera(&settings, h_cam);
+    let Some(applied) = ThorcamNode::camera_to_settings(h_cam) else {
+      return None;
+    };
+    self.settings_to_state(&applied, &actual, true);
+
+    Some(applied)
+  }
+
+  fn read_camera(&mut self) {
+    let Some(StateValue::Dict(actual)) = self.state.get("Actual") else {
+      return;
+    };
+    let Some(StateValue::Dict(mut desired)) = self.state.get("Desired") else {
+      return;
+    };
+    let Some(camera) = self.get_camera() else {
+      return;
+    };
+    if camera_running(&camera) {
+      self.api.show_dialog("Thorcam", "Can't read settings from a running camera", DialogType::Warn);
+      return;
+    }
+
+    let (h_cam, _cam_drop) = ThorcamNode::init_camera(&camera);
+    let Some(current) = ThorcamNode::camera_to_settings(h_cam) else {
+      return;
+    };
+    self.settings_to_state(&current, &actual, true);
+
+    let mut d2 = State::make_dict(self.api);
+    self.settings_to_state(&current, &d2, true);
+    d2.merge(&desired);
+    desired.assign(&d2);
+  }
+
+  fn camera_loop(
+    api: ThalamusAPIThreadSafe, 
+    signaler: Arc<OffMainSignaler>, 
+    camera: CameraInfo, 
+    shared_frame: Arc<Mutex<Option<FrameSnapshot>>>, 
+    settings: Option<CameraSettings>) {
+    let (h_cam, _cam_drop) = ThorcamNode::init_camera(&camera);
+
+    match settings {
+      Some(settings) => ThorcamNode::settings_to_camera(&settings, h_cam),
+      None => {}
+    };
+
+    let Some(settings) = ThorcamNode::camera_to_settings(h_cam) else {
+      println!("ThorcamNode: Failed to read camera settings");
+      return;
+    };
+    let width = settings.width as u64;
+    let height = settings.height as u64;
+    let frame_interval = if settings.framerate > 0.0 {
+      Duration::from_secs_f64(1.0 / settings.framerate)
+    } else {
+      Duration::from_nanos(16_666_667)
+    };
+
+    let (lib, _) = UC480.get().unwrap().as_ref().unwrap();
+
+    unsafe { (lib.set_color_mode)(h_cam, 6) }; // IS_CM_MONO8
+
+    // Allocate a ring buffer of 3 frames for is_WaitForNextImage
+    const NUM_BUFS: usize = 3;
+    let mut bufs: Vec<(*mut c_char, i32)> = Vec::with_capacity(NUM_BUFS);
+    let mut alloc_ok = true;
+    for _ in 0..NUM_BUFS {
+      let mut p_mem: *mut c_char = std::ptr::null_mut();
+      let mut mem_id: i32 = 0;
+      let ret = unsafe {
+        (lib.alloc_image_mem)(
+          h_cam,
+          width as i32,
+          height as i32,
+          8,
+          &mut p_mem,
+          &mut mem_id,
+        )
+      };
+      if ret != 0 {
+        println!("ThorcamNode: is_AllocImageMem failed: {}", ret);
+        alloc_ok = false;
+        break;
+      }
+      let ret = unsafe { (lib.add_to_sequence)(h_cam, p_mem, mem_id) };
+      if ret != 0 {
+        println!("ThorcamNode: is_AddToSequence failed: {}", ret);
+        unsafe { (lib.free_image_mem)(h_cam, p_mem, mem_id) };
+        alloc_ok = false;
+        break;
+      }
+      bufs.push((p_mem, mem_id));
+    }
+    if !alloc_ok {
+      for (p, id) in bufs {
+        unsafe { (lib.free_image_mem)(h_cam, p, id) };
+      }
+      unsafe { (lib.exit_camera)(h_cam) };
+      return;
+    }
+
+    let ret = unsafe { (lib.init_image_queue)(h_cam, 0) };
+    if ret != 0 {
+      println!("ThorcamNode: is_InitImageQueue failed: {}", ret);
+      unsafe { (lib.clear_sequence)(h_cam) };
+      for (p, id) in bufs {
+        unsafe { (lib.free_image_mem)(h_cam, p, id) };
+      }
+      unsafe { (lib.exit_camera)(h_cam) };
+      return;
+    }
+
+    let ret = unsafe { (lib.capture_video)(h_cam, 0) }; // IS_DONT_WAIT
+    if ret != 0 {
+      println!("ThorcamNode: is_CaptureVideo failed: {}", ret);
+      unsafe { (lib.exit_image_queue)(h_cam) };
+      unsafe { (lib.clear_sequence)(h_cam) };
+      for (p, id) in bufs {
+        unsafe { (lib.free_image_mem)(h_cam, p, id) };
+      }
+      unsafe { (lib.exit_camera)(h_cam) };
+      return;
+    }
+
+    let frame_size = (width * height) as usize;
+
+    loop {
+      let mut next_mem: *mut c_char = std::ptr::null_mut();
+      let mut next_id: i32 = 0;
+      let ret = unsafe { (lib.wait_for_next_image)(h_cam, 1000, &mut next_mem, &mut next_id) };
+      if ret != 0 {
+        continue;
+      }
+
+      let data = ThorcamFrame {
+        frame_ptr: next_mem as *const u8,
+        frame_len: frame_size,
+        width,
+        height,
+        time: api.time(),
+        frame_interval,
+      };
+
+      // Publishes directly from this thread; subscribers read plane() synchronously
+      // before this call returns. Ignore if the node was destroyed concurrently.
+      match signaler.ready(&data) {
+        Ok(v) => {
+          if !v {
+            break;
+          }
+        }
+        Err(_) => break,
+      };
+
+      // Copied out before unlock_seq_buf below hands the buffer back to the
+      // driver (which may overwrite it): the main-thread preview window
+      // reads this asynchronously, well after this call returns.
+      *shared_frame.lock().unwrap() = Some(FrameSnapshot {
+        data: data.plane(0).to_vec(),
+        width: width as u32,
+        height: height as u32,
+      });
+
+      unsafe { (lib.unlock_seq_buf)(h_cam, next_id, next_mem) };
+    }
+  }
+
+  fn on_state(rc_this: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
+    let StateValue::String(key_str) = key else {
+      return;
+    };
+
+    match key_str.as_str() {
+      "Running" => {
+        let mut this = rc_this.borrow_mut();
+        this.stop_loop();
+        if value == StateValue::Bool(true) {
+          // Refuse to start if there's no camera or another run (possibly
+          // another node's) already has it, rather than taking it over.
+          let camera = match this.get_camera() {
+            Some(c) if camera_running(&c) => {
+              Err(format!("Camera {} is already running", camera_label(&c)))
+            }
+            Some(c) => Ok(c),
+            None => Err("No camera selected".to_string()),
+          };
+          let camera = match camera {
+            Ok(camera) => camera,
+            Err(message) => {
+              this.api.show_dialog("Thorcam", &message, DialogType::Error);
+              // Release the borrow first: if this set notifies synchronously it
+              // re-enters on_state, which borrows the node mutably.
+              let state = this.state.clone();
+              drop(this);
+              state.set("Running", false);
+              return;
+            }
+          };
+
+          let api = this.api.thread_safe();
+          let signaler = this.signaler.clone();
+          signaler.unblock();
+          let wrapped_state = MainThreadOnly::new(this.state.clone(), this.main_thread_token);
+          let settings = this.sync();
+          let shared_frame = this.shared_frame.clone();
+          let device_id = camera.device_id;
+          let run_id = mark_camera_running(&camera);
+          this.camera_thread = Some(std::thread::spawn(move || {
+            ThorcamNode::camera_loop(api, signaler, camera, shared_frame, settings);
+            api.post_to_main(move |main_thread_token| {
+              mark_camera_stopped(device_id, run_id);
+              let state = wrapped_state.take(main_thread_token);
+              state.set("Running", false);
+            });
+          }));
+        }
+      },
+      "Camera" => {
+        rc_this.borrow_mut().read_camera();
+      },
+      "View" => {
+        if value == StateValue::Bool(true) {
+          open_viewer(&rc_this);
+        } else {
+          close_viewer(&mut rc_this.borrow_mut());
+        }
+      }
+      _ => {}
+    }
+  }
+}
+
+impl ThorcamNode {
+  fn process(&mut self, handle: Request, request: Json) {
+    let api = self.api;
     let response = match serde_json::from_str::<serde_json::Value>(&request.to_string()) {
       Ok(serde_json::Value::String(s)) if s == "get_cameras" => {
         let cameras: Vec<serde_json::Value> = UC480
@@ -1160,19 +1139,25 @@ impl Node for ThorcamNode {
         serde_json::to_string(&cameras).unwrap()
       }
       Ok(serde_json::Value::String(s)) if s == "sync_config" => {
-        sync_config(&self.inner);
+        if self.get_camera().is_some_and(|camera| camera_running(&camera)) {
+          self.api.show_dialog("Thorcam", "Can't sync running camera", DialogType::Error);
+        } else {
+          self.sync();
+        }
         "null".to_string()
       }
       _ => "null".to_string(),
     };
     handle.respond(&Json::from_string(api, &response));
   }
+}
 
+impl Node for ThorcamNode {
   fn new(
     api: ThalamusAPI,
     node_token: NodeToken,
     state: State,
-    token: MainThreadToken,
+    main_thread_token: MainThreadToken,
   ) -> Rc<RefCell<Self>> {
     let init_result = UC480.get_or_init(load_uc480);
     match init_result {
@@ -1187,96 +1172,45 @@ impl Node for ThorcamNode {
       Err(e) => println!("ThorcamNode: uc480 init failed: {}", e),
     }
 
-    if state
-      .get(StateKey::String("Camera Values".to_string()))
-      .is_none()
-    {
-      state.set(
-        StateKey::String("Camera Values".to_string()),
-        StateValue::Dict(State::make_dict(api)),
-      );
-    }
+    let result = Rc::new_cyclic(|weak: &Weak<RefCell<Self>>| {
+      let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
 
-    let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
-    let inner = Rc::new(RefCell::new(ThorcamNodeInner {
-      api,
-      node_token,
-      state: state.clone(),
-      state_connection: None,
-      camera_thread: None,
-      main_thread_token: token,
-      viewer: None,
-      viewer_task: None,
-      shared_frame: Arc::new(Mutex::new(None)),
-      signaler,
-      live_handle: Arc::new(Mutex::new(None)),
-    }));
-
-    let change_ref = Rc::clone(&inner);
-    // The camera seen by the last "Camera" callback. The first one, from the
-    // recap of the saved config, must not replace the saved settings.
-    let mut last_camera: Option<String> = None;
-    let started = Rc::new(std::cell::Cell::new(false));
-    let started_in_callback = Rc::clone(&started);
-    let state_callback =
-      move |_source: State, _action: StateAction, key: StateValue, value: StateValue| {
-        let StateValue::String(key_str) = key else {
-          return;
-        };
-        match key_str.as_str() {
-          "Running" => {
-            stop_camera(&change_ref);
-            if value == StateValue::Bool(true) {
-              start_camera(&change_ref);
-            }
-          }
-          "Camera" => {
-            let StateValue::String(name) = value else {
-              return;
-            };
-            let changed =
-              started_in_callback.get() && last_camera.as_deref() != Some(name.as_str());
-            last_camera = Some(name);
-            if changed {
-              // The running camera is the old one, and its thread is holding it.
-              let running = change_ref.borrow().camera_thread.is_some();
-              if running {
-                stop_camera(&change_ref);
-                let state = change_ref.borrow().state.clone();
-                state.set(
-                  StateKey::String("Running".to_string()),
-                  StateValue::Bool(false),
-                );
-              }
-            }
-            refresh_camera_values(&change_ref, changed);
-          }
-          "View" => {
-            if value == StateValue::Bool(true) {
-              open_viewer(&change_ref);
-            } else {
-              close_viewer(&change_ref);
-            }
-          }
-          _ => {}
+      let weak2 = weak.clone();
+      let callback = move |source, action, key, value| {
+        if let Some(strong) = weak2.upgrade() {
+          ThorcamNode::on_state(strong, source, action, key, value);
         }
       };
+      let _state_connection = state.connect(callback);
+      RefCell::new(Self {
+        api,
+        _state_connection,
+        main_thread_token,
+        state: state.clone(),
+        signaler,
+        camera_thread: None,
+        viewer: None,
+        viewer_task: None,
+        shared_frame: Arc::new(Mutex::new(None)),
+      })
+    });
 
-    inner.borrow_mut().state_connection = Some(state.connect(state_callback));
+    let weak = Rc::downgrade(&result);
+    node_token.set_process(move |handle, request| {
+      if let Some(strong) = weak.upgrade() {
+        strong.borrow_mut().process(handle, request);
+      }
+    });
+
     state.recap();
-    started.set(true);
-    // No Camera chosen yet, so the recap above didn't load the values of the default camera.
-    if !state.contains_key(StateKey::String("Camera".to_string())) {
-      refresh_camera_values(&inner, false);
-    }
-
-    ThorcamNode { inner }
+    result.borrow_mut().sync();
+    result
   }
 }
 
 impl Drop for ThorcamNode {
   fn drop(&mut self) {
-    close_viewer(&self.inner);
-    stop_camera(&self.inner);
+    close_viewer(self);
+    self.stop_loop();
   }
 }

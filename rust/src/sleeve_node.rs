@@ -1,6 +1,6 @@
 use crate::api::{
-  self, AnalogData, Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken,
-  OnDrop, OnDropSend, Request, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG,
+  self, AnalogData, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken,
+  OnDrop, OnDropSend, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG,
   ThalamusAPI,
 };
 use crate::block as blk;
@@ -745,11 +745,6 @@ impl NodeConsts for SleeveNode {
 }
 
 impl Node for SleeveNode {
-  fn process(&self, handle: Request, _request: Json) {
-    let api = self.inner.lock().unwrap().api;
-    handle.respond(&Json::from_string(api, "null"));
-  }
-
   fn new(
     api: ThalamusAPI,
     node_token: NodeToken,

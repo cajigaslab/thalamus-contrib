@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::api::{
-  AnalogData, ImageData, Json, MainThreadToken, MocapData, Node, NodeConsts, NodeData,
-  NodeSelector, NodeToken, OnDrop, PredropToken, Request, State, StateAction, StateKey, StateValue,
+  AnalogData, ImageData, MainThreadToken, MocapData, Node, NodeConsts, NodeData,
+  NodeSelector, NodeToken, OnDrop, PredropToken, State, StateAction, StateKey, StateValue,
   THALAMUS_MODALITY_ANALOG, ThalamusAPI,
 };
 
@@ -387,11 +387,6 @@ impl NodeConsts for AngularScalingNode {
 }
 
 impl Node for AngularScalingNode {
-  fn process(&self, handle: Request, _request: Json) {
-    let api = self.inner.borrow().api;
-    handle.respond(&Json::from_string(api, "null"));
-  }
-
   fn new(api: ThalamusAPI, node_token: NodeToken, state: State, _token: MainThreadToken) -> Self {
     let eye_scaling_state = state_get_dict(&root_state(&state), "eye_scaling");
     let angular_scaling = Arc::new(Mutex::new(match &eye_scaling_state {

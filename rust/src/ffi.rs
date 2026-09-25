@@ -83,10 +83,16 @@ impl NodeHandle {
   }
 }
 
+pub(crate) type ProcessHandler = Box<dyn FnMut(crate::api::Request, crate::api::Json)>;
+
 pub(crate) struct PluginImpl {
   api: crate::api::ThalamusAPI,
   node_token: crate::api::NodeToken,
-  node: NodeHandle,
+  /// None only while Node::new is running.
+  node: Option<NodeHandle>,
+  /// Installed via NodeToken::set_process. Mutably borrowed while the handler
+  /// runs, so it can't be replaced during a process call.
+  pub(crate) process: std::cell::RefCell<ProcessHandler>,
   pub(crate) data: Option<&'static dyn NodeData>,
 }
 
@@ -251,7 +257,7 @@ pub extern "C" fn c_node_process(
     handle: arg1,
   };
   let json = crate::api::Json::new(_impl.api, arg2);
-  _impl.node.with_node(|node| node.process(handle, json));
+  (_impl.process.borrow_mut())(handle, json);
 }
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_predrop(raw_node: *mut ThalamusNode) {
@@ -262,7 +268,9 @@ pub extern "C" fn c_node_predrop(raw_node: *mut ThalamusNode) {
     api: _impl.api.raw,
     node: raw_node,
   };
-  _impl.node.with_node(|node| node.predrop(token));
+  if let Some(node) = &_impl.node {
+    node.with_node(|node| node.predrop(token));
+  }
 }
 
 pub extern "C" fn c_node_image_plane(
@@ -460,26 +468,37 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
   let api = ThalamusAPI { raw: api_raw };
   let node_token = crate::api::NodeToken::new(c_node);
 
+  // Allocated before T::new so NodeToken::set_process can reach it during
+  // construction. Requests get a null response until a handler is set.
+  let plugin_impl = Box::into_raw(Box::new(PluginImpl {
+    api,
+    node_token: node_token.clone(),
+    node: None,
+    process: std::cell::RefCell::new(Box::new(
+      move |handle: crate::api::Request, _: crate::api::Json| {
+        handle.respond(&crate::api::Json::from_string(api, "null"));
+      },
+    )),
+    data: None,
+  }));
+  c_node_ref.plugin_impl = plugin_impl as *mut ::std::os::raw::c_void;
+  c_node_ref.time_ns = Some(c_node_time_ns);
+  c_node_ref.process = Some(c_node_process);
+  c_node_ref.predrop = Some(c_node_predrop);
+
   let token = unsafe { crate::api::MainThreadToken::new_in_main_thread_callback() };
   let ctor = T::new(
     api,
-    node_token.clone(),
+    node_token,
     crate::api::State::new(api, state),
     token,
   );
   let modalities = T::MODALITIES;
   c_node_ref.signals_offmain = if T::SIGNALS_OFFMAIN { 1 } else { 0 };
 
-  let result = Box::new(PluginImpl {
-    api,
-    node_token,
-    node: ctor.into_node_handle(),
-    data: None,
-  });
-
-  c_node_ref.time_ns = Some(c_node_time_ns);
-  c_node_ref.process = Some(c_node_process);
-  c_node_ref.predrop = Some(c_node_predrop);
+  unsafe {
+    (*plugin_impl).node = Some(ctor.into_node_handle());
+  }
 
   if modalities & THALAMUS_MODALITY_ANALOG != 0 {
     wrap_analog(c_node_ref);
@@ -494,7 +513,6 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
     wrap_text(c_node_ref);
   }
 
-  c_node_ref.plugin_impl = Box::into_raw(result) as *mut ::std::os::raw::c_void;
   c_node
 }
 

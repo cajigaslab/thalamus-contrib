@@ -188,7 +188,7 @@ impl WebcamSettings {
 
 pub struct WebcamNode {
   api: ThalamusAPI,
-  _state_connection: Option<OnDrop>,
+  _state_connection: OnDrop,
   main_thread_token: MainThreadToken,
   state: State,
   signaler: Arc<OffMainSignaler>,
@@ -385,8 +385,8 @@ impl NodeConsts for WebcamNode {
   const SIGNALS_OFFMAIN: bool = true;
 }
 
-impl Node for WebcamNode {
-  fn process(&self, handle: Request, request: Json) {
+impl WebcamNode {
+  fn process(&mut self, handle: Request, request: Json) {
     let api = self.api;
     let request = serde_json::from_str::<serde_json::Value>(&request.to_string())
       .unwrap_or(serde_json::Value::Null);
@@ -418,14 +418,16 @@ impl Node for WebcamNode {
     };
     handle.respond(&Json::from_string(api, &response));
   }
+}
 
+impl Node for WebcamNode {
   fn new(
     api: ThalamusAPI,
     node_token: NodeToken,
     state: State,
     main_thread_token: MainThreadToken,
   ) -> Rc<RefCell<Self>> {
-    let result = Rc::new_cyclic(|weak: &Weak<RefCell<WebcamNode>>| {
+    let result = Rc::new_cyclic(|weak: &Weak<RefCell<Self>>| {
       let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
 
       let weak2 = weak.clone();
@@ -434,8 +436,8 @@ impl Node for WebcamNode {
           strong.borrow_mut().on_state(source, action, key, value);
         }
       };
-      let _state_connection = Some(state.connect(callback));
-      RefCell::new(WebcamNode {
+      let _state_connection = state.connect(callback);
+      RefCell::new(Self {
         api,
         _state_connection,
         main_thread_token,
@@ -446,6 +448,13 @@ impl Node for WebcamNode {
       })
     });
 
+    let weak = Rc::downgrade(&result);
+    node_token.set_process(move |handle, request| {
+      if let Some(strong) = weak.upgrade() {
+        strong.borrow_mut().process(handle, request);
+      }
+    });
+
     state.recap();
     result
   }
@@ -454,7 +463,6 @@ impl Node for WebcamNode {
 impl Drop for WebcamNode {
   fn drop(&mut self) {
     self.stop_webcam();
-    self._state_connection.take();
     self.state.set(
       api::StateKey::String("Running".to_string()),
       api::StateValue::Bool(false),

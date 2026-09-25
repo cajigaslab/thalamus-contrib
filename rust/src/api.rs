@@ -1,6 +1,6 @@
 use core::slice;
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -549,6 +549,32 @@ impl NodeToken {
     }
     Ok(f(*guard))
   }
+
+  /// Installs `process` as the handler for requests sent to this node,
+  /// replacing the previous one (initially a handler that responds null).
+  /// Does nothing if the node has been destroyed.
+  ///
+  /// Must be called on the main thread: the handler isn't required to be
+  /// Send (so it can capture Rc/Weak), and it is invoked and dropped there.
+  /// Must not be called from inside a process call.
+  pub fn set_process(&self, process: impl FnMut(Request, Json) + 'static) {
+    assert!(
+      is_main_thread(),
+      "NodeToken::set_process must be called on the main thread"
+    );
+    let previous = self.with(|node| unsafe {
+      // SAFETY: plugin_impl is allocated before Node::new runs and lives
+      // until destroy_node_template, which also nulls this token first.
+      let plugin_impl = &*plugin_impl_ptr(node);
+      let mut slot = plugin_impl
+        .process
+        .try_borrow_mut()
+        .expect("NodeToken::set_process must not be called during a process call");
+      std::mem::replace(&mut *slot, Box::new(process))
+    });
+    // Drop the old handler outside the token lock.
+    drop(previous);
+  }
 }
 
 pub struct OffMainSignaler {
@@ -600,6 +626,15 @@ impl Drop for OffMainSignaler {
       ((*self.api).node_offmain_signaler_destroy.unwrap())(self.signaler);
     }
   }
+}
+
+/// Severity of a dialog shown with ThalamusAPI::show_dialog.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum DialogType {
+  Info,
+  Warn,
+  Error,
+  Fatal,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -738,6 +773,34 @@ impl ThalamusAPI {
       let node_channels_changed = (&*self.raw).node_channels_changed.unwrap();
       node_channels_changed(node);
     })
+  }
+
+  /// Shows a dialog in the Thalamus UI. If the running Thalamus predates
+  /// dialog_show, the dialog is printed to stdout instead.
+  pub fn show_dialog(&self, title: &str, message: &str, dialog_type: DialogType) {
+    let Some(dialog_show) = (unsafe { &*self.raw }).dialog_show else {
+      println!("{:?}: {}: {}", dialog_type, title, message);
+      return;
+    };
+    let mut title = ThalamusCharSpan {
+      data: title.as_ptr() as *const c_char,
+      size: title.len() as u64,
+      owns_data: 0,
+    };
+    let mut message = ThalamusCharSpan {
+      data: message.as_ptr() as *const c_char,
+      size: message.len() as u64,
+      owns_data: 0,
+    };
+    let dialog_type = match dialog_type {
+      DialogType::Info => ThalamusDialogType::Info,
+      DialogType::Warn => ThalamusDialogType::Warn,
+      DialogType::Error => ThalamusDialogType::Error,
+      DialogType::Fatal => ThalamusDialogType::Fatal,
+    };
+    // SAFETY: dialog_show copies title and message before returning and
+    // doesn't write through the spans despite taking them as non-const.
+    unsafe { dialog_show(&mut title, &mut message, dialog_type) };
   }
 
   pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
@@ -1904,7 +1967,7 @@ impl TryFrom<StateValue> for String {
   }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum StateKey {
   Int(i64),
   String(String),
@@ -2185,6 +2248,52 @@ impl Drop for StateIter {
   }
 }
 
+pub trait IntoStateKey {
+  fn into_state_key(self) -> StateKey;
+}
+
+impl IntoStateKey for StateKey {
+  fn into_state_key(self) -> StateKey { self }
+}
+impl IntoStateKey for &str {
+  fn into_state_key(self) -> StateKey { StateKey::String(self.to_string()) }
+}
+impl IntoStateKey for String {
+  fn into_state_key(self) -> StateKey { StateKey::String(self) }
+}
+impl IntoStateKey for i64 {   // use whatever integer type StateKey::Int holds
+  fn into_state_key(self) -> StateKey { StateKey::Int(self) }
+}
+
+pub trait IntoStateValue {
+  fn into_state_value(self) -> StateValue;
+}
+
+impl IntoStateValue for StateValue {
+  fn into_state_value(self) -> StateValue { self }
+}
+impl IntoStateValue for &str {
+  fn into_state_value(self) -> StateValue { StateValue::String(self.to_string()) }
+}
+impl IntoStateValue for String {
+  fn into_state_value(self) -> StateValue { StateValue::String(self) }
+}
+impl IntoStateValue for i64 {   // use whatever integer type StateKey::Int holds
+  fn into_state_value(self) -> StateValue { StateValue::Int(self) }
+}
+impl IntoStateValue for i32 {   // use whatever integer type StateKey::Int holds
+  fn into_state_value(self) -> StateValue { StateValue::Int(self as i64) }
+}
+impl IntoStateValue for f32 {   // use whatever integer type StateKey::Int holds
+  fn into_state_value(self) -> StateValue { StateValue::Float(self as f64) }
+}
+impl IntoStateValue for f64 {   // use whatever integer type StateKey::Int holds
+  fn into_state_value(self) -> StateValue { StateValue::Float(self) }
+}
+impl IntoStateValue for bool {   // use whatever integer type StateKey::Int holds
+  fn into_state_value(self) -> StateValue { StateValue::Bool(self) }
+}
+
 impl State {
   pub fn new(api: ThalamusAPI, state: *mut ThalamusState) -> State {
     unsafe {
@@ -2226,18 +2335,55 @@ impl State {
     }
   }
 
-  pub fn contains_key(&self, val: StateKey) -> bool {
+  pub fn keys(&self) -> impl Iterator<Item = StateKey> {
+    self.into_iter().map(|e| e.key)
+  }
+
+  pub fn values(&self) -> impl Iterator<Item = StateValue> {
+    self.into_iter().map(|e| e.val)
+  }
+
+  pub fn assign(&mut self, that: &State) {
+    for k in self.merge(that) {
+      self.remove(k);
+    }
+  }
+
+  pub fn merge(&mut self, that: &State) -> HashSet<StateKey> {
+    let mut missing: HashSet<StateKey> = self.keys().collect();
+    for entry in that {
+      missing.remove(&entry.key);
+      let mut target = self.get(entry.key.clone());
+
+      match (&entry.val, &mut target) {
+        (StateValue::Dict(source), Some(StateValue::Dict(dest))) => {
+          dest.assign(source);
+        }
+        (StateValue::List(source), Some(StateValue::List(dest))) => {
+          dest.assign(source);
+        },
+        _ => {
+          self.set(entry.key, entry.val);
+        }
+      }
+    }
+    missing
+  }
+
+  pub fn contains_key(&self, val: impl IntoStateKey) -> bool {
+    let rendered = val.into_state_key();
     for entry in self {
-      if entry.key == val {
+      if entry.key == rendered {
         return true;
       }
     }
     false
   }
 
-  pub fn contains_val(&self, val: StateValue) -> bool {
+  pub fn contains_val(&self, val: impl IntoStateValue) -> bool {
+    let rendered = val.into_state_value();
     for entry in self {
-      if entry.val == val {
+      if entry.val == rendered {
         return true;
       }
     }
@@ -2274,8 +2420,9 @@ impl State {
     //State::new
   }
 
-  pub fn get(&self, index: StateKey) -> Option<StateValue> {
-    let result = match index {
+  pub fn get(&self, index: impl IntoStateKey) -> Option<StateValue> {
+    
+    let result = match index.into_state_key() {
       StateKey::Int(key) => unsafe {
         ((&*self.api.raw).state_get_at_index.unwrap())(self.state, key as u64)
       },
@@ -2300,11 +2447,11 @@ impl State {
     }
   }
 
-  pub fn set(&self, index: StateKey, raw_value: StateValue) {
+  pub fn set(&self, index: impl IntoStateKey, raw_value: impl IntoStateValue) {
     let api = unsafe { &*self.api.raw };
-    match index {
+    match index.into_state_key() {
       StateKey::Int(key) => unsafe {
-        match raw_value {
+        match raw_value.into_state_value() {
           StateValue::Bool(value) => {
             (api.state_set_at_index_bool.unwrap())(self.state, key, if value { 1 } else { 0 });
           }
@@ -2345,7 +2492,7 @@ impl State {
         };
         let key = &key_span as *const ThalamusCharSpan;
         unsafe {
-          match raw_value {
+          match raw_value.into_state_value() {
             StateValue::Bool(value) => {
               (api.state_set_at_name_bool.unwrap())(self.state, key, if value { 1 } else { 0 });
             }
@@ -2380,6 +2527,26 @@ impl State {
         }
       }
     };
+  }
+
+  pub fn remove(&self, index: impl IntoStateKey) {
+    let api = unsafe { &*self.api.raw };
+    let key = index.into_state_key();
+    match key {
+      StateKey::Int(key) => {
+        let remove_at_index = api.state_remove_at_index.unwrap();
+        unsafe { remove_at_index(self.state, key, None, std::ptr::null_mut()) };
+      }
+      StateKey::String(key_raw) => {
+        let remove_at_name = api.state_remove_at_name.unwrap();
+        let key_span = ThalamusCharSpan {
+          data: key_raw.as_ptr() as *const c_char,
+          size: key_raw.len() as u64,
+          owns_data: 0,
+        };
+        unsafe { remove_at_name(self.state, &key_span, None, std::ptr::null_mut()) };
+      }
+    }
   }
 
   pub fn recap(&self) {
@@ -2570,13 +2737,15 @@ pub trait NodeConsts {
 }
 
 pub trait Node {
-  fn process(&self, handle: Request, request: Json);
   /// Most nodes just return Self, which is freshly boxed by the framework.
   /// A node that needs to hand out a pointer it already shares elsewhere
   /// (e.g. with a background thread started during construction) can
-  /// instead return Arc<Self> or Rc<Self> -- Node dispatch (process/predrop/
-  /// etc.) only ever happens on the main thread, so Rc is sound here even
-  /// though it isn't Send.
+  /// instead return Arc<Self> or Rc<Self> -- Node dispatch (predrop etc.)
+  /// only ever happens on the main thread, so Rc is sound here even though
+  /// it isn't Send.
+  ///
+  /// Requests sent to the node get a null response until new() (or anything
+  /// later on the main thread) installs a handler with NodeToken::set_process.
   fn new(
     api: ThalamusAPI,
     node_token: NodeToken,
