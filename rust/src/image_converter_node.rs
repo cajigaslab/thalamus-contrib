@@ -1,0 +1,132 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::api::{
+  ImageFormat,
+  MainThreadToken, Node, NodeConsts, NodeSelector, NodeToken, OffMainSignaler, OnDrop, State, StateAction, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
+};
+use crate::image_converter::{Converter, ConverterParams};
+
+pub struct ImageConverterNode {
+  api: ThalamusAPI,
+  params: ConverterParams,
+  state_connection: Option<OnDrop>,
+  source_connection: Option<OnDrop>,
+  data_connection: Option<OnDrop>,
+  signaler: Arc<OffMainSignaler>,
+}
+
+impl NodeConsts for ImageConverterNode {
+  const MODALITIES: u32 = THALAMUS_MODALITY_IMAGE;
+  const SIGNALS_OFFMAIN: bool = true;
+}
+
+impl ImageConverterNode {
+  fn on_state(rc: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
+    let StateValue::String(key_str) = key else {
+      return;
+    };
+
+    let mut this = rc.borrow_mut();
+    match key_str.as_str() {
+      "Format" => {
+        let StateValue::String(v) = value else {
+          return;
+        };
+
+        this.params.format = match v.to_uppercase().as_str() {
+          "GRAY" => ImageFormat::Gray,
+          "RGB" => ImageFormat::RGB, 
+          "YUYV422" => ImageFormat::YUYV422, 
+          "YUV420P" => ImageFormat::YUV420P, 
+          "YUVJ420P" => ImageFormat::YUVJ420P, 
+          "NV12" => ImageFormat::NV12, 
+          "BGR" => ImageFormat::BGR, 
+          "MPEG4" => ImageFormat::MPEG4,
+          _ => this.params.format
+        };
+      },
+      "Width" => {
+        if let StateValue::Int(v) = value {
+          this.params.width = v as i32;
+        }
+      },
+      "Height" => {
+        if let StateValue::Int(v) = value {
+          this.params.height = v as i32;
+        }
+      },
+      "Quality" => {
+        if let StateValue::Int(v) = value {
+          this.params.quality = v as i32;
+        }
+      },
+      "Source" => {
+        let StateValue::String(name) = value else {
+          return;
+        };
+
+        let weak = Rc::downgrade(&rc);
+        this.source_connection = Some(this.api.get_node(NodeSelector::Name(name), move |node| {
+          let Some(this) = weak.upgrade() else {
+            return
+          };
+          let lock = this.borrow_mut();
+
+          let mut converter = Converter::new(ConverterParams {
+            format: crate::api::ImageFormat::Gray,
+            width: 1,
+            height: 1,
+            quality: 5,
+            frame_interval: Duration::from_millis(16),
+          });
+          let signaler = lock.signaler.clone();
+          this.borrow_mut().data_connection = Some(node.subscribe_multithreaded(move |node| {
+            let data = node.data();
+            let mut result = converter.push(&data);
+            while let Some(image) = result.pull() {
+              let _ = signaler.ready(image.as_ref());
+            }
+          }));
+        }));
+      }
+      _ => {}
+    }
+  }
+}
+
+impl Node for ImageConverterNode {
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, _token: MainThreadToken) -> Rc<RefCell<Self>> {
+    let signaler = Arc::new(OffMainSignaler::new(api, node_token));
+    let params = ConverterParams { 
+      format: ImageFormat::Gray, 
+      width: 640, 
+      height: 480, 
+      quality: 5, 
+      frame_interval: Duration::from_millis(16) 
+    };
+    let result = Rc::new(RefCell::new(ImageConverterNode {
+      params,
+      api,
+      state_connection: None,
+      source_connection: None,
+      data_connection: None,
+      signaler,
+    }));
+
+    let change_ref = Rc::downgrade(&result);
+    let state_callback =
+      move |s, a, k, v| {
+        if let Some(lock) = change_ref.upgrade() {
+          ImageConverterNode::on_state(lock, s, a, k, v);
+        };
+      };
+
+    result.borrow_mut().state_connection = Some(state.connect(state_callback));
+    state.recap();
+
+    result
+  }
+}
