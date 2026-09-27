@@ -407,6 +407,8 @@ impl<'a> ImageData for ExtNodeData<'a> {
         ThalamusImageFormat::NV12 => ImageFormat::NV12,
         ThalamusImageFormat::BGR => ImageFormat::BGR,
         ThalamusImageFormat::MJPEG => ImageFormat::MJPEG,
+        ThalamusImageFormat::MPEG1 => ImageFormat::MPEG1,
+        ThalamusImageFormat::MPEG4 => ImageFormat::MPEG4,
         other => panic!("Unknown ThalamusImageFormat {}", other.0),
       }
     }
@@ -523,9 +525,10 @@ impl std::error::Error for NodeDestroyed {}
 /// a callback queued via post_to_main/post_to_threadpool (and thus possibly
 /// running after the node is gone) can detect that and bail out instead of
 /// dereferencing freed memory.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NodeToken {
   node: Arc<Mutex<*mut ThalamusNode>>,
+  destroy_hooks: Arc<Mutex<Option<Vec<Box<dyn FnOnce() + Send>>>>>
 }
 unsafe impl Send for NodeToken {}
 unsafe impl Sync for NodeToken {}
@@ -534,11 +537,20 @@ impl NodeToken {
   pub fn new(node: *mut ThalamusNode) -> NodeToken {
     NodeToken {
       node: Arc::new(Mutex::new(node)),
+      destroy_hooks: Arc::new(Mutex::new(Some(vec![])))
     }
+  }
+
+  pub fn add_destroy_hook(&self, hook: impl FnOnce() + Send + 'static) {
+    self.destroy_hooks.lock().unwrap().as_mut().unwrap().push(Box::new(hook));
   }
 
   /// Called by destroy_node_template once the node is gone.
   pub(crate) fn destroy(&self) {
+    let hooks = self.destroy_hooks.lock().unwrap().take();
+    for hook in hooks.unwrap() {
+      hook()
+    }
     *self.node.lock().unwrap() = std::ptr::null_mut();
   }
 
@@ -578,21 +590,23 @@ impl NodeToken {
 }
 
 pub struct OffMainSignaler {
-  api: *mut ThalamusAPIRaw,
+  api: ThalamusAPI,
   signaler: *mut ThalamusOffMainSignaler,
   token: NodeToken,
 }
 
 impl OffMainSignaler {
-  pub fn new(api: ThalamusAPI, token: NodeToken) -> OffMainSignaler {
+  pub fn new(api: ThalamusAPI, token: NodeToken) -> Arc<OffMainSignaler> {
     let signaler = token
       .with(|node| unsafe { ((*api.raw).node_offmain_signaler_create.unwrap())(node) })
       .unwrap();
-    OffMainSignaler {
-      api: api.raw,
+    let result = Arc::new(OffMainSignaler {
+      api: api,
       signaler,
       token,
-    }
+    });
+
+    result
   }
 
   pub fn ready(&self, data: &dyn NodeData) -> Result<bool, NodeDestroyed> {
@@ -603,18 +617,53 @@ impl OffMainSignaler {
       // outlives the real borrow.
       let data: &'static dyn NodeData = std::mem::transmute(data);
       (*plugin_impl).data = Some(data);
-      let signaled = ((*self.api).node_offmain_signaler_ready.unwrap())(self.signaler) != 0;
+      let signaled = ((*self.api.raw).node_offmain_signaler_ready.unwrap())(self.signaler) != 0;
       (*plugin_impl).data = None;
       signaled
     })
   }
 
+  pub fn ready_onmain(&self, data: &dyn NodeData) -> Result<bool, NodeDestroyed> {
+    self.token.with(|node| unsafe {
+      let node_ready = (&*self.api.raw).node_ready.unwrap();
+      let plugin_impl = plugin_impl_ptr(node);
+      // SAFETY: data is only read back synchronously inside node_ready_offmain,
+      // which returns before this function does, so the erased lifetime never
+      // outlives the real borrow.
+      let data: &'static dyn NodeData = std::mem::transmute(data);
+      (*plugin_impl).data = Some(data);
+      node_ready(node);
+      (*plugin_impl).data = None;
+      true
+    })
+  }
+
+  pub fn ready_this_thread(
+    &self,
+    data: &dyn NodeData,
+  ) -> Result<bool, NodeDestroyed> {
+    if is_main_thread() {
+      self.ready_onmain(data)
+    } else {
+      self.ready(data)
+    }
+  }
+
   pub fn block(&self) {
-    unsafe { ((*self.api).node_offmain_signaler_block.unwrap())(self.signaler) }
+    unsafe { ((*self.api.raw).node_offmain_signaler_block.unwrap())(self.signaler) }
   }
 
   pub fn unblock(&self) {
-    unsafe { ((*self.api).node_offmain_signaler_unblock.unwrap())(self.signaler) }
+    unsafe { ((*self.api.raw).node_offmain_signaler_unblock.unwrap())(self.signaler) }
+  }
+
+  pub fn predrop(&self, predrop_token: PredropToken) {
+    self.block();
+    let node_token = self.token.clone();
+    self.api.post_to_threadpool(move || {
+      let _ = node_token.with(|_n| ());
+      predrop_token.ready();
+    });
   }
 }
 unsafe impl Send for OffMainSignaler {}
@@ -623,7 +672,7 @@ unsafe impl Sync for OffMainSignaler {}
 impl Drop for OffMainSignaler {
   fn drop(&mut self) {
     unsafe {
-      ((*self.api).node_offmain_signaler_destroy.unwrap())(self.signaler);
+      ((*self.api.raw).node_offmain_signaler_destroy.unwrap())(self.signaler);
     }
   }
 }
@@ -749,7 +798,7 @@ impl ThalamusAPI {
     }
   }
 
-  pub fn create_offmain_signaler(&self, token: NodeToken) -> OffMainSignaler {
+  pub fn create_offmain_signaler(&self, token: NodeToken) -> Arc<OffMainSignaler> {
     OffMainSignaler::new(self.clone(), token)
   }
 
@@ -2906,6 +2955,8 @@ pub enum ImageFormat {
   NV12,
   BGR,
   MJPEG,
+  MPEG1,
+  MPEG4,
 }
 
 pub trait ImageData {

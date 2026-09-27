@@ -13,6 +13,8 @@ mod block;
 mod bluetooth;
 mod ffi;
 mod ffmpeg_devices;
+mod image_converter;
+mod image_converter_node;
 mod image_viewer;
 mod imgui_platform;
 mod imgui_window;
@@ -24,6 +26,7 @@ mod wakers;
 mod webcam_node;
 
 use angular_scaling_node::AngularScalingNode;
+use image_converter_node::ImageConverterNode;
 use rtmps_node::RtmpsNode;
 use sleeve_node::SleeveNode;
 use thorcam_node::ThorcamNode;
@@ -34,5 +37,6 @@ export_nodes!(
   ("RTMPS", RtmpsNode),
   ("SLEEVE", SleeveNode),
   ("ANGULAR_SCALING", AngularScalingNode),
-  ("WEBCAM", WebcamNode)
+  ("WEBCAM", WebcamNode),
+  ("IMAGE_CONVERTER", ImageConverterNode)
 );

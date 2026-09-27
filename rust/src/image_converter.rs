@@ -4,7 +4,7 @@ use std::ffi::{CStr};
 
 use ffmpeg_sys_next::{self as ffi, AV_INPUT_BUFFER_PADDING_SIZE, AVCodecContext, AVCodecParserContext, AVPixelFormat};
 
-use crate::api::{ImageData, ImageFormat, NodeData};
+use crate::api::{ImageData, ImageFormat, NodeData, ThalamusAPIThreadSafe};
 
 const fn mktag(a: u8, b: u8, c: u8, d: u8) -> i32 {
   (a as i32) | ((b as i32) << 8) | ((c as i32) << 16) | ((d as i32) << 24)
@@ -13,17 +13,14 @@ const fn mktag(a: u8, b: u8, c: u8, d: u8) -> i32 {
 const AVERROR_EAGAIN: i32 = -ffi::EAGAIN;
 pub(crate) const AVERROR_EOF: i32 = -mktag(b'E', b'O', b'F', b' ');
 
-const NANOSECOND_TIME_BASE: ffi::AVRational = ffi::AVRational {
-  num: 1,
-  den: 1_000_000_000,
-};
-
 fn encoder_time_base(frame_interval: Duration) -> ffi::AVRational {
   unsafe { ffi::av_d2q(frame_interval.as_secs_f64(), 65535) }
 }
 
 pub struct Converter {
+  api: ThalamusAPIThreadSafe,
   encoder: Option<*mut AVCodecContext>,
+  pts_to_time: VecDeque<(i64, Duration)>,
 
   decoder: Option<*mut AVCodecContext>,
   parser: *mut AVCodecParserContext,
@@ -35,16 +32,16 @@ pub struct Converter {
   src_width: i32,
   src_height: i32,
 
-  dst_format: ImageFormat,
-  dst_width: i32,
-  dst_height: i32,
+  dst_format: Option<ImageFormat>,
+  dst_width: Option<i32>,
+  dst_height: Option<i32>,
   quality: i32,
 
   packet: *mut ffi::AVPacket,
   parser_packet: *mut ffi::AVPacket,
 
   src_pix: AVPixelFormat,
-  dst_pix: AVPixelFormat,
+  dst_pix: Option<AVPixelFormat>,
 
   pts: i64,
 
@@ -58,20 +55,27 @@ pub struct Converter {
   available_times: VecDeque<(Duration, Duration)>,
 
   src_frame: *mut ffi::AVFrame,
+  raw_pending: bool,
+  initialized: bool,
+
+  frame_interval: Duration,
 }
 
+#[derive(Debug,Clone,Copy)]
 pub struct ConverterParams {
-  pub format: ImageFormat,
-  pub width: i32,
-  pub height: i32,
-  pub quality: i32,
-  pub frame_interval: Duration,
+  pub format: Option<ImageFormat>,
+  pub width: Option<i32>,
+  pub height: Option<i32>,
+  pub quality: Option<i32>,
 }
 
 pub struct EncodedImage<'a> {
   converter: &'a Converter,
   frame_interval: Duration,
   pts: Duration,
+  format: ImageFormat,
+  width: i32,
+  height: i32,
 }
 
 impl<'a> NodeData for EncodedImage<'a> {
@@ -94,15 +98,15 @@ impl<'a> ImageData for EncodedImage<'a> {
   }
 
   fn format(&self) -> ImageFormat {
-    self.converter.dst_format
+    self.format
   }
 
   fn width(&self) -> u64 {
-    self.converter.dst_width as u64
+    self.width as u64
   }
 
   fn height(&self) -> u64 {
-    self.converter.dst_height as u64
+    self.height as u64
   }
 
   fn frame_interval(&self) -> Duration {
@@ -240,9 +244,10 @@ fn pix_to_height(height: i32, pix: AVPixelFormat) -> [i32; 4] {
     AVPixelFormat::AV_PIX_FMT_GRAY8 => [height, 0, 0, 0],
     AVPixelFormat::AV_PIX_FMT_RGB24 => [height, 0, 0, 0],
     AVPixelFormat::AV_PIX_FMT_YUYV422 => [height, 0, 0, 0],
-    AVPixelFormat::AV_PIX_FMT_YUV420P => [height, height/2, height/2, 0],
-    AVPixelFormat::AV_PIX_FMT_YUVJ420P => [height, height/2, height/2, 0],
-    AVPixelFormat::AV_PIX_FMT_NV12 => [height*3/2, 0, 0, 0],
+    // Chroma planes of 4:2:0 formats have ceil(height / 2) rows.
+    AVPixelFormat::AV_PIX_FMT_YUV420P => [height, (height + 1)/2, (height + 1)/2, 0],
+    AVPixelFormat::AV_PIX_FMT_YUVJ420P => [height, (height + 1)/2, (height + 1)/2, 0],
+    AVPixelFormat::AV_PIX_FMT_NV12 => [height, (height + 1)/2, 0, 0],
     AVPixelFormat::AV_PIX_FMT_BGR24 => [height, 0, 0, 0],
     _ => panic!("Unsupported pixel format: {:?}", pix)
   }
@@ -255,7 +260,7 @@ fn pix_to_num_planes(pix: AVPixelFormat) -> i32 {
     AVPixelFormat::AV_PIX_FMT_YUYV422 => 1,
     AVPixelFormat::AV_PIX_FMT_YUV420P => 3,
     AVPixelFormat::AV_PIX_FMT_YUVJ420P => 3,
-    AVPixelFormat::AV_PIX_FMT_NV12 => 1,
+    AVPixelFormat::AV_PIX_FMT_NV12 => 2,
     AVPixelFormat::AV_PIX_FMT_BGR24 => 1,
     _ => panic!("Unsupported pixel format: {:?}", pix)
   }
@@ -303,35 +308,55 @@ fn node_to_image(input: &dyn ImageData, data: [*mut u8; 8], linesize: [i32; 8]) 
 unsafe impl Send for Converter {}
 
 impl Converter {
-  pub fn new(params: ConverterParams) -> Converter {
-    let ConverterParams {quality, width, height, format, frame_interval, ..} = params;
-    let mut result = Converter {
+  pub fn new(api: ThalamusAPIThreadSafe, params: ConverterParams) -> Converter {
+    let ConverterParams {quality, width, height, format, ..} = params;
+    let result = Converter {
+      api,
       encoder: None,
       decoder: None,
       parser: std::ptr::null_mut(),
       available_times: VecDeque::new(),
       decoder_frame: std::ptr::null_mut(),
-      quality: ffi::FF_QP2LAMBDA * quality,
+      quality: ffi::FF_QP2LAMBDA * quality.unwrap_or(5),
       dst_width: width,
       dst_height: height,
-      dst_pix: image_to_pix(format),
-      src_pix: image_to_pix(format),
+      dst_pix: format.map(image_to_pix),
+      src_pix: ffi::AVPixelFormat::AV_PIX_FMT_GRAY8,
       dst_format: format,
       num_input_bytes: 0,
       in_buffer: vec![],
       scaler: Some(std::ptr::null_mut()),
-      src_format: format,
-      src_width: width,
-      src_height: height,
+      src_format: ImageFormat::Gray,
+      src_width: 0,
+      src_height: 0,
       packet: std::ptr::null_mut(),
       parser_packet: std::ptr::null_mut(),
       pts: 0,
       out_buffer: vec![],
       scaled_frame: std::ptr::null_mut(),
       src_frame: std::ptr::null_mut(),
+      raw_pending: false,
+      initialized: false,
+      frame_interval: Duration::default(),
+      pts_to_time: VecDeque::new(),
     };
-    result.configure(width, height, format, frame_interval);
     result
+  }
+
+  fn get_dst_pix(&self) -> ffi::AVPixelFormat {
+    self.dst_pix.unwrap_or(self.src_pix)
+  }
+
+  fn get_dst_width(&self) -> i32 {
+    self.dst_width.unwrap_or(self.src_width)
+  }
+
+  fn get_dst_height(&self) -> i32 {
+    self.dst_height.unwrap_or(self.src_height)
+  }
+
+  fn get_dst_format(&self) -> ImageFormat {
+    self.dst_format.unwrap_or(self.src_format)
   }
 
   fn configure(&mut self, src_width: i32, src_height: i32, src_format: ImageFormat, frame_interval: Duration) {
@@ -356,6 +381,9 @@ impl Converter {
       if self.src_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.src_frame);
       }
+      if self.scaled_frame != std::ptr::null_mut() {
+        ffi::av_frame_free(&mut self.scaled_frame);
+      }
 
       if self.packet != std::ptr::null_mut() {
         ffi::av_packet_free(&mut self.packet);
@@ -370,6 +398,7 @@ impl Converter {
       self.src_pix = src_pix;
       self.src_width = src_width;
       self.src_height = src_height;
+      let time_base = encoder_time_base(frame_interval);
 
       if is_compressed(src_format) {
         let codec_id = format_codec(src_format);
@@ -383,7 +412,7 @@ impl Converter {
           panic!("avcodec_alloc_context3 failed");
         }
 
-        (*context).pkt_timebase = NANOSECOND_TIME_BASE;
+        (*context).pkt_timebase = time_base;
         (*context).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
 
         let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
@@ -411,9 +440,9 @@ impl Converter {
       let ret = ffi::av_frame_get_buffer(self.src_frame, 0);
       assert!(ret >= 0, "ffi::av_frame_get_buffer: {}", av_error_string(ret));
 
-      let dst_pix = self.dst_pix;
-      let dst_width = self.dst_width;
-      let dst_height = self.dst_height;
+      let dst_pix = self.get_dst_pix();
+      let dst_width = self.get_dst_width();
+      let dst_height = self.get_dst_height();
 
       if (src_width, src_height, src_pix) != (dst_width, dst_height, dst_pix) {
         let scaler = ffi::sws_getContext(
@@ -441,12 +470,12 @@ impl Converter {
       self.pts = 0;
       self.num_input_bytes = 0;
       self.available_times.clear();
+      self.pts_to_time.clear();
 
-      if is_compressed(self.dst_format) {
+      if is_compressed(self.get_dst_format()) {
         let quality = self.quality;
-        let time_base = encoder_time_base(frame_interval);
 
-        let codec_id = format_codec(self.dst_format);
+        let codec_id = format_codec(self.get_dst_format());
         let codec = ffi::avcodec_find_encoder(codec_id);
         if codec.is_null() {
           panic!("no {:?} encoder in this FFmpeg build", codec_id);
@@ -489,17 +518,29 @@ impl Converter {
 
     let current_format = (self.src_format, self.src_width, self.src_height);
     let input_format = (input.format(), input.width() as i32, input.height() as i32);
-    if current_format != input_format {
-      self.configure(input.width() as i32, input.height() as i32, input.format(), input.frame_interval());
-    }
-
-    if input_format == (self.dst_format, self.dst_width, self.dst_height) {
+    let target_format = (
+      self.dst_format.unwrap_or(input_format.0),
+      self.dst_width.unwrap_or(input_format.1),
+      self.dst_height.unwrap_or(input_format.2));
+    if input_format == target_format {
       let passthrough = Some(Box::new(PassthroughImage{ underlying: input, pts} ));
       return ConverterResult { converter: self, passthrough, exhausted: false };
     }
 
-    self.available_times.push_back((pts, input.frame_interval()));
-    let pts = pts.as_nanos() as i64;
+    let raw_frame_interval = input.frame_interval();
+    self.frame_interval = if raw_frame_interval.as_nanos() == 0 { Duration::from_millis(16) } else { raw_frame_interval };
+
+    if !self.initialized || current_format != input_format {
+      self.configure(input.width() as i32, input.height() as i32, input.format(), self.frame_interval);
+      self.initialized = true;
+    }
+
+
+    //self.frame_interval = input.frame_interval();
+    //self.available_times.push_back((pts, input.frame_interval()));
+    let pts = self.pts;
+    self.pts_to_time.push_back((pts, data.time()));
+    self.pts += 1;
     unsafe {
       if let Some(decoder) = self.decoder {
         let plane = input.plane(0);
@@ -509,7 +550,7 @@ impl Converter {
         self.in_buffer[buffer_pos..(buffer_pos+plane.len())].copy_from_slice(plane);
 
         let mut offset = 0;
-        loop {
+        while offset + (AV_INPUT_BUFFER_PADDING_SIZE as usize) < self.in_buffer.len() {
           let used = ffi::av_parser_parse2(
             self.parser, decoder, 
             &mut (*self.parser_packet).data,
@@ -519,20 +560,28 @@ impl Converter {
             pts, ffi::AV_NOPTS_VALUE, 
             self.num_input_bytes
           );
-          if used == 0 {
-            break;
-          }
           offset += used as usize;
           self.num_input_bytes += used as i64;
 
-          let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
-          assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+          if (*self.parser_packet).size > 0 {
+            (*self.parser_packet).pts = (*self.parser).pts;
+            let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
+            assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+          }
+          
+          if used == 0 && (*self.parser_packet).size == 0 {
+            break;
+          }
         }
         if offset > 0 {
           self.in_buffer.drain(0..offset);
         }
-      } else { 
+      } else {
+        let ret = ffi::av_frame_make_writable(self.src_frame);
+        assert!(ret >= 0, "av_frame_make_writable {}", av_error_string(ret));
         node_to_image(input, (*self.src_frame).data, (*self.src_frame).linesize);
+        (*self.src_frame).pts = pts;
+        self.raw_pending = true;
       }
     }
 
@@ -549,15 +598,31 @@ impl Converter {
         assert!(ret >= 0, "avcodec_receive_frame: {}", av_error_string(ret));
         (self.decoder_frame, true)
       } else {
+        if !self.raw_pending {
+          return None;
+        }
+        self.raw_pending = false;
         (self.src_frame, false)
       };
 
-      let (pts, frame_interval) = self.available_times.pop_front().expect("No pts for decoded frame");
+      let pts = match self.pts_to_time.iter().position(|(pts, _)| pts == &(*decoded_frame).pts) {
+        Some(i) => {
+          let temp = self.pts_to_time[i];
+          self.pts_to_time.remove(i);
+          temp.1
+        },
+        None => self.api.time()
+      };
+
+      //let pts = Duration::from_nanos((*decoded_frame).pts as u64);
+      let frame_interval = self.frame_interval;
+      //let (_, frame_interval) = self.available_times.pop_front().expect("No pts for decoded frame");
 
       let (scaled_frame, need_unref2) = if let Some(scaler) = self.scaler {
         let ret = ffi::av_frame_make_writable(self.scaled_frame);
-        assert!(ret >= 0, "av_frame_make_writable failed");
-        ffi::sws_scale_frame(scaler, self.scaled_frame, decoded_frame);
+        assert!(ret >= 0, "av_frame_make_writable failed: {}", av_error_string(ret));
+        let ret = ffi::sws_scale_frame(scaler, self.scaled_frame, decoded_frame);
+        assert!(ret >= 0, "sws_scale_frame: {}", av_error_string(ret));
         if need_unref {
           ffi::av_frame_unref(decoded_frame);
         }
@@ -567,7 +632,9 @@ impl Converter {
       };
 
       if let Some(encoder) = self.encoder {
-        ffi::avcodec_send_frame(encoder, scaled_frame);
+        (*scaled_frame).quality = self.quality;
+        let ret = ffi::avcodec_send_frame(encoder, scaled_frame);
+        assert!(ret >= 0, "avcodec_send_frame: {}", av_error_string(ret));
         if need_unref {
           ffi::av_frame_unref(scaled_frame);
         }
@@ -577,21 +644,24 @@ impl Converter {
           if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
             break;
           }
-          assert!(ret >= 0, "Error during encoding");
+          assert!(ret >= 0, "Error during encoding: {}", av_error_string(ret));
 
           let slice = std::slice::from_raw_parts((*self.packet).data, (*self.packet).size as usize);
           self.out_buffer.extend_from_slice(slice);
         }
 
+        let width = self.get_dst_width();
+        let height = self.get_dst_height();
+        let format = self.get_dst_format();
         return Some(Box::new(EncodedImage {
-          converter: self, frame_interval, pts
+          converter: self, frame_interval, pts, width, height, format,
         }));
       } else {
 
-        let num_planes = pix_to_num_planes(self.dst_pix);
-        let plane_heights = pix_to_height(self.dst_height, self.dst_pix);
+        let num_planes = pix_to_num_planes(self.get_dst_pix());
+        let plane_heights = pix_to_height(self.get_dst_height(), self.get_dst_pix());
         return Some(Box::new(RawImage {
-          frame: scaled_frame, num_planes, plane_heights, frame_interval, format: self.dst_format, pts, need_unref: need_unref2
+          frame: scaled_frame, num_planes, plane_heights, frame_interval, format: self.get_dst_format(), pts, need_unref: need_unref2
         }));
       };
     }
@@ -599,6 +669,43 @@ impl Converter {
 
   //fn new(params: ConverterParams) -> Converter {}
     
+}
+
+impl Drop for Converter {
+  fn drop(&mut self) {
+    unsafe {
+      if let Some(scaler) = self.scaler {
+        ffi::sws_freeContext(scaler);
+        self.scaler = None;
+      }
+      if let Some(mut decoder) = self.decoder {
+        ffi::avcodec_free_context(&mut decoder);
+        ffi::av_parser_close(self.parser);
+        self.decoder = None;
+      }
+      if let Some(mut encoder) = self.encoder {
+        ffi::avcodec_free_context(&mut encoder);
+        self.encoder = None;
+      }
+
+      if self.decoder_frame != std::ptr::null_mut() {
+        ffi::av_frame_free(&mut self.decoder_frame);
+      }
+      if self.src_frame != std::ptr::null_mut() {
+        ffi::av_frame_free(&mut self.src_frame);
+      }
+      if self.scaled_frame != std::ptr::null_mut() {
+        ffi::av_frame_free(&mut self.scaled_frame);
+      }
+
+      if self.packet != std::ptr::null_mut() {
+        ffi::av_packet_free(&mut self.packet);
+      }
+      if self.parser_packet != std::ptr::null_mut() {
+        ffi::av_packet_free(&mut self.parser_packet);
+      }
+    }
+  }
 }
 
 pub struct ConverterResult<'a, 'b> {

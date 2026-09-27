@@ -1,3 +1,40 @@
+# Uses the system's FFmpeg if pkg-config can find a compatible one (7.x, which
+# the ffmpeg-sys-next 7 bindings in rust/Cargo.toml expect), otherwise builds
+# it from source below. Set FFMPEG_BUILD_FROM_SOURCE=ON to always build it.
+#
+# Which one was used is written to ffmpeg_provider.txt in the build directory
+# ("system" or "source") so hatch_build.py knows whether to point cargo at the
+# source-built install.
+option(FFMPEG_BUILD_FROM_SOURCE "Build FFmpeg from source even if a system FFmpeg is found" OFF)
+
+if(NOT FFMPEG_BUILD_FROM_SOURCE)
+  find_package(PkgConfig QUIET)
+  if(PKG_CONFIG_FOUND)
+    pkg_check_modules(FFMPEG_SYSTEM QUIET IMPORTED_TARGET
+      "libavcodec>=61" "libavcodec<62"
+      "libavdevice>=61" "libavdevice<62"
+      "libavfilter>=10" "libavfilter<11"
+      "libavformat>=61" "libavformat<62"
+      "libavutil>=59" "libavutil<60"
+      "libswresample>=5" "libswresample<6"
+      "libswscale>=8" "libswscale<9")
+  endif()
+endif()
+
+if(FFMPEG_SYSTEM_FOUND)
+  message("Using system FFmpeg (libavcodec ${FFMPEG_SYSTEM_libavcodec_VERSION})")
+  file(WRITE "${CMAKE_BINARY_DIR}/ffmpeg_provider.txt" "system")
+  set(FFMPEG_FOUND 1)
+  set(FFMPEG_INCLUDE_DIRS ${FFMPEG_SYSTEM_INCLUDE_DIRS})
+  set(FFMPEG_LIBRARIES ${FFMPEG_SYSTEM_LINK_LIBRARIES})
+  add_library(ffmpeg INTERFACE)
+  target_link_libraries(ffmpeg INTERFACE PkgConfig::FFMPEG_SYSTEM)
+  return()
+endif()
+
+message("System FFmpeg 7.x not found, building FFmpeg from source")
+file(WRITE "${CMAKE_BINARY_DIR}/ffmpeg_provider.txt" "source")
+
 FetchContent_Declare(
   ffmpeg 
   GIT_REPOSITORY https://github.com/FFmpeg/FFmpeg.git

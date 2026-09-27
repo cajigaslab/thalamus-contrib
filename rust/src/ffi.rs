@@ -306,6 +306,8 @@ pub extern "C" fn c_node_image_format(raw_node: *mut ThalamusNode) -> ThalamusIm
     ImageFormat::NV12 => ThalamusImageFormat::NV12,
     ImageFormat::BGR => ThalamusImageFormat::BGR,
     ImageFormat::MJPEG => ThalamusImageFormat::MJPEG,
+    ImageFormat::MPEG1 => ThalamusImageFormat::MPEG1,
+    ImageFormat::MPEG4 => ThalamusImageFormat::MPEG4,
   }
 }
 

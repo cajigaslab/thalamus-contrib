@@ -2,13 +2,13 @@ use std::cell::RefCell;
 use std::os::raw::c_char;
 use std::rc::{Rc, Weak};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::api::{
   AnalogData, DialogType, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node,
-  NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, PredropToken, Request, State,
+  NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, Request, State,
   StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, TaskScope, ThalamusAPI,
   ThalamusAPIThreadSafe, run_task,
 };
@@ -26,7 +26,7 @@ type IsAddToSequence = unsafe extern "C" fn(u32, *mut c_char, i32) -> i32;
 type IsClearSequence = unsafe extern "C" fn(u32) -> i32;
 type IsUnlockSeqBuf = unsafe extern "C" fn(u32, i32, *mut c_char) -> i32;
 type IsCaptureVideo = unsafe extern "C" fn(u32, i32) -> i32;
-type IsStopLiveVideo = unsafe extern "C" fn(u32, i32) -> i32;
+//type IsStopLiveVideo = unsafe extern "C" fn(u32, i32) -> i32;
 type IsWaitForNextImage = unsafe extern "C" fn(u32, u32, *mut *mut c_char, *mut i32) -> i32;
 type IsInitImageQueue = unsafe extern "C" fn(u32, i32) -> i32;
 type IsExitImageQueue = unsafe extern "C" fn(u32) -> i32;
@@ -132,7 +132,7 @@ struct Uc480Lib {
   clear_sequence: IsClearSequence,
   unlock_seq_buf: IsUnlockSeqBuf,
   capture_video: IsCaptureVideo,
-  stop_live_video: IsStopLiveVideo,
+  //stop_live_video: IsStopLiveVideo,
   wait_for_next_image: IsWaitForNextImage,
   init_image_queue: IsInitImageQueue,
   exit_image_queue: IsExitImageQueue,
@@ -209,7 +209,7 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
   let clear_sequence = load_fn::<IsClearSequence>(&library, b"is_ClearSequence\0")?;
   let unlock_seq_buf = load_fn::<IsUnlockSeqBuf>(&library, b"is_UnlockSeqBuf\0")?;
   let capture_video = load_fn::<IsCaptureVideo>(&library, b"is_CaptureVideo\0")?;
-  let stop_live_video = load_fn::<IsStopLiveVideo>(&library, b"is_StopLiveVideo\0")?;
+  //let stop_live_video = load_fn::<IsStopLiveVideo>(&library, b"is_StopLiveVideo\0")?;
   let wait_for_next_image = load_fn::<IsWaitForNextImage>(&library, b"is_WaitForNextImage\0")?;
   let init_image_queue = load_fn::<IsInitImageQueue>(&library, b"is_InitImageQueue\0")?;
   let exit_image_queue = load_fn::<IsExitImageQueue>(&library, b"is_ExitImageQueue\0")?;
@@ -269,7 +269,7 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
       clear_sequence,
       unlock_seq_buf,
       capture_video,
-      stop_live_video,
+      //stop_live_video,
       wait_for_next_image,
       init_image_queue,
       exit_image_queue,
@@ -286,17 +286,17 @@ fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
 impl Uc480Lib {
   /// Opens the camera just long enough to run `f`. Only valid while the camera
   /// thread isn't holding the camera.
-  fn with_camera<R>(&self, device_id: u32, f: impl FnOnce(u32) -> R) -> Option<R> {
-    let mut h_cam = device_id | IS_USE_DEVICE_ID;
-    let ret = unsafe { (self.init_camera)(&mut h_cam, std::ptr::null_mut()) };
-    if ret != 0 {
-      println!("ThorcamNode: is_InitCamera failed: {}", ret);
-      return None;
-    }
-    let result = f(h_cam);
-    unsafe { (self.exit_camera)(h_cam) };
-    Some(result)
-  }
+  //fn with_camera<R>(&self, device_id: u32, f: impl FnOnce(u32) -> R) -> Option<R> {
+  //  let mut h_cam = device_id | IS_USE_DEVICE_ID;
+  //  let ret = unsafe { (self.init_camera)(&mut h_cam, std::ptr::null_mut()) };
+  //  if ret != 0 {
+  //    println!("ThorcamNode: is_InitCamera failed: {}", ret);
+  //    return None;
+  //  }
+  //  let result = f(h_cam);
+  //  unsafe { (self.exit_camera)(h_cam) };
+  //  Some(result)
+  //}
 
   fn aoi_query<T: Default>(&self, h_cam: u32, command: u32) -> Option<T> {
     let mut value = T::default();
@@ -1173,7 +1173,7 @@ impl Node for ThorcamNode {
     }
 
     let result = Rc::new_cyclic(|weak: &Weak<RefCell<Self>>| {
-      let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
+      let signaler = OffMainSignaler::new(api, node_token.clone());
 
       let weak2 = weak.clone();
       let callback = move |source, action, key, value| {

@@ -1,11 +1,11 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError, sync_channel};
+use std::time::{Duration, Instant};
 
 use crate::api::{
-  MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken,
-  OnDrop, PredropToken, State, StateAction, StateKey, StateValue, ThalamusAPI,
-  ThalamusAPIThreadSafe,
+  MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OnDrop, PredropToken,
+  State, StateAction, StateKey, StateValue, ThalamusAPI,
 };
 use crate::rtmps_publisher::{FrameBuf, RtmpsPublisher};
 
@@ -36,11 +36,10 @@ pub struct RtmpsNode {
 }
 
 fn start_publishing(inner: &Rc<RefCell<RtmpsNodeInner>>) {
-  let (api, main_thread_token, source, destination) = {
+  let (api, source, destination) = {
     let borrow = inner.borrow();
     (
       borrow.api,
-      borrow.main_thread_token,
       state_get_string(&borrow.state, "Source"),
       state_get_string(&borrow.state, "Destination"),
     )
@@ -61,15 +60,8 @@ fn start_publishing(inner: &Rc<RefCell<RtmpsNodeInner>>) {
   // enough to smooth over momentary jitter.
   let (frame_tx, frame_rx) = sync_channel::<FrameBuf>(4);
 
-  // Lets the publisher thread report a fatal error back to the node despite
-  // Rc<RefCell<..>> not being Send: wrapped once here (on the main thread,
-  // proven by main_thread_token), the wrapper itself is Send and can only be
-  // unwrapped again via a MainThreadToken obtained from a later post_to_main
-  // callback -- same pattern ThalamusAPI::join_then uses.
-  let mt_api = api.thread_safe();
-  let inner_for_error = MainThreadOnly::new(Rc::clone(inner), main_thread_token);
   let publish_thread = std::thread::spawn(move || {
-    run_publisher(frame_rx, destination, mt_api, inner_for_error);
+    run_publisher(frame_rx, destination);
   });
 
   let inner_for_source = Rc::clone(inner);
@@ -115,51 +107,56 @@ fn start_publishing(inner: &Rc<RefCell<RtmpsNodeInner>>) {
   borrow.publish_thread = Some(publish_thread);
 }
 
-fn run_publisher(
-  frame_rx: Receiver<FrameBuf>,
-  destination: String,
-  mt_api: ThalamusAPIThreadSafe,
-  inner: MainThreadOnly<Rc<RefCell<RtmpsNodeInner>>>,
-) {
-  let mut publisher: Option<RtmpsPublisher> = None;
-  let mut error = None;
+// How long to wait after losing the connection before reconnecting.
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 
-  for frame in frame_rx {
-    let pub_ref = match publisher.as_mut() {
-      Some(p) => p,
-      None => match RtmpsPublisher::open(
+fn run_publisher(frame_rx: Receiver<FrameBuf>, destination: String) {
+  let mut publisher: Option<RtmpsPublisher> = None;
+
+  while let Ok(frame) = frame_rx.recv() {
+    let result = match publisher.as_mut() {
+      Some(p) => p.write_frame(&frame),
+      None => RtmpsPublisher::open(
         &destination,
         frame.format,
         frame.width,
         frame.height,
         frame.frame_interval,
-      ) {
-        Ok(p) => publisher.insert(p),
-        Err(e) => {
-          error = Some(format!("failed to open {}: {}", destination, e));
-          break;
-        }
-      },
+      )
+      .map_err(|e| format!("failed to open {}: {}", destination, e))
+      .and_then(|p| publisher.insert(p).write_frame(&frame)),
     };
-    if let Err(e) = pub_ref.write_frame(&frame) {
-      error = Some(e);
-      break;
+
+    if let Err(e) = result {
+      println!(
+        "RtmpsNode: {}, reconnecting in {:?}",
+        e, RECONNECT_DELAY
+      );
+      // Closes the broken connection; the next frame after the delay opens
+      // a new one.
+      publisher = None;
+      if !wait_before_reconnect(&frame_rx) {
+        break;
+      }
     }
   }
 
-  if let Some(e) = error {
-    println!("RtmpsNode: {}, stopping", e);
-    // Flips Running to false, which the node's state-change handler picks
-    // up to tear down the source/data subscriptions and join this thread
-    // (from a threadpool thread, not this one -- see stop_publishing).
-    mt_api.post_to_main(move |token| {
-      let inner = inner.take(token);
-      let running = StateKey::String("Running".to_string());
-      inner.borrow().state.set(running, StateValue::Bool(false));
-    });
-  }
-
   println!("RtmpsNode: publisher thread exited");
+}
+
+// Waits RECONNECT_DELAY, discarding frames that arrive in the meantime so the
+// reconnected stream starts from a fresh one. Returns false if the node
+// stopped publishing (the channel closed) while waiting.
+fn wait_before_reconnect(frame_rx: &Receiver<FrameBuf>) -> bool {
+  let deadline = Instant::now() + RECONNECT_DELAY;
+  loop {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match frame_rx.recv_timeout(remaining) {
+      Ok(_stale) => {}
+      Err(RecvTimeoutError::Timeout) => return true,
+      Err(RecvTimeoutError::Disconnected) => return false,
+    }
+  }
 }
 
 fn stop_publishing<F: FnOnce() + 'static>(inner: &Rc<RefCell<RtmpsNodeInner>>, on_stopped: F) {

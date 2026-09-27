@@ -48,6 +48,15 @@ def widgets():
       UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation X', 0.0, []),
       UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation Y', 0.0, []),
     ]),
+    'IMAGE_CONVERTER': Factory(None, [
+      UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
+      UserData(UserDataType.COMBO_BOX, 'Format', 'RGB', [
+        'PASSTHROUGH', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4'
+      ]),
+      UserData(UserDataType.SPINBOX, 'Quality', 5, []),
+      UserData(UserDataType.SPINBOX, 'Width', 0, []),
+      UserData(UserDataType.SPINBOX, 'Height', 0, []),
+    ]),
     'SLEEVE': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.DEFAULT, 'Address', '', []),

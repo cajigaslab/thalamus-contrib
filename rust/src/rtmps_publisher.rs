@@ -46,9 +46,10 @@ fn av_pixel_format(format: ImageFormat) -> Result<ffi::AVPixelFormat, String> {
     ImageFormat::YUVJ420P => Ok(ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P),
     ImageFormat::NV12 => Ok(ffi::AVPixelFormat::AV_PIX_FMT_NV12),
     ImageFormat::BGR => Ok(ffi::AVPixelFormat::AV_PIX_FMT_BGR24),
-    ImageFormat::MJPEG => {
-      Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string())
-    }
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => Err(format!(
+      "{:?} frames can't be encoded, the source needs to produce raw frames",
+      format
+    )),
   }
 }
 
@@ -70,9 +71,10 @@ fn plane_layout(
       let (chroma_w, chroma_h) = (w.div_ceil(2), h.div_ceil(2));
       Ok(vec![(w, h), (chroma_w, chroma_h), (chroma_w, chroma_h)])
     }
-    ImageFormat::MJPEG => {
-      Err("MJPEG frames can't be encoded, the source needs to produce raw frames".to_string())
-    }
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => Err(format!(
+      "{:?} frames can't be encoded, the source needs to produce raw frames",
+      format
+    )),
   }
 }
 
@@ -215,10 +217,10 @@ const fn mktag(a: u8, b: u8, c: u8, d: u8) -> i32 {
 }
 // bindgen doesn't expand these two function-like macros from error.h, so
 // they're reproduced here from libavutil/error.h's definitions.
-const AVERROR_EAGAIN: i32 = -ffi::EAGAIN;
-const AVERROR_EOF: i32 = -mktag(b'E', b'O', b'F', b' ');
+pub(crate) const AVERROR_EAGAIN: i32 = -ffi::EAGAIN;
+pub(crate) const AVERROR_EOF: i32 = -mktag(b'E', b'O', b'F', b' ');
 
-fn av_error_string(ret: i32) -> String {
+pub(crate) fn av_error_string(ret: i32) -> String {
   let mut buf = [0i8; ffi::AV_ERROR_MAX_STRING_SIZE];
   let rc = unsafe { ffi::av_strerror(ret, buf.as_mut_ptr(), buf.len()) };
   if rc == 0 {

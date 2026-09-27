@@ -21,7 +21,9 @@ fn channels_for_format(format: ImageFormat) -> Option<u32> {
     | ImageFormat::YUV420P
     | ImageFormat::YUVJ420P
     | ImageFormat::NV12
-    | ImageFormat::MJPEG => None,
+    | ImageFormat::MJPEG
+    | ImageFormat::MPEG1
+    | ImageFormat::MPEG4 => None,
   }
 }
 

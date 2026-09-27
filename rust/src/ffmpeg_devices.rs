@@ -1,3 +1,8 @@
+// FFmpeg-based camera enumeration and capture (dshow/avfoundation/v4l2).
+// Unused since the webcam node moved to nokhwa, but kept for future
+// FFmpeg-based capture nodes.
+#![allow(dead_code)]
+
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int, c_void};
@@ -337,7 +342,9 @@ fn plane_layout(format: ImageFormat, width: u64, height: u64) -> Vec<(u64, u64)>
       let chroma_h = height.div_ceil(2);
       vec![(width, height), (chroma_w, chroma_h), (chroma_w, chroma_h)]
     }
-    ImageFormat::MJPEG => panic!("Unsupported Format: MJPEG"),
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => {
+      panic!("Unsupported Format: {:?}", format)
+    }
   }
 }
 

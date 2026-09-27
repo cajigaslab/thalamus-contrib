@@ -13,7 +13,9 @@ use crate::api::{
 };
 
 struct Frame<'a> {
-  buffer: &'a [u8],
+  // Borrowed straight from nokhwa's buffer; only the first num_planes are used.
+  planes: [&'a [u8]; 2],
+  num_planes: u64,
   width: u64,
   height: u64,
   format: api::ImageFormat,
@@ -44,12 +46,15 @@ impl<'a> NodeData for Frame<'a> {
 }
 
 impl<'a> ImageData for Frame<'a> {
-  fn plane(&self, _channel: i32) -> &[u8] {
-    self.buffer
+  fn plane(&self, channel: i32) -> &[u8] {
+    match usize::try_from(channel) {
+      Ok(i) if (i as u64) < self.num_planes => self.planes[i],
+      _ => &[],
+    }
   }
 
   fn num_planes(&self) -> u64 {
-    1
+    self.num_planes
   }
 
   fn format(&self) -> api::ImageFormat {
@@ -300,8 +305,28 @@ impl WebcamNode {
 
       let resolution = buffer.resolution();
       //println!("{} {} {} {}", buffer.buffer().len(), resolution.width(), resolution.height(), buffer.source_frame_format());
+      let data = buffer.buffer();
+      let (planes, num_planes) = if format == api::ImageFormat::NV12 {
+        // nokhwa delivers NV12 as one tightly packed buffer, the Y plane
+        // (width x height) followed by the interleaved UV plane
+        // (width x height/2); forward them as separate planes.
+        let luma_size = resolution.width() as usize * resolution.height() as usize;
+        if data.len() < luma_size * 3 / 2 {
+          println!(
+            "NV12 frame has {} bytes, expected {}, dropping it",
+            data.len(),
+            luma_size * 3 / 2
+          );
+          continue;
+        }
+        let (y, uv) = data.split_at(luma_size);
+        ([y, &uv[..luma_size / 2]], 2)
+      } else {
+        ([data, &[][..]], 1)
+      };
       let frame = Frame {
-        buffer: buffer.buffer(),
+        planes,
+        num_planes,
         width: resolution.width() as u64,
         height: resolution.height() as u64,
         time,
@@ -428,7 +453,7 @@ impl Node for WebcamNode {
     main_thread_token: MainThreadToken,
   ) -> Rc<RefCell<Self>> {
     let result = Rc::new_cyclic(|weak: &Weak<RefCell<Self>>| {
-      let signaler = Arc::new(OffMainSignaler::new(api, node_token.clone()));
+      let signaler = OffMainSignaler::new(api, node_token.clone());
 
       let weak2 = weak.clone();
       let callback = move |source, action, key, value| {
