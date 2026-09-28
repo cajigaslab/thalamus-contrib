@@ -9,9 +9,13 @@
 //! Besides drawing imgui's own widgets, callers can register their own
 //! Vulkan-backed textures (e.g. a video frame) via `register_texture` and
 //! display them with `ui.image()`/`draw_list.add_image_quad()`. Updating a
-//! registered texture's pixel data must happen through `render_frame`'s
+//! registered texture's pixel data is simplest through `render_frame`'s
 //! `prepare` hook, which runs on the exact command buffer (and frame-in-flight
-//! slot) that frame will use -- see its doc comment for why.
+//! slot) that frame will use -- see its doc comment for why. Updating one from
+//! elsewhere (e.g. another thread) needs its own command pool and must not
+//! touch a texture an in-flight frame is still sampling -- and must not use
+//! this window's fences from another thread, since `render_frame` resets and
+//! submits them (see `TexturePool` in image_viewer.rs).
 
 use ash::khr;
 use ash::vk;
@@ -230,9 +234,7 @@ impl ImguiWindow {
   pub fn physical_device(&self) -> vk::PhysicalDevice {
     self.physical_device
   }
-  pub fn cmd_pool(&self) -> vk::CommandPool {
-    self.cmd_pool
-  }
+
 
   /// Registers a Vulkan-backed texture (image view + sampler) for display via
   /// `ui.image()`/`draw_list.add_image_quad()`, returning its `TextureId`
