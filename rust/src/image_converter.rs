@@ -54,11 +54,14 @@ pub struct Converter {
 
   available_times: VecDeque<(Duration, Duration)>,
 
-  src_frame: *mut ffi::AVFrame,
-  raw_pending: bool,
   initialized: bool,
 
   frame_interval: Duration,
+  slice_to_pts: VecDeque<(usize, i64)>,
+
+  writable_src_frames: VecDeque<*mut ffi::AVFrame>,
+  pending_src_frames: VecDeque<*mut ffi::AVFrame>,
+  pulled_src_frames: VecDeque<*mut ffi::AVFrame>,
 }
 
 #[derive(Debug,Clone,Copy)]
@@ -172,47 +175,6 @@ impl Drop for RawImage {
     if self.need_unref {
       unsafe { ffi::av_frame_unref(self.frame) };
     }
-  }
-}
-
-struct PassthroughImage<'a> {
-  underlying: &'a dyn ImageData,
-  pts: Duration,
-}
-
-impl<'a> NodeData for PassthroughImage<'a> {
-  fn time(&self) -> Duration {
-    self.pts
-  }
-
-  fn image(&self) -> Option<&dyn ImageData> {
-    Some(self)
-  }
-}
-
-impl<'a> ImageData for PassthroughImage<'a> {
-  fn plane(&self, i: i32) -> &[u8] {
-    self.underlying.plane(i)
-  }
-
-  fn num_planes(&self) -> u64 {
-    self.underlying.num_planes()
-  }
-
-  fn format(&self) -> ImageFormat {
-    self.underlying.format()
-  }
-
-  fn width(&self) -> u64 {
-    self.underlying.width()
-  }
-
-  fn height(&self) -> u64 {
-    self.underlying.height()
-  }
-
-  fn frame_interval(&self) -> Duration {
-    self.underlying.frame_interval()
   }
 }
 
@@ -334,11 +296,13 @@ impl Converter {
       pts: 0,
       out_buffer: vec![],
       scaled_frame: std::ptr::null_mut(),
-      src_frame: std::ptr::null_mut(),
-      raw_pending: false,
       initialized: false,
       frame_interval: Duration::default(),
       pts_to_time: VecDeque::new(),
+      slice_to_pts: VecDeque::new(),
+      writable_src_frames: VecDeque::new(),
+      pending_src_frames: VecDeque::new(),
+      pulled_src_frames: VecDeque::new(),
     };
     result
   }
@@ -378,8 +342,14 @@ impl Converter {
       if self.decoder_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.decoder_frame);
       }
-      if self.src_frame != std::ptr::null_mut() {
-        ffi::av_frame_free(&mut self.src_frame);
+      for f in self.writable_src_frames.iter_mut() {
+        ffi::av_frame_free(f);
+      }
+      for f in self.pending_src_frames.iter_mut() {
+        ffi::av_frame_free(f);
+      }
+      for f in self.pulled_src_frames.iter_mut() {
+        ffi::av_frame_free(f);
       }
       if self.scaled_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.scaled_frame);
@@ -433,12 +403,9 @@ impl Converter {
         (*self.decoder_frame).height = src_height;
       }
 
-      self.src_frame = ffi::av_frame_alloc();
-      (*self.src_frame).format = src_pix as i32;
-      (*self.src_frame).width = src_width;
-      (*self.src_frame).height = src_height;
-      let ret = ffi::av_frame_get_buffer(self.src_frame, 0);
-      assert!(ret >= 0, "ffi::av_frame_get_buffer: {}", av_error_string(ret));
+      self.writable_src_frames.clear();
+      self.pending_src_frames.clear();
+      self.pulled_src_frames.clear();
 
       let dst_pix = self.get_dst_pix();
       let dst_width = self.get_dst_width();
@@ -510,22 +477,61 @@ impl Converter {
     }
   }
 
-  pub fn push<'a, 'b>(&'a mut self, data: &'b dyn NodeData) -> ConverterResult<'a, 'b> {
+  pub fn needs_conversion(&self, data: &dyn NodeData) -> bool {
     let Some(input) = data.image() else {
-      return ConverterResult { converter: self, passthrough: None, exhausted: true };
+      return false;
     };
-    let pts = data.time();
-
-    let current_format = (self.src_format, self.src_width, self.src_height);
     let input_format = (input.format(), input.width() as i32, input.height() as i32);
     let target_format = (
       self.dst_format.unwrap_or(input_format.0),
       self.dst_width.unwrap_or(input_format.1),
       self.dst_height.unwrap_or(input_format.2));
-    if input_format == target_format {
-      let passthrough = Some(Box::new(PassthroughImage{ underlying: input, pts} ));
-      return ConverterResult { converter: self, passthrough, exhausted: false };
+    input_format != target_format
+  }
+
+  fn get_writable_src_frame(&mut self) -> *mut ffi::AVFrame {
+    unsafe {
+      self.pulled_src_frames.retain(|f| {
+        let writable = ffi::av_frame_is_writable(*f) != 0;
+        if writable {
+          self.writable_src_frames.push_back(*f);
+        }
+        !writable
+      });
+
+      if !self.writable_src_frames.is_empty() {
+        return self.writable_src_frames.pop_front().unwrap();
+      }
+
+      let frame = ffi::av_frame_alloc();
+      (*frame).format = self.src_pix as i32;
+      (*frame).width = self.src_width;
+      (*frame).height = self.src_height;
+      let ret = ffi::av_frame_get_buffer(frame, 0);
+      assert!(ret >= 0, "ffi::av_frame_get_buffer: {}", av_error_string(ret));
+      frame
     }
+  }
+
+  fn push_pending_src_frame(&mut self, frame: *mut ffi::AVFrame) {
+    self.pending_src_frames.push_back(frame);
+  }
+
+  fn get_pending_src_frame(&mut self) -> Option<*mut ffi::AVFrame> {
+    let result = self.pending_src_frames.pop_front();
+    if let Some(frame) = result {
+      self.pulled_src_frames.push_back(frame);
+    }
+    result
+  }
+
+  pub fn push(&mut self, data: &dyn NodeData) {
+    let Some(input) = data.image() else {
+      return;
+    };
+
+    let current_format = (self.src_format, self.src_width, self.src_height);
+    let input_format = (input.format(), input.width() as i32, input.height() as i32);
 
     let raw_frame_interval = input.frame_interval();
     self.frame_interval = if raw_frame_interval.as_nanos() == 0 { Duration::from_millis(16) } else { raw_frame_interval };
@@ -542,55 +548,82 @@ impl Converter {
     self.pts_to_time.push_back((pts, data.time()));
     self.pts += 1;
     unsafe {
-      if let Some(decoder) = self.decoder {
+      if let Some(_) = self.decoder {
         let plane = input.plane(0);
 
         let buffer_pos = self.in_buffer.len() - AV_INPUT_BUFFER_PADDING_SIZE as usize;
         self.in_buffer.resize(self.in_buffer.len() + plane.len(), 0);
-        self.in_buffer[buffer_pos..(buffer_pos+plane.len())].copy_from_slice(plane);
 
-        let mut offset = 0;
-        while offset + (AV_INPUT_BUFFER_PADDING_SIZE as usize) < self.in_buffer.len() {
-          let used = ffi::av_parser_parse2(
-            self.parser, decoder, 
-            &mut (*self.parser_packet).data,
-            &mut (*self.parser_packet).size,
-            self.in_buffer.as_ptr().add(offset),
-            (self.in_buffer.len() - (AV_INPUT_BUFFER_PADDING_SIZE as usize) - offset) as i32,
-            pts, ffi::AV_NOPTS_VALUE, 
-            self.num_input_bytes
-          );
-          offset += used as usize;
-          self.num_input_bytes += used as i64;
-
-          if (*self.parser_packet).size > 0 {
-            (*self.parser_packet).pts = (*self.parser).pts;
-            let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
-            assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
-          }
-          
-          if used == 0 && (*self.parser_packet).size == 0 {
-            break;
-          }
-        }
-        if offset > 0 {
-          self.in_buffer.drain(0..offset);
-        }
+        let end = buffer_pos+plane.len();
+        self.in_buffer[buffer_pos..end].copy_from_slice(plane);
+        self.slice_to_pts.push_back((end, pts));
+        
       } else {
-        let ret = ffi::av_frame_make_writable(self.src_frame);
-        assert!(ret >= 0, "av_frame_make_writable {}", av_error_string(ret));
-        node_to_image(input, (*self.src_frame).data, (*self.src_frame).linesize);
-        (*self.src_frame).pts = pts;
-        self.raw_pending = true;
+        let frame = self.get_writable_src_frame();
+        node_to_image(input, (*frame).data, (*frame).linesize);
+        (*frame).pts = pts;
+        self.push_pending_src_frame(frame);
       }
     }
-
-    ConverterResult { converter: self, passthrough: None, exhausted: false }
   }
 
-  fn pull<'a>(&'a mut self) -> Option<Box<dyn NodeData + 'a>> {
+  fn parser_to_decoder(&mut self, decoder: *mut ffi::AVCodecContext) {
+    unsafe {
+      let mut offset = 0;
+      while offset + (AV_INPUT_BUFFER_PADDING_SIZE as usize) < self.in_buffer.len() {
+        let pts = loop {
+          let (end, pts) = self.slice_to_pts.front().expect("Ran out of pts while parsing");
+          if offset < *end {
+            break *pts;
+          }
+          self.slice_to_pts.pop_front();
+        };
+
+        let used = ffi::av_parser_parse2(
+          self.parser, decoder, 
+          &mut (*self.parser_packet).data,
+          &mut (*self.parser_packet).size,
+          self.in_buffer.as_ptr().add(offset),
+          (self.in_buffer.len() - (AV_INPUT_BUFFER_PADDING_SIZE as usize) - offset) as i32,
+          pts, ffi::AV_NOPTS_VALUE, 
+          self.num_input_bytes
+        );
+        offset += used as usize;
+        self.num_input_bytes += used as i64;
+
+        if (*self.parser_packet).size > 0 {
+          (*self.parser_packet).pts = (*self.parser).pts;
+          let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
+          assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+        }
+        
+        if used == 0 && (*self.parser_packet).size == 0 {
+          break;
+        }
+      }
+      if offset > 0 {
+        self.in_buffer.drain(0..offset);
+        for (end, _) in self.slice_to_pts.iter_mut() {
+          *end -= offset;
+        }
+      }
+    }
+  }
+
+  pub fn reconfigure(&mut self, params: ConverterParams) {
+    let ConverterParams {quality, width, height, format, ..} = params;
+    self.quality = ffi::FF_QP2LAMBDA * quality.unwrap_or(5);
+    self.dst_width = width;
+    self.dst_height = height;
+    self.dst_format = format;
+    self.initialized = false;
+  }
+
+  pub fn pull<'a>(&'a mut self) -> Option<Box<dyn NodeData + 'a>> {
     unsafe {
       let (decoded_frame, need_unref) = if let Some(decoder) = self.decoder {
+        self.parser_to_decoder(decoder);
+
         let ret = ffi::avcodec_receive_frame(decoder, self.decoder_frame);
         if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
           return None;                   // needs more input / fully drained
@@ -598,11 +631,10 @@ impl Converter {
         assert!(ret >= 0, "avcodec_receive_frame: {}", av_error_string(ret));
         (self.decoder_frame, true)
       } else {
-        if !self.raw_pending {
-          return None;
+        match self.get_pending_src_frame() {
+          Some(f) => { (f, false) }
+          None => {return None;}
         }
-        self.raw_pending = false;
-        (self.src_frame, false)
       };
 
       let pts = match self.pts_to_time.iter().position(|(pts, _)| pts == &(*decoded_frame).pts) {
@@ -628,14 +660,14 @@ impl Converter {
         }
         (self.scaled_frame, false)
       } else {
-        (decoded_frame, true)
+        (decoded_frame, need_unref)
       };
 
       if let Some(encoder) = self.encoder {
         (*scaled_frame).quality = self.quality;
         let ret = ffi::avcodec_send_frame(encoder, scaled_frame);
         assert!(ret >= 0, "avcodec_send_frame: {}", av_error_string(ret));
-        if need_unref {
+        if need_unref2 {
           ffi::av_frame_unref(scaled_frame);
         }
         self.out_buffer.clear();
@@ -691,8 +723,14 @@ impl Drop for Converter {
       if self.decoder_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.decoder_frame);
       }
-      if self.src_frame != std::ptr::null_mut() {
-        ffi::av_frame_free(&mut self.src_frame);
+      for f in self.writable_src_frames.iter_mut() {
+        ffi::av_frame_free(f);
+      }
+      for f in self.pending_src_frames.iter_mut() {
+        ffi::av_frame_free(f);
+      }
+      for f in self.pulled_src_frames.iter_mut() {
+        ffi::av_frame_free(f);
       }
       if self.scaled_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.scaled_frame);
@@ -705,30 +743,5 @@ impl Drop for Converter {
         ffi::av_packet_free(&mut self.parser_packet);
       }
     }
-  }
-}
-
-pub struct ConverterResult<'a, 'b> {
-  converter: &'a mut Converter,
-  passthrough: Option<Box<PassthroughImage<'b>>>,
-  exhausted: bool,
-}
-
-impl<'a, 'b: 'a> ConverterResult<'a, 'b> {
-  pub fn pull<'c>(&'c mut self) -> Option<Box<dyn NodeData + 'c>> {
-    if self.exhausted {
-      return None;
-    }
-    match self.passthrough.take() {
-      Some(p) => {
-        self.exhausted = true;
-        return Some(p)
-      },
-      None => {}
-    };
-
-    let temp = self.converter.pull();
-    self.exhausted = temp.is_none();
-    temp
   }
 }

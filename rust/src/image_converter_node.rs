@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
 
 use crate::api::{
   ImageFormat,
@@ -8,13 +11,22 @@ use crate::api::{
 };
 use crate::image_converter::{Converter, ConverterParams};
 
+#[derive(Clone,Debug)]
+struct ParamsHolder {
+  params: ConverterParams,
+  dirty: bool,
+}
+
 pub struct ImageConverterNode {
   api: ThalamusAPI,
-  params: Arc<Mutex<(ConverterParams, bool)>>,
+  params: Arc<Mutex<ParamsHolder>>,
   state_connection: Option<OnDrop>,
   source_connection: Option<OnDrop>,
   data_connection: Option<OnDrop>,
   signaler: Arc<OffMainSignaler>,
+  converter: Arc<Mutex<Converter>>,
+  notify: Arc<Notify>,
+  dropping: Arc<AtomicBool>,
 }
 
 impl NodeConsts for ImageConverterNode {
@@ -35,8 +47,9 @@ impl ImageConverterNode {
           return;
         };
 
-        let mut params = this.params.lock().unwrap();
-        let format = match v.to_uppercase().as_str() {
+        let mut lock = this.params.lock().unwrap();
+        lock.dirty = true;
+        lock.params.format = match v.to_uppercase().as_str() {
           "GRAY" => Some(ImageFormat::Gray),
           "RGB" => Some(ImageFormat::RGB), 
           "YUYV422" => Some(ImageFormat::YUYV422), 
@@ -47,28 +60,26 @@ impl ImageConverterNode {
           "MPEG4" => Some(ImageFormat::MPEG4),
           _ => None
         };
-        *params = (ConverterParams { format, ..params.0}, true);
-        //*this.converter.lock().unwrap() = Converter::new(this.api.thread_safe(), this.params);
       },
       "Width" => {
         if let StateValue::Int(v) = value {
-          let mut params = this.params.lock().unwrap();
-          let width = if v > 0 { Some(v as i32) } else { None };
-          *params = (ConverterParams { width, ..params.0}, true);
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.width = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "Height" => {
         if let StateValue::Int(v) = value {
-          let mut params = this.params.lock().unwrap();
-          let height = if v > 0 { Some(v as i32) } else { None };
-          *params = (ConverterParams { height, ..params.0}, true);
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.height = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "Quality" => {
         if let StateValue::Int(v) = value {
-          let mut params = this.params.lock().unwrap();
-          let quality = if v > 0 { Some(v as i32) } else { None };
-          *params = (ConverterParams { quality, ..params.0}, true);
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.quality = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "Source" => {
@@ -85,29 +96,26 @@ impl ImageConverterNode {
             return
           };
           let mut borrow = this.borrow_mut();
-
-          let api = borrow.api.thread_safe();
           let params = borrow.params.clone();
-          let mut params_lock = borrow.params.lock().unwrap();
-          let mut converter = Converter::new(api, params_lock.0);
-          params_lock.1 = false;
-          drop(params_lock);
-
+          let converter = borrow.converter.clone();
           let signaler = borrow.signaler.clone();
+          let notify = borrow.notify.clone();
           borrow.data_connection = Some(node.subscribe_multithreaded(move |node| {
-            let data = node.data();
-
+            let mut converter = converter.lock().unwrap();
             {
-              let mut params_lock = params.lock().unwrap();
-              if params_lock.1 {
-                converter = Converter::new(api, params_lock.0);
-                params_lock.1 = false;
+              let mut params = params.lock().unwrap();
+              if params.dirty {
+                converter.reconfigure(params.params);
+                params.dirty = false;
               }
             }
 
-            let mut result = converter.push(&data);
-            while let Some(image) = result.pull() {
-              let _ = signaler.ready_this_thread(image.as_ref());
+            let data = node.data();
+            if !converter.needs_conversion(&data) {
+              let _ = signaler.ready_this_thread(&data);
+            } else {
+              converter.push(&data);
+              notify.notify_one();
             }
           }));
         }));
@@ -116,25 +124,46 @@ impl ImageConverterNode {
       _ => {}
     }
   }
+
+  async fn converter_task(converter: Arc<Mutex<Converter>>, signaler: Arc<OffMainSignaler>, notify: Arc<Notify>, dropping: Arc<AtomicBool>) {
+    loop {
+      if dropping.load(Ordering::SeqCst) {
+        return;
+      }
+      {
+        let mut converter = converter.lock().unwrap();
+        while let Some(image) = converter.pull() {
+          let _ = signaler.ready(&*image);
+        }
+      }
+      notify.notified().await;
+    }
+  }
 }
 
 impl Node for ImageConverterNode {
   fn new(api: ThalamusAPI, node_token: NodeToken, state: State, _token: MainThreadToken) -> Rc<RefCell<Self>> {
     let signaler = OffMainSignaler::new(api, node_token);
     signaler.unblock();
-    let params = ConverterParams { 
-      format: None, 
-      width: None, 
-      height: None, 
-      quality: None,
+    let params = ParamsHolder {
+      params: ConverterParams { 
+        format: None, 
+        width: None, 
+        height: None, 
+        quality: None,
+      },
+      dirty: true,
     };
     let result = Rc::new(RefCell::new(ImageConverterNode {
-      params: Arc::new(Mutex::new((params, true))),
+      params: Arc::new(Mutex::new(params.clone())),
+      converter: Arc::new(Mutex::new(Converter::new(api.thread_safe(), params.params))),
       api,
       state_connection: None,
       source_connection: None,
       data_connection: None,
       signaler,
+      notify: Arc::new(Notify::new()),
+      dropping: Arc::new(AtomicBool::new(false))
     }));
 
     let change_ref = Rc::downgrade(&result);
@@ -148,10 +177,20 @@ impl Node for ImageConverterNode {
     result.borrow_mut().state_connection = Some(state.connect(state_callback));
     state.recap();
 
+    {
+      let borrow = result.borrow();
+      let converter = borrow.converter.clone();
+      let signaler = borrow.signaler.clone();
+      let notify = borrow.notify.clone();
+      let dropping = borrow.dropping.clone();
+      api.tokio().as_ref().unwrap().spawn(ImageConverterNode::converter_task(converter, signaler, notify, dropping));
+    }
     result
   }
 
   fn predrop(&self, token: crate::api::PredropToken) {
+    self.dropping.store(true, Ordering::SeqCst);
     self.signaler.predrop(token);
+    self.notify.notify_one();
   }
 }

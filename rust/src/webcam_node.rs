@@ -232,6 +232,13 @@ impl WebcamNode {
     // The configured format normally comes straight from get_formats, but it may be from another
     // camera, so pick the closest format the camera actually has.  Resolution
     // takes priority over frame rate, which takes priority over the pixel format.
+    //
+    // The frame interval comes from the format we request rather than from
+    // camera.frame_rate(): nokhwa's Media Foundation backend
+    // (nokhwa-bindings-windows 0.4.6, format_refreshed) keeps only the low 32
+    // bits of MF_MT_FRAME_RATE, i.e. the ratio's denominator, so it reports
+    // 1 fps for every camera on Windows.
+    let frame_rate;
     match query_formats(&mut camera) {
       Ok(formats) => {
         *active_formats.lock().unwrap() = Some((index, formats.clone()));
@@ -258,9 +265,12 @@ impl WebcamNode {
               nokhwa::utils::RequestedFormatType::Exact(best),
               &allowed,
             );
-            if let Err(e) = camera.set_camera_requset(exact) {
-              println!("Camera Format Selection failed: {:?}", e);
-              return;
+            match camera.set_camera_requset(exact) {
+              Ok(format) => frame_rate = format.frame_rate(),
+              Err(e) => {
+                println!("Camera Format Selection failed: {:?}", e);
+                return;
+              }
             }
           }
           None => {
@@ -274,6 +284,13 @@ impl WebcamNode {
         return;
       }
     }
+
+    // Zero means unknown to consumers (e.g. storage falls back to a default).
+    let frame_interval = if frame_rate > 0 {
+      Duration::from_secs_f64(1.0 / frame_rate as f64)
+    } else {
+      Duration::ZERO
+    };
 
     match camera.open_stream() {
       Ok(_) => {}
@@ -301,7 +318,6 @@ impl WebcamNode {
         nokhwa::utils::FrameFormat::RAWRGB => api::ImageFormat::RGB,
         nokhwa::utils::FrameFormat::RAWBGR => api::ImageFormat::BGR,
       };
-      let frame_interval = Duration::from_secs_f64(1.0 / (camera.frame_rate() as f64));
 
       let resolution = buffer.resolution();
       //println!("{} {} {} {}", buffer.buffer().len(), resolution.width(), resolution.height(), buffer.source_frame_format());

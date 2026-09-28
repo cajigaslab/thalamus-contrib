@@ -37,7 +37,7 @@ def widgets():
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
       UserData(UserDataType.COMBO_BOX, 'View Rotation', '0', ['0', '90', '180', '270']),
-    ]),
+    ], py_viewer=True),
     'RTMPS': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
@@ -56,7 +56,8 @@ def widgets():
       UserData(UserDataType.SPINBOX, 'Quality', 5, []),
       UserData(UserDataType.SPINBOX, 'Width', 0, []),
       UserData(UserDataType.SPINBOX, 'Height', 0, []),
-    ]),
+      UserData(UserDataType.CHECK_BOX, 'View', False, []),
+    ], py_viewer = True),
     'SLEEVE': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.DEFAULT, 'Address', '', []),
