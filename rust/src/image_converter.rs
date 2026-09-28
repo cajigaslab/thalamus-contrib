@@ -62,6 +62,7 @@ pub struct Converter {
   writable_src_frames: VecDeque<*mut ffi::AVFrame>,
   pending_src_frames: VecDeque<*mut ffi::AVFrame>,
   pulled_src_frames: VecDeque<*mut ffi::AVFrame>,
+  need_key_frame: bool,
 }
 
 #[derive(Debug,Clone,Copy)]
@@ -287,7 +288,7 @@ impl Converter {
       dst_format: format,
       num_input_bytes: 0,
       in_buffer: vec![],
-      scaler: Some(std::ptr::null_mut()),
+      scaler: None,
       src_format: ImageFormat::Gray,
       src_width: 0,
       src_height: 0,
@@ -303,6 +304,7 @@ impl Converter {
       writable_src_frames: VecDeque::new(),
       pending_src_frames: VecDeque::new(),
       pulled_src_frames: VecDeque::new(),
+      need_key_frame: true,
     };
     result
   }
@@ -436,6 +438,7 @@ impl Converter {
 
       self.pts = 0;
       self.num_input_bytes = 0;
+      self.need_key_frame = true;
       self.available_times.clear();
       self.pts_to_time.clear();
 
@@ -592,9 +595,13 @@ impl Converter {
         self.num_input_bytes += used as i64;
 
         if (*self.parser_packet).size > 0 {
-          (*self.parser_packet).pts = (*self.parser).pts;
-          let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
-          assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+          let discard = self.need_key_frame && (*self.parser).pict_type != ffi::AVPictureType::AV_PICTURE_TYPE_I as i32;
+          if !discard {
+            self.need_key_frame = false;
+            (*self.parser_packet).pts = (*self.parser).pts;
+            let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
+            assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+          }
         }
         
         if used == 0 && (*self.parser_packet).size == 0 {
@@ -613,6 +620,7 @@ impl Converter {
   pub fn reconfigure(&mut self, params: ConverterParams) {
     let ConverterParams {quality, width, height, format, ..} = params;
     self.quality = ffi::FF_QP2LAMBDA * quality.unwrap_or(5);
+    self.dst_pix = format.map(image_to_pix);
     self.dst_width = width;
     self.dst_height = height;
     self.dst_format = format;
