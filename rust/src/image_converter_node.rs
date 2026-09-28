@@ -13,6 +13,7 @@ use crate::api::{
   ThalamusAPIThreadSafe,
 };
 use crate::image_converter::{Converter, ConverterParams};
+use crate::image_viewer::{ImageSink, ImageViewer};
 
 /// Input image time (NodeData::time) -> when that image arrived, for images
 /// that haven't come out of the node yet.
@@ -104,6 +105,11 @@ struct ParamsHolder {
 
 pub struct ImageConverterNode {
   api: ThalamusAPI,
+  state: State,
+  main_thread_token: MainThreadToken,
+  // Open while View is true; shows every image this node outputs.
+  viewer: Option<ImageViewer>,
+  viewer_sink: ImageSink,
   params: Arc<Mutex<ParamsHolder>>,
   state_connection: Option<OnDrop>,
   source_connection: Option<OnDrop>,
@@ -126,7 +132,7 @@ impl ImageConverterNode {
       return;
     };
 
-    let this = rc.borrow_mut();
+    let mut this = rc.borrow_mut();
     match key_str.as_str() {
       "Format" => {
         let StateValue::String(v) = value else {
@@ -168,6 +174,21 @@ impl ImageConverterNode {
           lock.params.quality = if v > 0 { Some(v as i32) } else { None };
         }
       },
+      "View" => {
+        if value != StateValue::Bool(true) {
+          this.viewer = None;
+        } else if this.viewer.is_none() {
+          let (api, state, sink, token) =
+            (this.api, this.state.clone(), this.viewer_sink.clone(), this.main_thread_token);
+          // ImageViewer::new may write view_geometry to the state, which calls
+          // back into on_state, so the node can't stay borrowed.
+          drop(this);
+          match ImageViewer::new(api, state, &sink, token) {
+            Ok(viewer) => rc.borrow_mut().viewer = Some(viewer),
+            Err(e) => println!("ImageConverterNode: failed to create image viewer: {e}"),
+          }
+        }
+      },
       "Source" => {
         let StateValue::String(name) = value else {
           return;
@@ -187,6 +208,7 @@ impl ImageConverterNode {
           let signaler = borrow.signaler.clone();
           let notify = borrow.notify.clone();
           let arrivals = borrow.arrivals.clone();
+          let viewer_sink = borrow.viewer_sink.clone();
           let api = borrow.api.thread_safe();
           borrow.data_connection = Some(node.subscribe_multithreaded(move |node| {
             let arrived = api.time();
@@ -203,6 +225,9 @@ impl ImageConverterNode {
             record_arrival(&arrivals, data.time(), arrived);
             if !converter.needs_conversion(&data) {
               let latency_ms = take_latency_ms(&arrivals, data.time(), api.time());
+              if let Some(image) = data.image() {
+                viewer_sink.update(image);
+              }
               let _ = signaler.ready_this_thread(&WithStats::new(&data, latency_ms));
             } else {
               converter.push(&data);
@@ -223,6 +248,7 @@ impl ImageConverterNode {
     dropping: Arc<AtomicBool>,
     api: ThalamusAPIThreadSafe,
     arrivals: Arrivals,
+    viewer_sink: ImageSink,
   ) {
     loop {
       if dropping.load(Ordering::SeqCst) {
@@ -233,6 +259,10 @@ impl ImageConverterNode {
         while let Some(image) = converter.pull() {
           // Converted images keep their input's time, which is the key.
           let latency_ms = take_latency_ms(&arrivals, image.time(), api.time());
+          // Encoded (MPEG4) output is dropped by the viewer.
+          if let Some(image) = image.image() {
+            viewer_sink.update(image);
+          }
           let _ = signaler.ready(&WithStats::new(&*image, latency_ms));
         }
       }
@@ -242,7 +272,7 @@ impl ImageConverterNode {
 }
 
 impl Node for ImageConverterNode {
-  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, _token: MainThreadToken) -> Rc<RefCell<Self>> {
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Rc<RefCell<Self>> {
     let signaler = OffMainSignaler::new(api, node_token);
     signaler.unblock();
     let params = ParamsHolder {
@@ -258,6 +288,10 @@ impl Node for ImageConverterNode {
       params: Arc::new(Mutex::new(params.clone())),
       converter: Arc::new(Mutex::new(Converter::new(api.thread_safe(), params.params))),
       api,
+      state: state.clone(),
+      main_thread_token: token,
+      viewer: None,
+      viewer_sink: ImageSink::new(),
       state_connection: None,
       source_connection: None,
       data_connection: None,
@@ -285,6 +319,7 @@ impl Node for ImageConverterNode {
       let notify = borrow.notify.clone();
       let dropping = borrow.dropping.clone();
       let arrivals = borrow.arrivals.clone();
+      let viewer_sink = borrow.viewer_sink.clone();
       api.tokio().as_ref().unwrap().spawn(ImageConverterNode::converter_task(
         converter,
         signaler,
@@ -292,6 +327,7 @@ impl Node for ImageConverterNode {
         dropping,
         api.thread_safe(),
         arrivals,
+        viewer_sink,
       ));
     }
     result

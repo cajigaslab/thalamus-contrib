@@ -19,7 +19,7 @@
 
 use ash::khr;
 use ash::vk;
-use imgui::Context;
+use imgui::{Context, SuspendedContext};
 use imgui_rs_vulkan_renderer::{Options, Renderer};
 
 use crate::api::{SDLWindow, ThalamusAPI};
@@ -69,7 +69,9 @@ pub struct ImguiWindow {
   custom_desc_layout: vk::DescriptorSetLayout,
   custom_desc_pool: vk::DescriptorPool,
 
-  pub ctx: Context,
+  // Suspended except inside render_frame: imgui-rs allows only one active
+  // context per thread, and every viewer window has its own.
+  ctx: Option<SuspendedContext>,
   platform: ImguiPlatform,
   renderer: Renderer,
   last_frame_time: std::time::Instant,
@@ -121,7 +123,9 @@ impl ImguiWindow {
       .map_err(|e| format!("{e:?}"))?;
     let cmd_pool = api.create_vulkan_command_pool();
 
-    let mut ctx = Context::create();
+    let mut ctx = SuspendedContext::create()
+      .activate()
+      .map_err(|_| "another imgui context is active".to_string())?;
     let platform = ImguiPlatform::new(api, &mut ctx, window_id);
 
     let renderer = {
@@ -203,7 +207,7 @@ impl ImguiWindow {
       dirty: true,
       custom_desc_layout,
       custom_desc_pool,
-      ctx,
+      ctx: Some(ctx.suspend()),
       platform,
       renderer,
       last_frame_time: std::time::Instant::now(),
@@ -214,6 +218,10 @@ impl ImguiWindow {
 
   pub fn should_close(&self) -> bool {
     self.platform.should_close()
+  }
+
+  pub fn set_title(&self, title: &str) {
+    self.window.set_title(title);
   }
 
   /// Current window position and size (`(x, y, w, h)`).
@@ -286,10 +294,30 @@ impl ImguiWindow {
     prepare: impl FnOnce(&ash::Device, vk::CommandBuffer, usize) -> R,
     build_ui: impl FnOnce(&imgui::Ui, usize, R),
   ) -> Result<(), String> {
+    let suspended = self.ctx.take().expect("imgui context missing");
+    let mut ctx = match suspended.activate() {
+      Ok(ctx) => ctx,
+      Err(suspended) => {
+        self.ctx = Some(suspended);
+        return Err("another imgui context is active".to_string());
+      }
+    };
+    let result = self.render_frame_active(&mut ctx, prepare, build_ui);
+    self.ctx = Some(ctx.suspend());
+    result
+  }
+
+  /// `render_frame` with this window's context activated as `ctx`.
+  fn render_frame_active<R>(
+    &mut self,
+    ctx: &mut Context,
+    prepare: impl FnOnce(&ash::Device, vk::CommandBuffer, usize) -> R,
+    build_ui: impl FnOnce(&imgui::Ui, usize, R),
+  ) -> Result<(), String> {
     let now = std::time::Instant::now();
     let delta = (now - self.last_frame_time).as_secs_f32();
     self.last_frame_time = now;
-    self.platform.new_frame(&mut self.ctx, delta);
+    self.platform.new_frame(ctx, delta);
 
     if self.dirty {
       self.recreate_swapchain()?;
@@ -304,7 +332,7 @@ impl ImguiWindow {
     // but more to the point a real UI needs the actual extent to lay out
     // against). Pixel dimensions, matching the swapchain; no separate
     // display_framebuffer_scale handling (HiDPI) is done anywhere else here.
-    self.ctx.io_mut().display_size = [self.extent.width as f32, self.extent.height as f32];
+    ctx.io_mut().display_size = [self.extent.width as f32, self.extent.height as f32];
 
     let frame_idx = self.frame % self.in_flight.len();
     unsafe {
@@ -361,9 +389,9 @@ impl ImguiWindow {
         .device
         .cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
 
-      let ui = self.ctx.frame();
+      let ui = ctx.frame();
       build_ui(ui, frame_idx, prepared);
-      let draw_data = self.ctx.render();
+      let draw_data = ctx.render();
       self
         .renderer
         .cmd_draw(cmd, draw_data)

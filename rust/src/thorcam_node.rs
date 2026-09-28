@@ -918,7 +918,6 @@ impl ThorcamNode {
           let viewer = ImageViewer::new(
             this.api,
             this.state.clone(),
-            "Thorcam",
             &this.viewer_sink,
             this.main_thread_token,
           );

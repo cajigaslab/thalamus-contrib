@@ -29,6 +29,9 @@ nokhwa = { version = "0.10.0-rc.6", features = ["input-native"] }
 [build-dependencies]
 bindgen = "0.72"
 cmake = "0.1.58"
+# wgsl-in is unused, but naga 30's glsl-in doesn't compile without it or
+# spv-in (a helper it calls, front::interpolator, is gated on those two).
+naga = { version = "30.0.1", features = ["glsl-in", "spv-out", "wgsl-in"] }
 pkg-config = "0.3"
 ureq = "3.3.0"
 zip = "8.6.0"

@@ -11,6 +11,7 @@ use crate::api::{
   OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_IMAGE,
   ThalamusAPI, ThalamusAPIThreadSafe,
 };
+use crate::image_viewer::{ImageSink, ImageViewer};
 
 struct Frame<'a> {
   // Borrowed straight from nokhwa's buffer; only the first num_planes are used.
@@ -199,6 +200,9 @@ pub struct WebcamNode {
   signaler: Arc<OffMainSignaler>,
   webcam_thread: Option<std::thread::JoinHandle<()>>,
   active_formats: ActiveFormats,
+  // Open while View is true; the capture thread sends it every frame.
+  viewer: Option<ImageViewer>,
+  viewer_sink: ImageSink,
 }
 
 impl WebcamNode {
@@ -212,6 +216,7 @@ impl WebcamNode {
     signaler: Arc<OffMainSignaler>,
     settings: WebcamSettings,
     active_formats: ActiveFormats,
+    viewer_sink: ImageSink,
   ) {
     println!("webcam start");
     let Some(index) = settings.index else {
@@ -349,6 +354,8 @@ impl WebcamNode {
         format,
         frame_interval,
       };
+      // MJPEG frames are dropped by the viewer.
+      viewer_sink.update(&frame);
       match signaler.ready(&frame) {
         Ok(v) => {
           if !v {
@@ -362,22 +369,41 @@ impl WebcamNode {
     println!("webcam end");
   }
 
-  fn on_state(&mut self, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
+  /// Borrows the node only in the arms that need it: opening the viewer
+  /// writes view_geometry to the state, which calls back into this.
+  fn on_state(rc: &Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
     let StateValue::String(key_str) = key else {
       return;
     };
     match key_str.as_str() {
+      "View" => {
+        let mut this = rc.borrow_mut();
+        if value != StateValue::Bool(true) {
+          this.viewer = None;
+        } else if this.viewer.is_none() {
+          let (api, state, sink, token) =
+            (this.api, this.state.clone(), this.viewer_sink.clone(), this.main_thread_token);
+          drop(this);
+          match ImageViewer::new(api, state, &sink, token) {
+            Ok(viewer) => rc.borrow_mut().viewer = Some(viewer),
+            Err(e) => println!("WebcamNode: failed to create image viewer: {e}"),
+          }
+        }
+      }
       "Running" => {
-        self.stop_webcam();
+        let mut this = rc.borrow_mut();
+        let this = &mut *this;
+        this.stop_webcam();
         if value == StateValue::Bool(true) {
-          let api = self.api.thread_safe();
-          let signaler = self.signaler.clone();
+          let api = this.api.thread_safe();
+          let signaler = this.signaler.clone();
           signaler.unblock();
-          let wrapped_state = MainThreadOnly::new(self.state.clone(), self.main_thread_token);
-          let settings = WebcamSettings::read(&self.state);
-          let active_formats = self.active_formats.clone();
-          self.webcam_thread = Some(std::thread::spawn(move || {
-            WebcamNode::webcam(api, signaler, settings, active_formats.clone());
+          let wrapped_state = MainThreadOnly::new(this.state.clone(), this.main_thread_token);
+          let settings = WebcamSettings::read(&this.state);
+          let active_formats = this.active_formats.clone();
+          let viewer_sink = this.viewer_sink.clone();
+          this.webcam_thread = Some(std::thread::spawn(move || {
+            WebcamNode::webcam(api, signaler, settings, active_formats.clone(), viewer_sink);
             *active_formats.lock().unwrap() = None;
             api.post_to_main(|main_thread_token| {
               let state = wrapped_state.take(main_thread_token);
@@ -474,7 +500,7 @@ impl Node for WebcamNode {
       let weak2 = weak.clone();
       let callback = move |source, action, key, value| {
         if let Some(strong) = weak2.upgrade() {
-          strong.borrow_mut().on_state(source, action, key, value);
+          WebcamNode::on_state(&strong, source, action, key, value);
         }
       };
       let _state_connection = state.connect(callback);
@@ -486,6 +512,8 @@ impl Node for WebcamNode {
         signaler,
         webcam_thread: None,
         active_formats: Arc::new(Mutex::new(None)),
+        viewer: None,
+        viewer_sink: ImageSink::new(),
       })
     });
 
@@ -503,6 +531,7 @@ impl Node for WebcamNode {
 
 impl Drop for WebcamNode {
   fn drop(&mut self) {
+    self.viewer = None;
     self.stop_webcam();
     self.state.set(
       api::StateKey::String("Running".to_string()),

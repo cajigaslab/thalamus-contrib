@@ -1,0 +1,100 @@
+// Converts one raw camera frame, copied byte-for-byte into `src`, into the
+// RGBA image the image viewer samples. Compiled to SPIR-V by build.rs.
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// The frame's planes, back to back. Read as uints since 8-bit storage
+// buffer access is an optional feature; bytes are extracted by shifting.
+layout(std430, set = 0, binding = 0) readonly buffer Source {
+  uint data[];
+};
+
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+
+// Format codes; must match ShaderFormat in image_viewer.rs.
+const uint GRAY = 0;
+const uint RGB = 1;
+const uint BGR = 2;
+const uint YUYV422 = 3;
+const uint YUV420P = 4;
+const uint YUVJ420P = 5;
+const uint NV12 = 6;
+
+layout(push_constant) uniform Params {
+  uint format;
+  uint width;
+  uint height;
+  // Byte offset of each plane in `data`, and each plane's row stride in
+  // bytes. Scalars rather than arrays: naga lays out arrays in push
+  // constants with a 16-byte stride.
+  uint offset0;
+  uint offset1;
+  uint offset2;
+  uint stride0;
+  uint stride1;
+  uint stride2;
+} p;
+
+float byte_at(uint addr) {
+  uint word = data[addr >> 2];
+  return float((word >> ((addr & 3u) * 8u)) & 0xFFu) / 255.0;
+}
+
+// Byte address of column `x` (in bytes) of row `y` of plane `plane`.
+uint addr(uint plane, uint x, uint y) {
+  if (plane == 0u) {
+    return p.offset0 + y * p.stride0 + x;
+  } else if (plane == 1u) {
+    return p.offset1 + y * p.stride1 + x;
+  }
+  return p.offset2 + y * p.stride2 + x;
+}
+
+// BT.601. Limited range scales luma from [16, 235] and chroma from
+// [16, 240] to the full [0, 255] first.
+vec3 yuv_to_rgb(float y, float u, float v, bool full_range) {
+  u -= 128.0 / 255.0;
+  v -= 128.0 / 255.0;
+  if (!full_range) {
+    y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+    u *= 255.0 / 224.0;
+    v *= 255.0 / 224.0;
+  }
+  return clamp(
+      vec3(y + 1.402 * v, y - 0.344136 * u - 0.714136 * v, y + 1.772 * u),
+      0.0, 1.0);
+}
+
+void main() {
+  uvec2 pos = gl_GlobalInvocationID.xy;
+  if (pos.x >= p.width || pos.y >= p.height) {
+    return;
+  }
+  uint x = pos.x;
+  uint y = pos.y;
+
+  vec3 rgb;
+  if (p.format == GRAY) {
+    rgb = vec3(byte_at(addr(0, x, y)));
+  } else if (p.format == RGB) {
+    uint a = addr(0, 3 * x, y);
+    rgb = vec3(byte_at(a), byte_at(a + 1), byte_at(a + 2));
+  } else if (p.format == BGR) {
+    uint a = addr(0, 3 * x, y);
+    rgb = vec3(byte_at(a + 2), byte_at(a + 1), byte_at(a));
+  } else if (p.format == YUYV422) {
+    // Y0 U Y1 V for each pair of pixels.
+    uint a = addr(0, 4 * (x / 2), y);
+    rgb = yuv_to_rgb(byte_at(a + 2 * (x & 1u)), byte_at(a + 1), byte_at(a + 3), false);
+  } else if (p.format == YUV420P || p.format == YUVJ420P) {
+    rgb = yuv_to_rgb(byte_at(addr(0, x, y)), byte_at(addr(1, x / 2, y / 2)),
+                     byte_at(addr(2, x / 2, y / 2)), p.format == YUVJ420P);
+  } else if (p.format == NV12) {
+    uint a = addr(1, 2 * (x / 2), y / 2);
+    rgb = yuv_to_rgb(byte_at(addr(0, x, y)), byte_at(a), byte_at(a + 1), false);
+  } else {
+    rgb = vec3(1.0, 0.0, 1.0);
+  }
+  imageStore(dst, ivec2(pos), vec4(rgb, 1.0));
+}

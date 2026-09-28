@@ -1,6 +1,9 @@
 //! Nests a live camera preview inside an imgui UI (window chrome, a rotation
-//! slider) on top of `ImguiWindow`. The camera frame is uploaded into a
-//! Vulkan texture and displayed via `imgui`'s custom-texture support; imgui
+//! combo box) on top of `ImguiWindow`. Each camera frame's raw bytes are
+//! copied into a GPU buffer as-is, converted to RGBA by a compute shader
+//! (shaders/convert.comp) into a Vulkan texture, and displayed via `imgui`'s
+//! custom-texture support. Every uncompressed ImageFormat is supported;
+//! MJPEG, MPEG1 and MPEG4 frames are dropped. imgui
 //! has no built-in way to rotate an image, so rotation is done by drawing a
 //! rotated quad (`DrawListMut::add_image_quad`) instead of the plain
 //! `ui.image()` widget -- the standard Dear ImGui trick for this.
@@ -14,26 +17,112 @@ use ash::vk;
 
 use crate::api::{
   ImageData, ImageFormat, MainThreadOnly, MainThreadToken, State, StateKey, StateValue,
-  TaskScope, ThalamusAPI, run_task,
+  OnDrop, TaskScope, ThalamusAPI, run_task,
 };
 use crate::imgui_window::{ImguiWindow, MAX_FRAMES_IN_FLIGHT};
 
-/// Number of tightly-packed bytes per pixel for the formats this viewer
-/// knows how to display, or `None` for formats it doesn't (yet) support
-/// (the YUV variants).
-fn channels_for_format(format: ImageFormat) -> Option<u32> {
-  match format {
-    ImageFormat::Gray => Some(1),
-    ImageFormat::RGB | ImageFormat::BGR => Some(3),
-    ImageFormat::YUYV422
-    | ImageFormat::YUV420P
-    | ImageFormat::YUVJ420P
-    | ImageFormat::NV12
-    | ImageFormat::MJPEG
-    | ImageFormat::MPEG1
-    | ImageFormat::MPEG4 => None,
+/// Format codes understood by the conversion shader; must match the
+/// constants in shaders/convert.comp.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum ShaderFormat {
+  Gray = 0,
+  Rgb = 1,
+  Bgr = 2,
+  Yuyv422 = 3,
+  Yuv420p = 4,
+  Yuvj420p = 5,
+  Nv12 = 6,
+}
+
+/// The planes of a frame as the conversion shader reads them: each plane's
+/// bytes and row stride.
+struct ShaderInput<'a> {
+  format: ShaderFormat,
+  planes: [(&'a [u8], u32); 3],
+  plane_count: usize,
+}
+
+impl ShaderInput<'_> {
+  fn len(&self) -> usize {
+    self.planes[..self.plane_count]
+      .iter()
+      .map(|(bytes, _)| bytes.len())
+      .sum()
   }
 }
+
+/// Splits `image` into the planes the conversion shader reads, or `None` if
+/// it can't be displayed: compressed formats (MJPEG, MPEG1, MPEG4), empty
+/// images, and planes too short for the image's size.
+///
+/// Row strides aren't part of ImageData, so each plane's stride is its length
+/// divided by its row count. Planar formats delivered as a single plane are
+/// assumed to be tightly packed.
+fn shader_input(image: &dyn ImageData) -> Option<ShaderInput<'_>> {
+  let (w, h) = (image.width() as usize, image.height() as usize);
+  if w == 0 || h == 0 {
+    return None;
+  }
+  let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+  // Per plane: the minimum bytes per row and the number of rows.
+  let (format, dims, plane_count) = match image.format() {
+    ImageFormat::Gray => (ShaderFormat::Gray, [(w, h), (0, 0), (0, 0)], 1),
+    ImageFormat::RGB => (ShaderFormat::Rgb, [(3 * w, h), (0, 0), (0, 0)], 1),
+    ImageFormat::BGR => (ShaderFormat::Bgr, [(3 * w, h), (0, 0), (0, 0)], 1),
+    ImageFormat::YUYV422 => (ShaderFormat::Yuyv422, [(4 * cw, h), (0, 0), (0, 0)], 1),
+    ImageFormat::YUV420P => (ShaderFormat::Yuv420p, [(w, h), (cw, ch), (cw, ch)], 3),
+    ImageFormat::YUVJ420P => (ShaderFormat::Yuvj420p, [(w, h), (cw, ch), (cw, ch)], 3),
+    ImageFormat::NV12 => (ShaderFormat::Nv12, [(w, h), (2 * cw, ch), (0, 0)], 2),
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => return None,
+  };
+
+  let mut planes: [(&[u8], u32); 3] = [(&[], 0); 3];
+  if image.num_planes() as usize >= plane_count {
+    for (i, &(row_bytes, rows)) in dims[..plane_count].iter().enumerate() {
+      let bytes = image.plane(i as i32);
+      let stride = bytes.len() / rows;
+      if stride < row_bytes {
+        return None;
+      }
+      planes[i] = (&bytes[..stride * rows], stride as u32);
+    }
+  } else {
+    let mut rest = image.plane(0);
+    for (i, &(row_bytes, rows)) in dims[..plane_count].iter().enumerate() {
+      if rest.len() < row_bytes * rows {
+        return None;
+      }
+      let (bytes, tail) = rest.split_at(row_bytes * rows);
+      planes[i] = (bytes, row_bytes as u32);
+      rest = tail;
+    }
+  }
+  Some(ShaderInput {
+    format,
+    planes,
+    plane_count,
+  })
+}
+
+/// Push constants for the conversion shader; layout matches `Params` in
+/// shaders/convert.comp (whose six scalars after `height` are these two
+/// arrays).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ShaderParams {
+  format: u32,
+  width: u32,
+  height: u32,
+  offsets: [u32; 3],
+  strides: [u32; 3],
+}
+
+// Compiled from shaders/convert.comp by build.rs.
+static CONVERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/convert.comp.spv"));
+
+/// Workgroup size of the conversion shader in each dimension.
+const CONVERT_GROUP_SIZE: u32 = 16;
 
 fn find_mem_type(
   instance: &ash::Instance,
@@ -127,38 +216,25 @@ fn record_barrier(
   }
 }
 
-/// One frame-in-flight slot's worth of sampled texture data. Doubled up
-/// (one per `MAX_FRAMES_IN_FLIGHT` slot) so uploading a new frame never
-/// stomps on a texture the GPU might still be reading from a previous
-/// submit -- see `ImguiWindow::render_frame`'s doc comment.
+/// One texture uploads rotate through: a host-visible buffer each frame's
+/// raw bytes are copied into, and the RGBA image the conversion shader
+/// writes from it and imgui samples.
 #[derive(Default)]
 struct Texture {
   w: u32,
   h: u32,
-  channels: u32, // bytes per pixel stored in the VkImage itself: 1 or 4
   image: vk::Image,
   memory: vk::DeviceMemory,
   view: vk::ImageView,
-  stage_buf: vk::Buffer,
-  stage_mem: vk::DeviceMemory,
-  stage_mapped: *mut std::ffi::c_void,
+  buf: vk::Buffer,
+  buf_mem: vk::DeviceMemory,
+  buf_size: vk::DeviceSize,
+  buf_mapped: *mut std::ffi::c_void,
 }
 
 impl Texture {
-  fn destroy(&mut self, device: &ash::Device) {
+  fn destroy_image(&mut self, device: &ash::Device) {
     unsafe {
-      if !self.stage_mapped.is_null() {
-        device.unmap_memory(self.stage_mem);
-        self.stage_mapped = std::ptr::null_mut();
-      }
-      if self.stage_buf != vk::Buffer::null() {
-        device.destroy_buffer(self.stage_buf, None);
-        self.stage_buf = vk::Buffer::null();
-      }
-      if self.stage_mem != vk::DeviceMemory::null() {
-        device.free_memory(self.stage_mem, None);
-        self.stage_mem = vk::DeviceMemory::null();
-      }
       if self.view != vk::ImageView::null() {
         device.destroy_image_view(self.view, None);
         self.view = vk::ImageView::null();
@@ -172,19 +248,42 @@ impl Texture {
         self.memory = vk::DeviceMemory::null();
       }
     }
+    self.w = 0;
+    self.h = 0;
+  }
+
+  fn destroy_buffer(&mut self, device: &ash::Device) {
+    unsafe {
+      if !self.buf_mapped.is_null() {
+        device.unmap_memory(self.buf_mem);
+        self.buf_mapped = std::ptr::null_mut();
+      }
+      if self.buf != vk::Buffer::null() {
+        device.destroy_buffer(self.buf, None);
+        self.buf = vk::Buffer::null();
+      }
+      if self.buf_mem != vk::DeviceMemory::null() {
+        device.free_memory(self.buf_mem, None);
+        self.buf_mem = vk::DeviceMemory::null();
+      }
+    }
+    self.buf_size = 0;
+  }
+
+  fn destroy(&mut self, device: &ash::Device) {
+    self.destroy_image(device);
+    self.destroy_buffer(device);
   }
 }
 
-/// Locks the shared Vulkan queue for a one-shot command buffer, submits it,
-/// and waits for it to finish -- used for the layout transition a texture
-/// needs right after creation.
-fn transition_layout(
+/// Locks the shared Vulkan queue for a one-shot command buffer that moves a
+/// freshly created image to `SHADER_READ_ONLY_OPTIMAL`, submits it, and waits
+/// for it to finish. Only used for the placeholder textures at startup.
+fn make_sampleable(
   api: ThalamusAPI,
   device: &ash::Device,
   cmd_pool: vk::CommandPool,
   image: vk::Image,
-  from: vk::ImageLayout,
-  to: vk::ImageLayout,
 ) -> Result<(), String> {
   unsafe {
     let cb = device
@@ -201,26 +300,17 @@ fn transition_layout(
         &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
       )
       .map_err(|e| format!("{e:?}"))?;
-
-    let (src_access, dst_access, src_stage, dst_stage) = if from == vk::ImageLayout::UNDEFINED {
-      (
-        vk::AccessFlags::empty(),
-        vk::AccessFlags::TRANSFER_WRITE,
-        vk::PipelineStageFlags::TOP_OF_PIPE,
-        vk::PipelineStageFlags::TRANSFER,
-      )
-    } else {
-      (
-        vk::AccessFlags::TRANSFER_WRITE,
-        vk::AccessFlags::SHADER_READ,
-        vk::PipelineStageFlags::TRANSFER,
-        vk::PipelineStageFlags::FRAGMENT_SHADER,
-      )
-    };
     record_barrier(
-      device, cb, image, from, to, src_access, dst_access, src_stage, dst_stage,
+      device,
+      cb,
+      image,
+      vk::ImageLayout::UNDEFINED,
+      vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+      vk::AccessFlags::empty(),
+      vk::AccessFlags::SHADER_READ,
+      vk::PipelineStageFlags::TOP_OF_PIPE,
+      vk::PipelineStageFlags::FRAGMENT_SHADER,
     );
-
     device
       .end_command_buffer(cb)
       .map_err(|e| format!("{e:?}"))?;
@@ -238,40 +328,18 @@ fn transition_layout(
   Ok(())
 }
 
-/// (Re)builds `tex` at the given size/format, leaving its image in
-/// `UNDEFINED` layout: the caller must transition it (as `build_texture` does,
-/// or with a barrier in its own command buffer) before sampling it.
-/// `channels` is the number of bytes per pixel to store in the texture itself
-/// (1 or 4) -- RGB source data is expanded to RGBA before upload since
-/// VK_FORMAT_R8G8B8_UNORM sampling support isn't guaranteed.
-fn create_texture(
+/// (Re)builds `tex`'s image at `w`x`h`, leaving it in `UNDEFINED` layout.
+/// RGBA8 because storage-image writes to it are guaranteed to be supported.
+fn create_image(
   device: &ash::Device,
   instance: &ash::Instance,
   physical_device: vk::PhysicalDevice,
   tex: &mut Texture,
   w: u32,
   h: u32,
-  channels: u32,
 ) -> Result<(), String> {
-  tex.destroy(device);
-
-  let size = (w as vk::DeviceSize) * (h as vk::DeviceSize) * (channels as vk::DeviceSize);
-  let format = if channels == 1 {
-    vk::Format::R8_UNORM
-  } else {
-    vk::Format::R8G8B8A8_UNORM
-  };
-
-  let (stage_buf, stage_mem) = make_buffer(
-    device,
-    instance,
-    physical_device,
-    size,
-    vk::BufferUsageFlags::TRANSFER_SRC,
-    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-  )?;
-  let stage_mapped = unsafe { device.map_memory(stage_mem, 0, size, vk::MemoryMapFlags::empty()) }
-    .map_err(|e| format!("{e:?}"))?;
+  tex.destroy_image(device);
+  let format = vk::Format::R8G8B8A8_UNORM;
 
   let image = unsafe {
     device.create_image(
@@ -287,15 +355,16 @@ fn create_texture(
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
-        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED)
         .initial_layout(vk::ImageLayout::UNDEFINED),
       None,
     )
   }
   .map_err(|e| format!("{e:?}"))?;
+  tex.image = image;
 
   let req = unsafe { device.get_image_memory_requirements(image) };
-  let memory = unsafe {
+  tex.memory = unsafe {
     device.allocate_memory(
       &vk::MemoryAllocateInfo::default()
         .allocation_size(req.size)
@@ -309,25 +378,14 @@ fn create_texture(
     )
   }
   .map_err(|e| format!("{e:?}"))?;
-  unsafe { device.bind_image_memory(image, memory, 0) }.map_err(|e| format!("{e:?}"))?;
+  unsafe { device.bind_image_memory(image, tex.memory, 0) }.map_err(|e| format!("{e:?}"))?;
 
-  let components = if channels == 1 {
-    vk::ComponentMapping {
-      r: vk::ComponentSwizzle::R,
-      g: vk::ComponentSwizzle::R,
-      b: vk::ComponentSwizzle::R,
-      a: vk::ComponentSwizzle::ONE,
-    }
-  } else {
-    vk::ComponentMapping::default()
-  };
-  let view = unsafe {
+  tex.view = unsafe {
     device.create_image_view(
       &vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(format)
-        .components(components)
         .subresource_range(vk::ImageSubresourceRange {
           aspect_mask: vk::ImageAspectFlags::COLOR,
           base_mip_level: 0,
@@ -339,148 +397,37 @@ fn create_texture(
     )
   }
   .map_err(|e| format!("{e:?}"))?;
-
-  *tex = Texture {
-    w,
-    h,
-    channels,
-    image,
-    memory,
-    view,
-    stage_buf,
-    stage_mem,
-    stage_mapped,
-  };
+  tex.w = w;
+  tex.h = h;
   Ok(())
 }
 
-/// Like `create_texture`, but also transitions the image to
-/// `SHADER_READ_ONLY_OPTIMAL` so it can be sampled right away. Blocks until
-/// the transition has run on the GPU.
-fn build_texture(
-  api: ThalamusAPI,
+/// (Re)builds `tex`'s source buffer with room for at least `size` bytes,
+/// mapped for the lifetime of the buffer.
+fn create_buffer(
   device: &ash::Device,
   instance: &ash::Instance,
   physical_device: vk::PhysicalDevice,
-  cmd_pool: vk::CommandPool,
   tex: &mut Texture,
-  w: u32,
-  h: u32,
-  channels: u32,
+  size: vk::DeviceSize,
 ) -> Result<(), String> {
-  create_texture(device, instance, physical_device, tex, w, h, channels)?;
-  transition_layout(
-    api,
+  tex.destroy_buffer(device);
+  // The shader reads whole uints.
+  let size = size.max(4).next_multiple_of(4);
+  let (buf, buf_mem) = make_buffer(
     device,
-    cmd_pool,
-    tex.image,
-    vk::ImageLayout::UNDEFINED,
-    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-  )
-}
-
-/// Uploads `plane` into `tex`, rebuilding it first if its size/format
-/// changed. Records the copy (and the layout-transition barriers around it)
-/// into `cb`; doesn't submit or wait for anything. Returns `true` if the
-/// texture was rebuilt, meaning its `vk::ImageView` handle changed and any
-/// descriptor set referencing it needs to be rebound.
-fn upload_texture(
-  device: &ash::Device,
-  instance: &ash::Instance,
-  physical_device: vk::PhysicalDevice,
-  tex: &mut Texture,
-  cb: vk::CommandBuffer,
-  plane: &[u8],
-  w: u32,
-  h: u32,
-  src_channels: u32,
-) -> Result<bool, String> {
-  let channels = if src_channels == 1 { 1 } else { 4 };
-  let rebuilt = w != tex.w || h != tex.h || channels != tex.channels;
-  if rebuilt {
-    create_texture(device, instance, physical_device, tex, w, h, channels)?;
-  }
-
-  unsafe {
-    let dst = tex.stage_mapped;
-    if src_channels == 1 {
-      std::ptr::copy_nonoverlapping(plane.as_ptr(), dst as *mut u8, (w as usize) * (h as usize));
-    } else {
-      let pixel_count = (w as usize) * (h as usize);
-      let dst = std::slice::from_raw_parts_mut(dst as *mut u8, pixel_count * 4);
-      for i in 0..pixel_count {
-        dst[4 * i] = plane[3 * i];
-        dst[4 * i + 1] = plane[3 * i + 1];
-        dst[4 * i + 2] = plane[3 * i + 2];
-        dst[4 * i + 3] = 255;
-      }
-    }
-  }
-
-  // A freshly built image has no contents or earlier readers to wait for.
-  // Otherwise earlier frames on this queue may still be sampling it, and this
-  // barrier orders the copy after them.
-  if rebuilt {
-    record_barrier(
-      device,
-      cb,
-      tex.image,
-      vk::ImageLayout::UNDEFINED,
-      vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-      vk::AccessFlags::empty(),
-      vk::AccessFlags::TRANSFER_WRITE,
-      vk::PipelineStageFlags::TOP_OF_PIPE,
-      vk::PipelineStageFlags::TRANSFER,
-    );
-  } else {
-    record_barrier(
-      device,
-      cb,
-      tex.image,
-      vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-      vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-      vk::AccessFlags::SHADER_READ,
-      vk::AccessFlags::TRANSFER_WRITE,
-      vk::PipelineStageFlags::FRAGMENT_SHADER,
-      vk::PipelineStageFlags::TRANSFER,
-    );
-  }
-
-  let region = vk::BufferImageCopy::default()
-    .image_subresource(vk::ImageSubresourceLayers {
-      aspect_mask: vk::ImageAspectFlags::COLOR,
-      mip_level: 0,
-      base_array_layer: 0,
-      layer_count: 1,
-    })
-    .image_extent(vk::Extent3D {
-      width: w,
-      height: h,
-      depth: 1,
-    });
-  unsafe {
-    device.cmd_copy_buffer_to_image(
-      cb,
-      tex.stage_buf,
-      tex.image,
-      vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-      &[region],
-    );
-  }
-
-  record_barrier(
-    device,
-    cb,
-    tex.image,
-    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    vk::AccessFlags::TRANSFER_WRITE,
-    vk::AccessFlags::SHADER_READ,
-    vk::PipelineStageFlags::TRANSFER,
-    vk::PipelineStageFlags::FRAGMENT_SHADER,
-  );
-
-  Ok(rebuilt)
+    instance,
+    physical_device,
+    size,
+    vk::BufferUsageFlags::STORAGE_BUFFER,
+    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+  )?;
+  tex.buf = buf;
+  tex.buf_mem = buf_mem;
+  tex.buf_mapped = unsafe { device.map_memory(buf_mem, 0, size, vk::MemoryMapFlags::empty()) }
+    .map_err(|e| format!("{e:?}"))?;
+  tex.buf_size = size;
+  Ok(())
 }
 
 /// How often the main thread redraws the viewer.
@@ -494,7 +441,11 @@ const TEXTURE_COUNT: usize = MAX_FRAMES_IN_FLIGHT + 2;
 struct PoolTexture {
   texture: Texture,
   id: imgui::TextureId,
+  /// imgui's descriptor set for sampling `texture.image`.
   descriptor_set: vk::DescriptorSet,
+  /// The conversion shader's descriptor set: `texture.buf` in,
+  /// `texture.image` out.
+  convert_set: vk::DescriptorSet,
   /// Number of the last frame that sampled this texture (see
   /// TexturePool::frames_completed); it can't be rewritten until that frame
   /// has finished.
@@ -503,8 +454,52 @@ struct PoolTexture {
   /// wait for another texture's upload to finish before reusing it.
   cmd: vk::CommandBuffer,
   /// Signals when this texture's last upload has finished on the GPU (its
-  /// staging buffer and `cmd` are reusable). Created signaled.
+  /// source buffer and `cmd` are reusable). Created signaled.
   upload_fence: vk::Fence,
+}
+
+/// Points imgui's descriptor set for `tex` at its current image view.
+fn write_sampler_descriptor(
+  device: &ash::Device,
+  set: vk::DescriptorSet,
+  sampler: vk::Sampler,
+  tex: &Texture,
+) {
+  let image_info = [vk::DescriptorImageInfo::default()
+    .sampler(sampler)
+    .image_view(tex.view)
+    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+  let write = [vk::WriteDescriptorSet::default()
+    .dst_set(set)
+    .dst_binding(0)
+    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+    .image_info(&image_info)];
+  unsafe { device.update_descriptor_sets(&write, &[]) };
+}
+
+/// Points the conversion shader's descriptor set for `tex` at its current
+/// buffer and image view.
+fn write_convert_descriptor(device: &ash::Device, set: vk::DescriptorSet, tex: &Texture) {
+  let buffer_info = [vk::DescriptorBufferInfo::default()
+    .buffer(tex.buf)
+    .offset(0)
+    .range(vk::WHOLE_SIZE)];
+  let image_info = [vk::DescriptorImageInfo::default()
+    .image_view(tex.view)
+    .image_layout(vk::ImageLayout::GENERAL)];
+  let writes = [
+    vk::WriteDescriptorSet::default()
+      .dst_set(set)
+      .dst_binding(0)
+      .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+      .buffer_info(&buffer_info),
+    vk::WriteDescriptorSet::default()
+      .dst_set(set)
+      .dst_binding(1)
+      .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+      .image_info(&image_info),
+  ];
+  unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
 
 /// The viewer's textures, shared between the render loop (main thread) and
@@ -519,6 +514,11 @@ struct TexturePool {
   // threads, and uploads run on the caller's thread.
   cmd_pool: vk::CommandPool,
   sampler: vk::Sampler,
+  // The conversion shader and the pool its descriptor sets come from.
+  convert_set_layout: vk::DescriptorSetLayout,
+  convert_layout: vk::PipelineLayout,
+  convert_pipeline: vk::Pipeline,
+  descriptor_pool: vk::DescriptorPool,
   textures: Vec<PoolTexture>,
   newest: Option<usize>,
   /// When the render loop will next draw; uploads that would be replaced
@@ -547,6 +547,18 @@ impl TexturePool {
     let instance = window.instance().clone();
     let physical_device = window.physical_device();
 
+    // Thalamus picks its queue by graphics support alone and doesn't expose
+    // which family it picked, so require every graphics family to also do
+    // compute (true of every desktop GPU).
+    let families =
+      unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    if families.iter().any(|f| {
+      f.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        && !f.queue_flags.contains(vk::QueueFlags::COMPUTE)
+    }) {
+      return Err("the GPU has a graphics queue without compute support".to_string());
+    }
+
     let sampler = unsafe {
       device.create_sampler(
         &vk::SamplerCreateInfo::default()
@@ -555,6 +567,88 @@ impl TexturePool {
           .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
           .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE),
         None,
+      )
+    }
+    .map_err(|e| format!("{e:?}"))?;
+
+    let bindings = [
+      vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+      vk::DescriptorSetLayoutBinding::default()
+        .binding(1)
+        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+    ];
+    let convert_set_layout = unsafe {
+      device.create_descriptor_set_layout(
+        &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+        None,
+      )
+    }
+    .map_err(|e| format!("{e:?}"))?;
+    let set_layouts = [convert_set_layout];
+    let push_ranges = [vk::PushConstantRange::default()
+      .stage_flags(vk::ShaderStageFlags::COMPUTE)
+      .offset(0)
+      .size(std::mem::size_of::<ShaderParams>() as u32)];
+    let convert_layout = unsafe {
+      device.create_pipeline_layout(
+        &vk::PipelineLayoutCreateInfo::default()
+          .set_layouts(&set_layouts)
+          .push_constant_ranges(&push_ranges),
+        None,
+      )
+    }
+    .map_err(|e| format!("{e:?}"))?;
+
+    let code = ash::util::read_spv(&mut std::io::Cursor::new(CONVERT_SPV))
+      .map_err(|e| format!("{e:?}"))?;
+    let module = unsafe {
+      device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None)
+    }
+    .map_err(|e| format!("{e:?}"))?;
+    let pipeline_info = vk::ComputePipelineCreateInfo::default()
+      .stage(
+        vk::PipelineShaderStageCreateInfo::default()
+          .stage(vk::ShaderStageFlags::COMPUTE)
+          .module(module)
+          .name(c"main"),
+      )
+      .layout(convert_layout);
+    let pipelines = unsafe {
+      device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+    };
+    unsafe { device.destroy_shader_module(module, None) };
+    let convert_pipeline = pipelines.map_err(|(_, e)| format!("{e:?}"))?[0];
+
+    let pool_sizes = [
+      vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_BUFFER,
+        descriptor_count: TEXTURE_COUNT as u32,
+      },
+      vk::DescriptorPoolSize {
+        ty: vk::DescriptorType::STORAGE_IMAGE,
+        descriptor_count: TEXTURE_COUNT as u32,
+      },
+    ];
+    let descriptor_pool = unsafe {
+      device.create_descriptor_pool(
+        &vk::DescriptorPoolCreateInfo::default()
+          .max_sets(TEXTURE_COUNT as u32)
+          .pool_sizes(&pool_sizes),
+        None,
+      )
+    }
+    .map_err(|e| format!("{e:?}"))?;
+    let convert_sets = unsafe {
+      device.allocate_descriptor_sets(
+        &vk::DescriptorSetAllocateInfo::default()
+          .descriptor_pool(descriptor_pool)
+          .set_layouts(&[convert_set_layout; TEXTURE_COUNT]),
       )
     }
     .map_err(|e| format!("{e:?}"))?;
@@ -573,19 +667,12 @@ impl TexturePool {
     // Placeholder 1x1 textures so real descriptor sets (and TextureIds) exist
     // from the start; uploads rebuild them at the real size.
     let mut textures = Vec::with_capacity(TEXTURE_COUNT);
-    for cmd in cmds {
+    for (cmd, convert_set) in cmds.into_iter().zip(convert_sets) {
       let mut texture = Texture::default();
-      build_texture(
-        api,
-        &device,
-        &instance,
-        physical_device,
-        cmd_pool,
-        &mut texture,
-        1,
-        1,
-        1,
-      )?;
+      create_image(&device, &instance, physical_device, &mut texture, 1, 1)?;
+      create_buffer(&device, &instance, physical_device, &mut texture, 4)?;
+      make_sampleable(api, &device, cmd_pool, texture.image)?;
+      write_convert_descriptor(&device, convert_set, &texture);
       let (id, descriptor_set) = window.register_texture(texture.view, sampler)?;
       let upload_fence = unsafe {
         device.create_fence(
@@ -598,6 +685,7 @@ impl TexturePool {
         texture,
         id,
         descriptor_set,
+        convert_set,
         read_frame: None,
         cmd,
         upload_fence,
@@ -611,6 +699,10 @@ impl TexturePool {
       physical_device,
       cmd_pool,
       sampler,
+      convert_set_layout,
+      convert_layout,
+      convert_pipeline,
+      descriptor_pool,
       textures,
       newest: None,
       next_render: Instant::now(),
@@ -653,27 +745,84 @@ impl TexturePool {
     self.frames_started
   }
 
-  /// Copies `image` into a free texture and submits the GPU copy, all on the
-  /// calling thread, then makes it the newest texture. Never waits on a
-  /// fence: if no texture is free the frame is dropped. Frames drawn later
-  /// see the finished copy because they're submitted to the same queue after
-  /// it, and `upload_texture`'s barriers order them.
+  /// Copies `image`'s raw bytes into a free texture's buffer and submits the
+  /// shader that converts them into the texture's RGBA image, all on the
+  /// calling thread, then makes it the newest texture. The only CPU work is
+  /// the copy. Never waits on a fence: if no texture is free, or `image`
+  /// can't be displayed (see `shader_input`), the frame is dropped. Frames
+  /// drawn later see the finished conversion because they're submitted to the
+  /// same queue after it, and the barriers recorded here order them.
   fn upload(&mut self, image: &dyn ImageData) -> Result<(), String> {
-    let Some(src_channels) = channels_for_format(image.format()) else {
+    let Some(input) = shader_input(image) else {
       return Ok(());
     };
     let (w, h) = (image.width() as u32, image.height() as u32);
-    let plane = image.plane(0);
-    let needed = (w as usize) * (h as usize) * (src_channels as usize);
-    if w == 0 || h == 0 || plane.len() < needed {
-      return Ok(());
-    }
     let Some(index) = self.free_texture() else {
       return Ok(());
     };
 
     let device = &self.device;
     let tex = &mut self.textures[index];
+
+    // Rebuilding is safe here: the texture is free, so no frame or upload is
+    // using it or its descriptor sets.
+    let image_rebuilt = w != tex.texture.w || h != tex.texture.h;
+    if image_rebuilt {
+      create_image(
+        device,
+        &self.instance,
+        self.physical_device,
+        &mut tex.texture,
+        w,
+        h,
+      )?;
+      write_sampler_descriptor(device, tex.descriptor_set, self.sampler, &tex.texture);
+    }
+    let len = input.len();
+    let buffer_rebuilt = len as vk::DeviceSize > tex.texture.buf_size;
+    if buffer_rebuilt {
+      create_buffer(
+        device,
+        &self.instance,
+        self.physical_device,
+        &mut tex.texture,
+        len as vk::DeviceSize,
+      )?;
+    }
+    if image_rebuilt || buffer_rebuilt {
+      write_convert_descriptor(device, tex.convert_set, &tex.texture);
+    }
+
+    let mut params = ShaderParams {
+      format: input.format as u32,
+      width: w,
+      height: h,
+      offsets: [0; 3],
+      strides: [0; 3],
+    };
+    let mut offset = 0;
+    for (i, &(bytes, stride)) in input.planes[..input.plane_count].iter().enumerate() {
+      // SAFETY: the buffer holds at least `len` bytes, the sum of the plane
+      // lengths, and the GPU isn't reading it (its upload fence signaled).
+      unsafe {
+        std::ptr::copy_nonoverlapping(
+          bytes.as_ptr(),
+          (tex.texture.buf_mapped as *mut u8).add(offset),
+          bytes.len(),
+        );
+      }
+      params.offsets[i] = offset as u32;
+      params.strides[i] = stride;
+      offset += bytes.len();
+    }
+    // SAFETY: ShaderParams is repr(C) plain u32s, with no padding.
+    let param_bytes = unsafe {
+      std::slice::from_raw_parts(
+        &params as *const ShaderParams as *const u8,
+        std::mem::size_of::<ShaderParams>(),
+      )
+    };
+
     unsafe {
       device
         .reset_command_buffer(tex.cmd, vk::CommandBufferResetFlags::empty())
@@ -685,32 +834,65 @@ impl TexturePool {
         )
         .map_err(|e| format!("{e:?}"))?;
     }
-    let rebuilt = upload_texture(
-      device,
-      &self.instance,
-      self.physical_device,
-      &mut tex.texture,
-      tex.cmd,
-      plane,
-      w,
-      h,
-      src_channels,
-    )?;
 
-    if rebuilt {
-      // The texture has a new image view; point its descriptor at it. Safe
-      // here: it's free, so no frame is using the descriptor set.
-      let image_info = [vk::DescriptorImageInfo::default()
-        .sampler(self.sampler)
-        .image_view(tex.texture.view)
-        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-      let write = [vk::WriteDescriptorSet::default()
-        .dst_set(tex.descriptor_set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(&image_info)];
-      unsafe { device.update_descriptor_sets(&write, &[]) };
+    // A freshly built image has no contents or earlier readers to wait for.
+    // Otherwise earlier frames on this queue may still be sampling it, and
+    // this barrier orders the shader's writes after them. The buffer needs no
+    // barrier: the submit makes host writes to coherent memory visible.
+    let (from, src_stage) = if image_rebuilt {
+      (vk::ImageLayout::UNDEFINED, vk::PipelineStageFlags::TOP_OF_PIPE)
+    } else {
+      (
+        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        vk::PipelineStageFlags::FRAGMENT_SHADER,
+      )
+    };
+    record_barrier(
+      device,
+      tex.cmd,
+      tex.texture.image,
+      from,
+      vk::ImageLayout::GENERAL,
+      vk::AccessFlags::empty(),
+      vk::AccessFlags::SHADER_WRITE,
+      src_stage,
+      vk::PipelineStageFlags::COMPUTE_SHADER,
+    );
+    unsafe {
+      device.cmd_bind_pipeline(tex.cmd, vk::PipelineBindPoint::COMPUTE, self.convert_pipeline);
+      device.cmd_bind_descriptor_sets(
+        tex.cmd,
+        vk::PipelineBindPoint::COMPUTE,
+        self.convert_layout,
+        0,
+        &[tex.convert_set],
+        &[],
+      );
+      device.cmd_push_constants(
+        tex.cmd,
+        self.convert_layout,
+        vk::ShaderStageFlags::COMPUTE,
+        0,
+        param_bytes,
+      );
+      device.cmd_dispatch(
+        tex.cmd,
+        w.div_ceil(CONVERT_GROUP_SIZE),
+        h.div_ceil(CONVERT_GROUP_SIZE),
+        1,
+      );
     }
+    record_barrier(
+      device,
+      tex.cmd,
+      tex.texture.image,
+      vk::ImageLayout::GENERAL,
+      vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+      vk::AccessFlags::SHADER_WRITE,
+      vk::AccessFlags::SHADER_READ,
+      vk::PipelineStageFlags::COMPUTE_SHADER,
+      vk::PipelineStageFlags::FRAGMENT_SHADER,
+    );
 
     unsafe {
       device
@@ -742,10 +924,17 @@ impl Drop for TexturePool {
         self.device.destroy_fence(tex.upload_fence, None);
       }
       self.device.destroy_sampler(self.sampler, None);
+      self.device.destroy_pipeline(self.convert_pipeline, None);
+      self.device.destroy_pipeline_layout(self.convert_layout, None);
+      // Also frees the conversion descriptor sets.
+      self.device.destroy_descriptor_pool(self.descriptor_pool, None);
+      self
+        .device
+        .destroy_descriptor_set_layout(self.convert_set_layout, None);
       // Also frees the textures' command buffers.
       self.device.destroy_command_pool(self.cmd_pool, None);
     }
-    // The descriptor sets belong to the window's pool and go with it.
+    // imgui's descriptor sets belong to the window's pool and go with it.
   }
 }
 
@@ -822,6 +1011,10 @@ impl ViewerWindow {
 
   fn should_close(&self) -> bool {
     self.window.should_close()
+  }
+
+  fn set_title(&self, title: &str) {
+    self.window.set_title(title);
   }
 
   /// Current window position and size (`(x, y, w, h)`).
@@ -915,6 +1108,14 @@ impl ViewerWindow {
 /// Reads `view_geometry` as `(x, y, w, h)` if the key exists and is a list
 /// with (at least) 4 int elements -- mirrors `read_geometry` in
 /// image_viewer.cpp.
+/// The node's name, used as the viewer's window title.
+fn read_name(state: &State) -> String {
+  match state.get(StateKey::String("name".to_string())) {
+    Some(StateValue::String(name)) => name,
+    _ => "Image Viewer".to_string(),
+  }
+}
+
 fn read_geometry(state: &State) -> Option<(i32, i32, i32, i32)> {
   let StateValue::List(list) = state.get(StateKey::String("view_geometry".to_string()))? else {
     return None;
@@ -961,6 +1162,7 @@ async fn tick_loop(
   state: State,
   token: MainThreadToken,
   initial_geometry: (i32, i32, i32, i32),
+  new_title: Rc<RefCell<Option<String>>>,
 ) {
   let timer = api.create_timer();
   let mut last_geometry_check = Instant::now();
@@ -982,6 +1184,10 @@ async fn tick_loop(
         state.take(token).set("View", false);
       });
       break;
+    }
+
+    if let Some(title) = new_title.borrow_mut().take() {
+      window.set_title(&title);
     }
 
     window.render();
@@ -1008,21 +1214,22 @@ async fn tick_loop(
 }
 
 /// A preview window showing the images sent to an ImageSink (see
-/// ImageSink::update). Its position and size are read from, and saved to, the
-/// node's `view_geometry`; pressing its X button sets the node's `View` to
+/// ImageSink::update), titled with the node's `name`. Its position and size
+/// are read from, and saved to, the node's `view_geometry`; pressing its X button sets the node's `View` to
 /// false. The window, its render loop and its textures live exactly as long
 /// as this value: drop it to close them. Main thread only.
 pub struct ImageViewer {
   task: Option<TaskScope>,
   window: Option<Rc<RefCell<ViewerWindow>>>,
   sink: ImageSink,
+  // Flags renames of the node for the render loop, which retitles the window.
+  _name_connection: OnDrop,
 }
 
 impl ImageViewer {
   pub fn new(
     api: ThalamusAPI,
     state: State,
-    title: &str,
     sink: &ImageSink,
     token: MainThreadToken,
   ) -> Result<Self, String> {
@@ -1037,20 +1244,35 @@ impl ImageViewer {
       }
     };
     let (x, y, w, h) = geometry;
+    let title = read_name(&state);
     let window = Rc::new(RefCell::new(ViewerWindow::new(
-      api, title, x, y, w, h, sink,
+      api, &title, x, y, w, h, sink,
     )?));
+    // The connection is recursive; comparing the source to the node's own
+    // state skips `name` keys in nested collections.
+    let new_title = Rc::new(RefCell::new(None));
+    let pending = new_title.clone();
+    let node_state = state.clone();
+    let name_connection = state.connect(move |source, _action, key, value| {
+      if source == node_state && key == StateValue::String("name".to_string()) {
+        if let StateValue::String(name) = value {
+          *pending.borrow_mut() = Some(name);
+        }
+      }
+    });
     let task = run_task(tick_loop(
       api,
       Rc::downgrade(&window),
       state,
       token,
       geometry,
+      new_title,
     ));
     Ok(ImageViewer {
       task: Some(task),
       window: Some(window),
       sink: sink.clone(),
+      _name_connection: name_connection,
     })
   }
 }

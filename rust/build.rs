@@ -52,8 +52,47 @@ fn generate_thalamus_api() {
     .expect("failed to write Thalamus bindings");
 }
 
+/// Compiles the GLSL shaders under src/shaders to SPIR-V in OUT_DIR, where
+/// the code includes them from (e.g. `convert.comp` -> `convert.comp.spv`).
+/// Uses naga so no shader compiler has to be installed.
+fn compile_shaders() {
+  let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+  let shaders = [("convert.comp", naga::ShaderStage::Compute)];
+  for (name, stage) in shaders {
+    let path = format!("src/shaders/{name}");
+    println!("cargo:rerun-if-changed={path}");
+    let source = std::fs::read_to_string(&path).expect("failed to read shader");
+
+    let mut module = naga::front::glsl::Frontend::default()
+      .parse(&naga::front::glsl::Options::from(stage), &source)
+      .unwrap_or_else(|e| panic!("{}", e.emit_to_string_with_path(&source, &path)));
+    // The GLSL frontend leaves behind types for every builtin overload (e.g.
+    // an image type per imageStore format), and the SPIR-V backend would
+    // declare capabilities for them that the device may not have enabled.
+    naga::compact::compact(&mut module, naga::compact::KeepUnused::No);
+    let info = naga::valid::Validator::new(
+      naga::valid::ValidationFlags::all(),
+      // Push constants, which naga calls immediates.
+      naga::valid::Capabilities::IMMEDIATES,
+    )
+    .validate(&module)
+    .unwrap_or_else(|e| panic!("{}", e.emit_to_string_with_path(&source, &path)));
+    let options = naga::back::spv::Options {
+      // Thalamus creates a Vulkan 1.0 instance.
+      lang_version: (1, 0),
+      ..Default::default()
+    };
+    let words = naga::back::spv::write_vec(&module, &info, &options, None)
+      .unwrap_or_else(|e| panic!("failed to write SPIR-V for {path}: {e}"));
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(out_dir.join(format!("{name}.spv")), bytes)
+      .expect("failed to write compiled shader");
+  }
+}
+
 fn main() {
   generate_thalamus_api();
+  compile_shaders();
 
   let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
