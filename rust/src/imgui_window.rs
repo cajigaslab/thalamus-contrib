@@ -272,16 +272,22 @@ impl ImguiWindow {
   /// Pumps pending SDL events into imgui, then builds+renders one frame and
   /// presents it. Call once per tick from the main thread.
   ///
+  /// Never waits on the GPU or the display: if the frame slot's previous
+  /// frame hasn't finished (its in-flight fence isn't signaled) or no
+  /// swapchain image is free yet, events are still pumped (so e.g.
+  /// `should_close` updates) but nothing is rendered and neither hook runs;
+  /// the next call tries again.
+  ///
   /// `prepare(device, cmd, frame_idx)` runs after the frame's command buffer
   /// is opened but before the render pass begins -- the only place commands
   /// that can't run inside a render pass instance (buffer-to-image copies,
   /// most pipeline barriers) are allowed. `frame_idx` is this window's
-  /// current frame-in-flight slot (`0..MAX_FRAMES_IN_FLIGHT`): recording a
-  /// texture upload into slot `frame_idx`'s own command buffer means it
-  /// inherits this window's existing fence wait for that slot, so a caller
-  /// keeping one texture per `MAX_FRAMES_IN_FLIGHT` slot (indexed the same
-  /// way) never writes to a texture a previous frame's submission might
-  /// still be sampling from, with no extra synchronization needed. The same
+  /// current frame-in-flight slot (`0..MAX_FRAMES_IN_FLIGHT`), whose previous
+  /// frame is known to have finished: recording a texture upload into slot
+  /// `frame_idx`'s own command buffer means a caller keeping one texture per
+  /// `MAX_FRAMES_IN_FLIGHT` slot (indexed the same way) never writes to a
+  /// texture a previous frame's submission might still be sampling from,
+  /// with no extra synchronization needed. The same
   /// `frame_idx` is then passed to `build_ui`, along with whatever `prepare`
   /// returned, so it can select the matching texture's `TextureId` -- threading
   /// data through this return value (rather than a variable both closures
@@ -314,10 +320,21 @@ impl ImguiWindow {
     prepare: impl FnOnce(&ash::Device, vk::CommandBuffer, usize) -> R,
     build_ui: impl FnOnce(&imgui::Ui, usize, R),
   ) -> Result<(), String> {
+    let frame_idx = self.frame % self.in_flight.len();
+    let slot_free = unsafe { self.device.get_fence_status(self.in_flight[frame_idx]) }
+      .map_err(|e| format!("{e:?}"))?;
+
+    // Events are pumped even when the frame is skipped, so window-level state
+    // like `should_close` stays current while the GPU is behind; imgui queues
+    // the input until its next frame.
     let now = std::time::Instant::now();
     let delta = (now - self.last_frame_time).as_secs_f32();
-    self.last_frame_time = now;
     self.platform.new_frame(ctx, delta);
+    // On a skipped tick last_frame_time is left alone, so the next rendered
+    // frame's delta covers it.
+    if !slot_free {
+      return Ok(());
+    }
 
     if self.dirty {
       self.recreate_swapchain()?;
@@ -334,26 +351,26 @@ impl ImguiWindow {
     // display_framebuffer_scale handling (HiDPI) is done anywhere else here.
     ctx.io_mut().display_size = [self.extent.width as f32, self.extent.height as f32];
 
-    let frame_idx = self.frame % self.in_flight.len();
     unsafe {
-      self
-        .device
-        .wait_for_fences(&[self.in_flight[frame_idx]], true, u64::MAX)
-        .map_err(|e| format!("{e:?}"))?;
-
+      // A timeout of 0 returns NOT_READY instead of waiting when the
+      // presentation engine holds every image. The semaphore is only
+      // signaled by a successful acquire, and the slot's fence is only reset
+      // below, so a skipped tick leaves both ready for the next one.
       let image_index = match self.swapchain_loader.acquire_next_image(
         self.swapchain,
-        u64::MAX,
+        0,
         self.image_available[frame_idx],
         vk::Fence::null(),
       ) {
         Ok((index, _suboptimal)) => index,
+        Err(vk::Result::NOT_READY | vk::Result::TIMEOUT) => return Ok(()),
         Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
           self.dirty = true;
           return Ok(());
         }
         Err(e) => return Err(format!("{e:?}")),
       };
+      self.last_frame_time = now;
 
       self
         .device

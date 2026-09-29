@@ -105,16 +105,6 @@ fn shader_input(image: &dyn ImageData) -> Option<ShaderInput<'_>> {
       }
       planes[i] = (&bytes[..stride * rows], stride as u32);
     }
-  } else {
-    let mut rest = image.plane(0);
-    for (i, &(row_bytes, rows)) in dims[..plane_count].iter().enumerate() {
-      if rest.len() < row_bytes * rows {
-        return None;
-      }
-      let (bytes, tail) = rest.split_at(row_bytes * rows);
-      planes[i] = (bytes, row_bytes as u32);
-      rest = tail;
-    }
   }
   Some(ShaderInput {
     format,
@@ -749,11 +739,11 @@ impl TexturePool {
   }
 
   /// Called by the render loop when it starts recording frame-in-flight slot
-  /// `slot`, right after waiting on that slot's fence. Returns the new frame's
-  /// number.
+  /// `slot`, which render_frame only does once that slot's fence has
+  /// signaled. Returns the new frame's number.
   fn start_frame(&mut self, slot: usize) -> u64 {
-    // The frame this slot carried before has finished (its fence was just
-    // waited on), and the queue runs frames in order, so so has every frame
+    // The frame this slot carried before has finished (its fence has
+    // signaled), and the queue runs frames in order, so so has every frame
     // before it.
     if let Some(finished) = self.slot_frames[slot] {
       self.frames_completed = self.frames_completed.max(finished);
@@ -1047,6 +1037,13 @@ impl ViewerWindow {
     let sink = &self.sink;
     let quarter_turns = &mut self.quarter_turns;
 
+    // Set every tick, even ones render_frame skips because the GPU is behind:
+    // uploads use it to skip frames that would be replaced before the next
+    // tick.
+    if let Some(pool) = sink.pool.lock().unwrap().as_mut() {
+      pool.next_render = Instant::now() + REFRESH_INTERVAL;
+    }
+
     let result = self.window.render_frame(
       // Picks the texture to draw and marks it as sampled by this frame, so
       // uploads leave it alone until the frame has finished. Returned
@@ -1056,7 +1053,6 @@ impl ViewerWindow {
       |_device, _cmd, frame_idx| -> Option<(imgui::TextureId, u32, u32)> {
         let mut guard = sink.pool.lock().unwrap();
         let pool = guard.as_mut()?;
-        pool.next_render = Instant::now() + REFRESH_INTERVAL;
         let frame = pool.start_frame(frame_idx);
         let tex = &mut pool.textures[pool.newest?];
         tex.read_frame = Some(frame);
