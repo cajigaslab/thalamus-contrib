@@ -334,6 +334,8 @@ pub fn list_formats(device_name: &str) -> Result<String, String> {
 fn plane_layout(format: ImageFormat, width: u64, height: u64) -> Vec<(u64, u64)> {
   match format {
     ImageFormat::Gray => vec![(width, height)],
+    ImageFormat::Gray16 => vec![(width * 2, height)],
+    ImageFormat::RGB16 => vec![(width * 6, height)],
     ImageFormat::RGB | ImageFormat::BGR => vec![(width * 3, height)],
     ImageFormat::YUYV422 => vec![(width * 2, height)],
     ImageFormat::NV12 => vec![(width, height * 3 / 2)],

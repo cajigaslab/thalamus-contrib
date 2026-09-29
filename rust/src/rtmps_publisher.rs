@@ -46,6 +46,17 @@ fn av_pixel_format(format: ImageFormat) -> Result<ffi::AVPixelFormat, String> {
     ImageFormat::YUVJ420P => Ok(ffi::AVPixelFormat::AV_PIX_FMT_YUVJ420P),
     ImageFormat::NV12 => Ok(ffi::AVPixelFormat::AV_PIX_FMT_NV12),
     ImageFormat::BGR => Ok(ffi::AVPixelFormat::AV_PIX_FMT_BGR24),
+    // 16-bit formats are in the platform's native byte order.
+    ImageFormat::Gray16 => Ok(if cfg!(target_endian = "big") {
+      ffi::AVPixelFormat::AV_PIX_FMT_GRAY16BE
+    } else {
+      ffi::AVPixelFormat::AV_PIX_FMT_GRAY16LE
+    }),
+    ImageFormat::RGB16 => Ok(if cfg!(target_endian = "big") {
+      ffi::AVPixelFormat::AV_PIX_FMT_RGB48BE
+    } else {
+      ffi::AVPixelFormat::AV_PIX_FMT_RGB48LE
+    }),
     ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => Err(format!(
       "{:?} frames can't be encoded, the source needs to produce raw frames",
       format
@@ -64,6 +75,8 @@ fn plane_layout(
   let (w, h) = (width as usize, height as usize);
   match format {
     ImageFormat::Gray => Ok(vec![(w, h)]),
+    ImageFormat::Gray16 => Ok(vec![(w * 2, h)]),
+    ImageFormat::RGB16 => Ok(vec![(w * 6, h)]),
     ImageFormat::RGB | ImageFormat::BGR => Ok(vec![(w * 3, h)]),
     ImageFormat::YUYV422 => Ok(vec![(w * 2, h)]),
     ImageFormat::NV12 => Ok(vec![(w, h), (w, h.div_ceil(2))]),

@@ -202,6 +202,18 @@ fn av_error_string(ret: i32) -> String {
   }
 }
 
+// 16-bit formats are in the platform's native byte order.
+const GRAY16_NATIVE: AVPixelFormat = if cfg!(target_endian = "big") {
+  AVPixelFormat::AV_PIX_FMT_GRAY16BE
+} else {
+  AVPixelFormat::AV_PIX_FMT_GRAY16LE
+};
+const RGB48_NATIVE: AVPixelFormat = if cfg!(target_endian = "big") {
+  AVPixelFormat::AV_PIX_FMT_RGB48BE
+} else {
+  AVPixelFormat::AV_PIX_FMT_RGB48LE
+};
+
 fn pix_to_height(height: i32, pix: AVPixelFormat) -> [i32; 4] {
   match pix {
     AVPixelFormat::AV_PIX_FMT_GRAY8 => [height, 0, 0, 0],
@@ -212,6 +224,8 @@ fn pix_to_height(height: i32, pix: AVPixelFormat) -> [i32; 4] {
     AVPixelFormat::AV_PIX_FMT_YUVJ420P => [height, (height + 1)/2, (height + 1)/2, 0],
     AVPixelFormat::AV_PIX_FMT_NV12 => [height, (height + 1)/2, 0, 0],
     AVPixelFormat::AV_PIX_FMT_BGR24 => [height, 0, 0, 0],
+    AVPixelFormat::AV_PIX_FMT_GRAY16LE | AVPixelFormat::AV_PIX_FMT_GRAY16BE => [height, 0, 0, 0],
+    AVPixelFormat::AV_PIX_FMT_RGB48LE | AVPixelFormat::AV_PIX_FMT_RGB48BE => [height, 0, 0, 0],
     _ => panic!("Unsupported pixel format: {:?}", pix)
   }
 }
@@ -225,6 +239,8 @@ fn pix_to_num_planes(pix: AVPixelFormat) -> i32 {
     AVPixelFormat::AV_PIX_FMT_YUVJ420P => 3,
     AVPixelFormat::AV_PIX_FMT_NV12 => 2,
     AVPixelFormat::AV_PIX_FMT_BGR24 => 1,
+    AVPixelFormat::AV_PIX_FMT_GRAY16LE | AVPixelFormat::AV_PIX_FMT_GRAY16BE => 1,
+    AVPixelFormat::AV_PIX_FMT_RGB48LE | AVPixelFormat::AV_PIX_FMT_RGB48BE => 1,
     _ => panic!("Unsupported pixel format: {:?}", pix)
   }
 }
@@ -241,6 +257,8 @@ fn image_to_pix(format: ImageFormat) -> AVPixelFormat {
     ImageFormat::MPEG1 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::MPEG4 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::MJPEG => panic!("No Pixel format"),
+    ImageFormat::Gray16 => GRAY16_NATIVE,
+    ImageFormat::RGB16 => RGB48_NATIVE,
   }
 }
 

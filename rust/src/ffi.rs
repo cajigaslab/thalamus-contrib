@@ -298,16 +298,18 @@ pub extern "C" fn c_node_image_format(raw_node: *mut ThalamusNode) -> ThalamusIm
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let image = deref_plugin_impl(c_node).data.unwrap().image().unwrap();
   match image.format() {
-    ImageFormat::Gray => ThalamusImageFormat::Gray,
-    ImageFormat::RGB => ThalamusImageFormat::RGB,
-    ImageFormat::YUYV422 => ThalamusImageFormat::YUYV422,
-    ImageFormat::YUV420P => ThalamusImageFormat::YUV420P,
-    ImageFormat::YUVJ420P => ThalamusImageFormat::YUVJ420P,
-    ImageFormat::NV12 => ThalamusImageFormat::NV12,
-    ImageFormat::BGR => ThalamusImageFormat::BGR,
-    ImageFormat::MJPEG => ThalamusImageFormat::MJPEG,
-    ImageFormat::MPEG1 => ThalamusImageFormat::MPEG1,
-    ImageFormat::MPEG4 => ThalamusImageFormat::MPEG4,
+    ImageFormat::Gray => ThalamusImageFormat::ThalamusImageFormat_Gray,
+    ImageFormat::RGB => ThalamusImageFormat::ThalamusImageFormat_RGB,
+    ImageFormat::YUYV422 => ThalamusImageFormat::ThalamusImageFormat_YUYV422,
+    ImageFormat::YUV420P => ThalamusImageFormat::ThalamusImageFormat_YUV420P,
+    ImageFormat::YUVJ420P => ThalamusImageFormat::ThalamusImageFormat_YUVJ420P,
+    ImageFormat::NV12 => ThalamusImageFormat::ThalamusImageFormat_NV12,
+    ImageFormat::BGR => ThalamusImageFormat::ThalamusImageFormat_BGR,
+    ImageFormat::MJPEG => ThalamusImageFormat::ThalamusImageFormat_MJPEG,
+    ImageFormat::MPEG1 => ThalamusImageFormat::ThalamusImageFormat_MPEG1,
+    ImageFormat::MPEG4 => ThalamusImageFormat::ThalamusImageFormat_MPEG4,
+    ImageFormat::Gray16 => ThalamusImageFormat::ThalamusImageFormat_Gray16,
+    ImageFormat::RGB16 => ThalamusImageFormat::ThalamusImageFormat_RGB16,
   }
 }
 

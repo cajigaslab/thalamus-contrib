@@ -20,6 +20,11 @@ const uint YUYV422 = 3;
 const uint YUV420P = 4;
 const uint YUVJ420P = 5;
 const uint NV12 = 6;
+// 16-bit formats come in the producing platform's byte order.
+const uint GRAY16_LE = 7;
+const uint RGB16_LE = 8;
+const uint GRAY16_BE = 9;
+const uint RGB16_BE = 10;
 
 layout(push_constant) uniform Params {
   uint format;
@@ -36,9 +41,20 @@ layout(push_constant) uniform Params {
   uint stride2;
 } p;
 
+uint raw_byte(uint addr) {
+  return (data[addr >> 2] >> ((addr & 3u) * 8u)) & 0xFFu;
+}
+
 float byte_at(uint addr) {
-  uint word = data[addr >> 2];
-  return float((word >> ((addr & 3u) * 8u)) & 0xFFu) / 255.0;
+  return float(raw_byte(addr)) / 255.0;
+}
+
+// A 16-bit sample, scaled so the full range 0..65535 maps to 0..1.
+float u16_at(uint addr, bool big_endian) {
+  uint first = raw_byte(addr);
+  uint second = raw_byte(addr + 1u);
+  uint value = big_endian ? (first << 8u) | second : first | (second << 8u);
+  return float(value) / 65535.0;
 }
 
 // Byte address of column `x` (in bytes) of row `y` of plane `plane`.
@@ -93,6 +109,12 @@ void main() {
   } else if (p.format == NV12) {
     uint a = addr(1, 2 * (x / 2), y / 2);
     rgb = yuv_to_rgb(byte_at(addr(0, x, y)), byte_at(a), byte_at(a + 1), false);
+  } else if (p.format == GRAY16_LE || p.format == GRAY16_BE) {
+    rgb = vec3(u16_at(addr(0, 2 * x, y), p.format == GRAY16_BE));
+  } else if (p.format == RGB16_LE || p.format == RGB16_BE) {
+    bool big_endian = p.format == RGB16_BE;
+    uint a = addr(0, 6 * x, y);
+    rgb = vec3(u16_at(a, big_endian), u16_at(a + 2, big_endian), u16_at(a + 4, big_endian));
   } else {
     rgb = vec3(1.0, 0.0, 1.0);
   }

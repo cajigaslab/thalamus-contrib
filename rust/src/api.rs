@@ -399,16 +399,18 @@ impl<'a> ImageData for ExtNodeData<'a> {
       let image = (*self.node.node).image;
       let format = (*image).format.unwrap();
       match format(self.node.node) {
-        ThalamusImageFormat::Gray => ImageFormat::Gray,
-        ThalamusImageFormat::RGB => ImageFormat::RGB,
-        ThalamusImageFormat::YUYV422 => ImageFormat::YUYV422,
-        ThalamusImageFormat::YUV420P => ImageFormat::YUV420P,
-        ThalamusImageFormat::YUVJ420P => ImageFormat::YUVJ420P,
-        ThalamusImageFormat::NV12 => ImageFormat::NV12,
-        ThalamusImageFormat::BGR => ImageFormat::BGR,
-        ThalamusImageFormat::MJPEG => ImageFormat::MJPEG,
-        ThalamusImageFormat::MPEG1 => ImageFormat::MPEG1,
-        ThalamusImageFormat::MPEG4 => ImageFormat::MPEG4,
+        ThalamusImageFormat::ThalamusImageFormat_Gray => ImageFormat::Gray,
+        ThalamusImageFormat::ThalamusImageFormat_RGB => ImageFormat::RGB,
+        ThalamusImageFormat::ThalamusImageFormat_YUYV422 => ImageFormat::YUYV422,
+        ThalamusImageFormat::ThalamusImageFormat_YUV420P => ImageFormat::YUV420P,
+        ThalamusImageFormat::ThalamusImageFormat_YUVJ420P => ImageFormat::YUVJ420P,
+        ThalamusImageFormat::ThalamusImageFormat_NV12 => ImageFormat::NV12,
+        ThalamusImageFormat::ThalamusImageFormat_BGR => ImageFormat::BGR,
+        ThalamusImageFormat::ThalamusImageFormat_MJPEG => ImageFormat::MJPEG,
+        ThalamusImageFormat::ThalamusImageFormat_MPEG1 => ImageFormat::MPEG1,
+        ThalamusImageFormat::ThalamusImageFormat_MPEG4 => ImageFormat::MPEG4,
+        ThalamusImageFormat::ThalamusImageFormat_Gray16 => ImageFormat::Gray16,
+        ThalamusImageFormat::ThalamusImageFormat_RGB16 => ImageFormat::RGB16,
         other => panic!("Unknown ThalamusImageFormat {}", other.0),
       }
     }
@@ -842,10 +844,10 @@ impl ThalamusAPI {
       owns_data: 0,
     };
     let dialog_type = match dialog_type {
-      DialogType::Info => ThalamusDialogType::Info,
-      DialogType::Warn => ThalamusDialogType::Warn,
-      DialogType::Error => ThalamusDialogType::Error,
-      DialogType::Fatal => ThalamusDialogType::Fatal,
+      DialogType::Info => ThalamusDialogType::ThalamusDialogType_Info,
+      DialogType::Warn => ThalamusDialogType::ThalamusDialogType_Warn,
+      DialogType::Error => ThalamusDialogType::ThalamusDialogType_Error,
+      DialogType::Fatal => ThalamusDialogType::ThalamusDialogType_Fatal,
     };
     // SAFETY: dialog_show copies title and message before returning and
     // doesn't write through the spans despite taking them as non-const.
@@ -2070,7 +2072,7 @@ unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateValue, St
   data: *mut ::std::os::raw::c_void,
 ) {
   let args = unsafe { &mut *(data as *mut StateConnectionCallbackArgs<T>) };
-  let action = if action == ThalamusStateAction::Set {
+  let action = if action == ThalamusStateAction::ThalamusStateAction_Set {
     StateAction::Set
   } else {
     StateAction::Delete
@@ -2957,6 +2959,12 @@ pub enum ImageFormat {
   MJPEG,
   MPEG1,
   MPEG4,
+  /// One 16-bit sample per pixel, in the platform's native byte order, using
+  /// the full 0..65535 range.
+  Gray16,
+  /// Three 16-bit samples (R, G, B) per pixel, in the platform's native byte
+  /// order, using the full 0..65535 range.
+  RGB16,
 }
 
 pub trait ImageData {

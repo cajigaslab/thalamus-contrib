@@ -33,7 +33,15 @@ enum ShaderFormat {
   Yuv420p = 4,
   Yuvj420p = 5,
   Nv12 = 6,
+  Gray16Le = 7,
+  Rgb16Le = 8,
+  Gray16Be = 9,
+  Rgb16Be = 10,
 }
+
+/// 16-bit formats are in the native byte order of the platform that produced
+/// them, i.e. this one.
+const BIG_ENDIAN: bool = cfg!(target_endian = "big");
 
 /// The planes of a frame as the conversion shader reads them: each plane's
 /// bytes and row stride.
@@ -74,6 +82,16 @@ fn shader_input(image: &dyn ImageData) -> Option<ShaderInput<'_>> {
     ImageFormat::YUV420P => (ShaderFormat::Yuv420p, [(w, h), (cw, ch), (cw, ch)], 3),
     ImageFormat::YUVJ420P => (ShaderFormat::Yuvj420p, [(w, h), (cw, ch), (cw, ch)], 3),
     ImageFormat::NV12 => (ShaderFormat::Nv12, [(w, h), (2 * cw, ch), (0, 0)], 2),
+    ImageFormat::Gray16 => (
+      if BIG_ENDIAN { ShaderFormat::Gray16Be } else { ShaderFormat::Gray16Le },
+      [(2 * w, h), (0, 0), (0, 0)],
+      1,
+    ),
+    ImageFormat::RGB16 => (
+      if BIG_ENDIAN { ShaderFormat::Rgb16Be } else { ShaderFormat::Rgb16Le },
+      [(6 * w, h), (0, 0), (0, 0)],
+      1,
+    ),
     ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => return None,
   };
 
