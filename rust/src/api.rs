@@ -311,6 +311,90 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       num_channels(self.node.node)
     }
   }
+
+  fn buffer(&self) -> &[u8] {
+    // Older Thalamus builds' ThalamusAnalogNode ends before `buffer`.
+    if self.node.api.analog_node_version() < 2 {
+      return &[];
+    }
+    let mut span = ThalamusByteSpan {
+      data: null(),
+      size: 0,
+    };
+    unsafe {
+      let analog = (*self.node.node).analog;
+      let Some(buffer) = (*analog).buffer else {
+        return &[];
+      };
+      buffer(&mut span as *mut ThalamusByteSpan, self.node.node);
+      if span.data.is_null() {
+        return &[];
+      }
+      std::slice::from_raw_parts(span.data, span.size as usize)
+    }
+  }
+
+  fn encoding(&self) -> AnalogEncoding {
+    // Older Thalamus builds' ThalamusAnalogNode ends before `encoding`.
+    if self.node.api.analog_node_version() < 2 {
+      return AnalogEncoding::None;
+    }
+    unsafe {
+      let analog = (*self.node.node).analog;
+      let Some(encoding) = (*analog).encoding else {
+        return AnalogEncoding::None;
+      };
+      match encoding(self.node.node) {
+        ThalamusAnalogEncoding::ThalamusAnalogEncoding_AAC => AnalogEncoding::AAC,
+        // Includes encodings from newer Thalamus builds this one doesn't know.
+        _ => AnalogEncoding::None,
+      }
+    }
+  }
+
+  fn analog_format(&self, channel: i32) -> AnalogFormat {
+    let by_type = || {
+      if self.is_short_data() {
+        AnalogFormat::Short
+      } else if self.is_int_data() {
+        AnalogFormat::Int
+      } else if self.is_ulong_data() {
+        AnalogFormat::ULong
+      } else {
+        AnalogFormat::Double
+      }
+    };
+    // Older Thalamus builds' ThalamusAnalogNode ends before `format`.
+    if self.node.api.analog_node_version() < 4 {
+      return by_type();
+    }
+    unsafe {
+      let analog = (*self.node.node).analog;
+      let Some(format) = (*analog).format else {
+        return by_type();
+      };
+      match format(self.node.node, channel) {
+        ThalamusAnalogFormat::ThalamusAnalogFormat_Double => AnalogFormat::Double,
+        ThalamusAnalogFormat::ThalamusAnalogFormat_Short => AnalogFormat::Short,
+        ThalamusAnalogFormat::ThalamusAnalogFormat_Int => AnalogFormat::Int,
+        ThalamusAnalogFormat::ThalamusAnalogFormat_ULong => AnalogFormat::ULong,
+        ThalamusAnalogFormat::ThalamusAnalogFormat_Encoded => AnalogFormat::Encoded,
+        // Formats from newer Thalamus builds this one doesn't know.
+        _ => by_type(),
+      }
+    }
+  }
+
+  fn encoded_count(&self) -> u64 {
+    // Older Thalamus builds' ThalamusAnalogNode ends before `encoded_count`.
+    if self.node.api.analog_node_version() < 4 {
+      return 0;
+    }
+    unsafe {
+      let analog = (*self.node.node).analog;
+      (*analog).encoded_count.map_or(0, |encoded_count| encoded_count(self.node.node))
+    }
+  }
   fn sample_interval(&self, channel: i32) -> Duration {
     unsafe {
       let analog = (*self.node.node).analog;
@@ -785,6 +869,14 @@ impl ThalamusAPIThreadSafe {
 }
 
 impl ThalamusAPI {
+  /// The number of fields after `name` in the ThalamusAnalogNodes Thalamus
+  /// provides (2 once `buffer` and `encoding` exist, 4 once `format` and
+  /// `encoded_count` do), or 0 if the running Thalamus predates the query.
+  pub fn analog_node_version(&self) -> i32 {
+    // copy_from_host leaves functions the host doesn't have as None.
+    unsafe { (*self.raw).analog_node_version.map_or(0, |f| f()) }
+  }
+
   pub fn thread_safe(&self) -> ThalamusAPIThreadSafe {
     ThalamusAPIThreadSafe { raw: self.raw }
   }
@@ -2939,12 +3031,61 @@ pub trait AnalogData {
   fn is_transformed(&self) -> bool {
     false
   }
+  /// Encoded data carried alongside (or instead of) the channel data; see
+  /// `encoding`.
+  fn buffer(&self) -> &[u8] {
+    &[]
+  }
+  fn encoding(&self) -> AnalogEncoding {
+    AnalogEncoding::None
+  }
+  /// The format of `channel`. The default gives every channel the format the
+  /// is_* functions select, so only data with mixed formats or encoded
+  /// channels needs to override it.
+  fn analog_format(&self, _channel: i32) -> AnalogFormat {
+    if self.is_short_data() {
+      AnalogFormat::Short
+    } else if self.is_int_data() {
+      AnalogFormat::Int
+    } else if self.is_ulong_data() {
+      AnalogFormat::ULong
+    } else {
+      AnalogFormat::Double
+    }
+  }
+  /// The number of samples per encoded channel in `buffer`: what decoding it
+  /// will eventually produce for this message, even if the encoder hasn't
+  /// output them yet.
+  fn encoded_count(&self) -> u64 {
+    0
+  }
   fn scale(&self, _channel: i32) -> f64 {
     return 1.0;
   }
   fn offset(&self, _channel: i32) -> f64 {
     return 0.0;
   }
+}
+
+/// How a channel's samples are stored, i.e. which AnalogData function reads
+/// them. Encoded channels have no samples in any of those: their samples are
+/// in `buffer`, `encoded_count` of them per channel.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum AnalogFormat {
+  Double,
+  Short,
+  Int,
+  ULong,
+  Encoded,
+}
+
+/// How an analog node's `buffer` is encoded.
+#[derive(Debug, PartialEq, Clone, Copy, Default)]
+pub enum AnalogEncoding {
+  /// No encoded data; the buffer is empty or unused.
+  #[default]
+  None,
+  AAC,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]

@@ -237,6 +237,43 @@ pub extern "C" fn c_node_analog_offset(raw_node: *mut ThalamusNode, channel: i32
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
   analog.offset(channel)
 }
+
+pub extern "C" fn c_node_analog_buffer(output: *mut ThalamusByteSpan, raw_node: *mut ThalamusNode) {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+  let result = analog.buffer();
+  unsafe {
+    (&mut *output).data = result.as_ptr();
+    (&mut *output).size = result.len() as u64;
+  }
+}
+
+pub extern "C" fn c_node_analog_format(raw_node: *mut ThalamusNode, channel: i32) -> ThalamusAnalogFormat {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+  match analog.analog_format(channel) {
+    crate::api::AnalogFormat::Double => ThalamusAnalogFormat::ThalamusAnalogFormat_Double,
+    crate::api::AnalogFormat::Short => ThalamusAnalogFormat::ThalamusAnalogFormat_Short,
+    crate::api::AnalogFormat::Int => ThalamusAnalogFormat::ThalamusAnalogFormat_Int,
+    crate::api::AnalogFormat::ULong => ThalamusAnalogFormat::ThalamusAnalogFormat_ULong,
+    crate::api::AnalogFormat::Encoded => ThalamusAnalogFormat::ThalamusAnalogFormat_Encoded,
+  }
+}
+
+pub extern "C" fn c_node_analog_encoded_count(raw_node: *mut ThalamusNode) -> u64 {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+  analog.encoded_count()
+}
+
+pub extern "C" fn c_node_analog_encoding(raw_node: *mut ThalamusNode) -> ThalamusAnalogEncoding {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
+  match analog.encoding() {
+    crate::api::AnalogEncoding::None => ThalamusAnalogEncoding::ThalamusAnalogEncoding_None,
+    crate::api::AnalogEncoding::AAC => ThalamusAnalogEncoding::ThalamusAnalogEncoding_AAC,
+  }
+}
 #[allow(non_snake_case)]
 pub extern "C" fn c_node_time_ns(raw_node: *mut ThalamusNode) -> u64 {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
@@ -405,6 +442,10 @@ fn wrap_analog(c_node: &mut ThalamusNode) {
     (*c_node.analog).is_transformed = Some(c_node_analog_is_transformed);
     (*c_node.analog).scale = Some(c_node_analog_scale);
     (*c_node.analog).offset = Some(c_node_analog_offset);
+    (*c_node.analog).buffer = Some(c_node_analog_buffer);
+    (*c_node.analog).encoding = Some(c_node_analog_encoding);
+    (*c_node.analog).format = Some(c_node_analog_format);
+    (*c_node.analog).encoded_count = Some(c_node_analog_encoded_count);
   }
 }
 
@@ -467,6 +508,9 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
     process: None,
     predrop: None,
     signals_offmain: 0,
+    // Blob nodes aren't supported yet. Thalamus only reads this field from
+    // plugins exporting thalamus_get_node_version, which this one doesn't.
+    blob: ptr::null_mut() as *mut ThalamusBlobNode,
   }));
   let c_node_ref = unsafe { &mut *c_node };
   let api = ThalamusAPI { raw: api_raw };
@@ -568,6 +612,13 @@ impl ThalamusNodeFactory {
     }));
     result as *mut ThalamusNodeFactory
   }
+}
+
+/// The number of fields after `name` in this plugin's ThalamusAnalogNodes:
+/// `buffer`, `encoding`, `format` and `encoded_count`.
+#[unsafe(no_mangle)]
+pub extern "C" fn thalamus_get_analog_node_version() -> i32 {
+  4
 }
 
 #[unsafe(no_mangle)]

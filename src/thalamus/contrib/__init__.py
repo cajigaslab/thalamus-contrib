@@ -13,6 +13,7 @@ from thalamus.pipeline.thalamus_window import Factory, UserData, UserDataType, g
 
 from .thorcam_widget import ThorcamWidget
 from .webcam_widget import WebcamWidget
+from .mic_widget import MicWidget
 
 print(__package__, type(__package__))
 print(type(importlib.resources.files(__package__)))
@@ -37,6 +38,9 @@ def widgets():
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
     ]),
+    'MIC': Factory(lambda c, s: MicWidget(c, s), [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+    ]),
     'RTMPS': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
@@ -55,6 +59,10 @@ def widgets():
       UserData(UserDataType.SPINBOX, 'Quality', 5, []),
       UserData(UserDataType.SPINBOX, 'Width', 0, []),
       UserData(UserDataType.SPINBOX, 'Height', 0, []),
+      UserData(UserDataType.COMBO_BOX, 'Audio Format', 'PASSTHROUGH', [
+        'PASSTHROUGH', 'integer', 'decimal', 'AAC'
+      ]),
+      UserData(UserDataType.SPINBOX, 'Audio Bitrate', 0, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
     ]),
     'SLEEVE': Factory(None, [

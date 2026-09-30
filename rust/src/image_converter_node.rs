@@ -12,7 +12,9 @@ use crate::api::{
   MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OffMainSignaler, OnDrop, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
-use crate::image_converter::{Converter, ConverterParams};
+use crate::audio_converter::{AudioConverterParams, AudioFormat};
+use crate::image_converter::ConverterParams;
+use crate::media_converter::{MediaConverter, MediaConverterParams};
 use crate::image_viewer::{ImageSink, ImageViewer};
 
 /// Input image time (NodeData::time) -> when that image arrived, for images
@@ -97,9 +99,37 @@ impl AnalogData for WithStats<'_> {
   }
 }
 
+/// Just the image half of a message, for forwarding it while its analog data
+/// is converted.
+struct ImageOnly<'a>(&'a dyn NodeData);
+
+impl NodeData for ImageOnly<'_> {
+  fn time(&self) -> Duration {
+    self.0.time()
+  }
+
+  fn image(&self) -> Option<&dyn ImageData> {
+    self.0.image()
+  }
+}
+
+/// Just the analog half of a message, for forwarding it while its image is
+/// converted, or when it has no image.
+struct AnalogOnly<'a>(&'a dyn NodeData);
+
+impl NodeData for AnalogOnly<'_> {
+  fn time(&self) -> Duration {
+    self.0.time()
+  }
+
+  fn analog(&self) -> Option<&dyn AnalogData> {
+    self.0.analog()
+  }
+}
+
 #[derive(Clone,Debug)]
 struct ParamsHolder {
-  params: ConverterParams,
+  params: MediaConverterParams,
   dirty: bool,
 }
 
@@ -115,7 +145,7 @@ pub struct ImageConverterNode {
   source_connection: Option<OnDrop>,
   data_connection: Option<OnDrop>,
   signaler: Arc<OffMainSignaler>,
-  converter: Arc<Mutex<Converter>>,
+  converter: Arc<Mutex<MediaConverter>>,
   notify: Arc<Notify>,
   dropping: Arc<AtomicBool>,
   arrivals: Arrivals,
@@ -141,7 +171,7 @@ impl ImageConverterNode {
 
         let mut lock = this.params.lock().unwrap();
         lock.dirty = true;
-        lock.params.format = match v.to_uppercase().as_str() {
+        lock.params.image.format = match v.to_uppercase().as_str() {
           "GRAY" => Some(ImageFormat::Gray),
           "RGB" => Some(ImageFormat::RGB), 
           "YUYV422" => Some(ImageFormat::YUYV422), 
@@ -153,25 +183,47 @@ impl ImageConverterNode {
           _ => None
         };
       },
+      "Audio Format" => {
+        let StateValue::String(v) = value else {
+          return;
+        };
+
+        let mut lock = this.params.lock().unwrap();
+        lock.dirty = true;
+        lock.params.audio.format = match v.to_uppercase().as_str() {
+          "INTEGER" => Some(AudioFormat::Integer),
+          "DECIMAL" => Some(AudioFormat::Decimal),
+          "AAC" => Some(AudioFormat::AAC),
+          _ => None
+        };
+      },
+      "Audio Bitrate" => {
+        // kbit/s for the whole stream; 0 means 64 kbit/s per channel.
+        if let StateValue::Int(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.audio.bitrate = if v > 0 { Some(v * 1000) } else { None };
+        }
+      },
       "Width" => {
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
-          lock.params.width = if v > 0 { Some(v as i32) } else { None };
+          lock.params.image.width = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "Height" => {
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
-          lock.params.height = if v > 0 { Some(v as i32) } else { None };
+          lock.params.image.height = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "Quality" => {
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
-          lock.params.quality = if v > 0 { Some(v as i32) } else { None };
+          lock.params.image.quality = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "View" => {
@@ -222,16 +274,35 @@ impl ImageConverterNode {
             }
 
             let data = node.data();
-            record_arrival(&arrivals, data.time(), arrived);
-            if !converter.needs_conversion(&data) {
+            // Latency is only measured for images.
+            if data.image().is_some() {
+              record_arrival(&arrivals, data.time(), arrived);
+            }
+            let image_needs = converter.needs_image_conversion(&data);
+            let audio_needs = converter.needs_audio_conversion(&data);
+            if image_needs || audio_needs {
+              converter.push(&data);
+              notify.notify_one();
+            }
+
+            // Forward whatever isn't being converted. Images carry the stats
+            // channels, which replace the message's own analog data, so
+            // analog data is forwarded with an image only when neither half
+            // is converted (as before audio conversion existed).
+            let forward_image = data.image().is_some() && !image_needs;
+            let forward_analog = data.analog().is_some() && !audio_needs;
+            if forward_image {
               let latency_ms = take_latency_ms(&arrivals, data.time(), api.time());
               if let Some(image) = data.image() {
                 viewer_sink.update(image);
               }
-              let _ = signaler.ready_this_thread(&WithStats::new(&data, latency_ms));
-            } else {
-              converter.push(&data);
-              notify.notify_one();
+              if audio_needs {
+                let _ = signaler.ready_this_thread(&WithStats::new(&ImageOnly(&data), latency_ms));
+              } else {
+                let _ = signaler.ready_this_thread(&WithStats::new(&data, latency_ms));
+              }
+            } else if forward_analog {
+              let _ = signaler.ready_this_thread(&AnalogOnly(&data));
             }
           }));
         }));
@@ -242,7 +313,7 @@ impl ImageConverterNode {
   }
 
   async fn converter_task(
-    converter: Arc<Mutex<Converter>>,
+    converter: Arc<Mutex<MediaConverter>>,
     signaler: Arc<OffMainSignaler>,
     notify: Arc<Notify>,
     dropping: Arc<AtomicBool>,
@@ -256,14 +327,18 @@ impl ImageConverterNode {
       }
       {
         let mut converter = converter.lock().unwrap();
-        while let Some(image) = converter.pull() {
+        while let Some(output) = converter.pull() {
+          let Some(image) = output.image() else {
+            // Converted audio has no stats channels (a message has one
+            // analog sample type, and the stats are f64).
+            let _ = signaler.ready(&*output);
+            continue;
+          };
           // Converted images keep their input's time, which is the key.
-          let latency_ms = take_latency_ms(&arrivals, image.time(), api.time());
+          let latency_ms = take_latency_ms(&arrivals, output.time(), api.time());
           // Encoded (MPEG4) output is dropped by the viewer.
-          if let Some(image) = image.image() {
-            viewer_sink.update(image);
-          }
-          let _ = signaler.ready(&WithStats::new(&*image, latency_ms));
+          viewer_sink.update(image);
+          let _ = signaler.ready(&WithStats::new(&*output, latency_ms));
         }
       }
       notify.notified().await;
@@ -276,17 +351,20 @@ impl Node for ImageConverterNode {
     let signaler = OffMainSignaler::new(api, node_token);
     signaler.unblock();
     let params = ParamsHolder {
-      params: ConverterParams { 
-        format: None, 
-        width: None, 
-        height: None, 
-        quality: None,
+      params: MediaConverterParams {
+        image: ConverterParams {
+          format: None,
+          width: None,
+          height: None,
+          quality: None,
+        },
+        audio: AudioConverterParams::default(),
       },
       dirty: true,
     };
     let result = Rc::new(RefCell::new(ImageConverterNode {
       params: Arc::new(Mutex::new(params.clone())),
-      converter: Arc::new(Mutex::new(Converter::new(api.thread_safe(), params.params))),
+      converter: Arc::new(Mutex::new(MediaConverter::new(api.thread_safe(), params.params))),
       api,
       state: state.clone(),
       main_thread_token: token,
