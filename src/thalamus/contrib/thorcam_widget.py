@@ -23,7 +23,7 @@ class ThorcamComboBox(QComboBox):
     name = self.config['name']
     current_camera = self.config.get('Camera', None)
 
-    response = await self.stub.node_request(thalamus_pb2.NodeRequest(node=name,json="\"get_cameras\""))
+    response = await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=name, type=self.config['type']), json="\"get_cameras\""))
     cameras = json.loads(response.json)
     LOGGER.debug('asyncShowPopup %s', cameras)
     self.clear()
@@ -130,7 +130,7 @@ class ThorcamWidget(QWidget):
 
     async def sync_config():
       name = self.config['name']
-      await self.stub.node_request(thalamus_pb2.NodeRequest(node=name,json="\"sync_config\""))
+      await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=name, type=self.config['type']), json="\"sync_config\""))
 
     def sync_sync_config():
       create_task_with_exc_handling(sync_config())

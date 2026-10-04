@@ -198,6 +198,10 @@ extern "C" {
     enum ThalamusAnalogEncoding (*encoding)(struct ThalamusNode* node);
     enum ThalamusAnalogFormat (*format)(struct ThalamusNode* node, int channel);
     uint64_t (*encoded_count)(struct ThalamusNode* node);
+    /* Whether this message's channels differ from the previous message's
+       (count, names, formats or sample intervals). Only the first message
+       with analog data after a change reports it. Analog node version 5. */
+    char (*channels_changed)(struct ThalamusNode* node);
   };
 
   enum ThalamusImageFormat {
@@ -376,6 +380,9 @@ extern "C" {
     void (*node_get_node_disconnect)(struct ThalamusNodeGetConnection*); // 65
     void (*node_ready_disconnect)(struct ThalamusNodeReadyConnection*); // 66
 
+    /* Deprecated: channel changes are reported per message by
+       ThalamusAnalogNode::channels_changed. These remain for ABI
+       compatibility and do nothing; the connect callback is never called. */
     void (*node_channels_changed)(struct ThalamusNode*); // 67
 
     struct ThalamusNodeReadyConnection* (*node_channels_changed_connect)(struct ThalamusNode*, ThalamusNodeReadyCallback callback, void* data); // 68
@@ -474,6 +481,11 @@ extern "C" {
     //The number of pointers after the ThalamusAnalogNode::name field in the analog nodes Thalamus provides
     //to plugins, the host side counterpart of thalamus_get_analog_node_version.
     int32_t (*analog_node_version)(void); // 140
+
+    //Like trace_event_begin, but name is a NUL terminated string that must stay valid and unchanged while
+    //the plugin is loaded: Perfetto interns it by address, so it's written to the trace once and later
+    //events refer to it by id. End the event with trace_event_end.
+    void (*trace_event_begin_static)(const char* name); // 141
   };
 
   typedef struct ThalamusNodeFactory** (*thalamus_get_node_factories_t)(struct ThalamusAPI*);

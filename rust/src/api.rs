@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::{
+  ffi::CStr,
   os::raw::{c_char, c_void},
   sync::OnceLock,
 };
@@ -51,21 +52,43 @@ pub fn is_main_thread() -> bool {
 
 /// Wraps a !Send value so it can travel inside a Send closure, while ensuring
 /// it can only be accessed with a MainThreadToken (i.e., on the main thread).
-pub struct MainThreadOnly<T> {
-  value: T,
+/// If it's dropped on another thread without being taken (e.g. a thread
+/// unwinding from a panic, or a cancelled task), the value is posted to the
+/// main thread and dropped there: dropping a State, for one, updates host
+/// structures only the main thread may touch. If that post never runs
+/// (Thalamus is shutting down) the value is leaked instead.
+pub struct MainThreadOnly<T: 'static> {
+  /// None once taken.
+  value: Option<T>,
+  api: ThalamusAPIThreadSafe,
 }
 
-unsafe impl<T> Send for MainThreadOnly<T> {}
+unsafe impl<T: 'static> Send for MainThreadOnly<T> {}
 
-impl<T> MainThreadOnly<T> {
-  pub fn new(value: T, _token: MainThreadToken) -> Self {
-    Self { value }
+impl<T: 'static> MainThreadOnly<T> {
+  pub fn new(value: T, api: ThalamusAPI, _token: MainThreadToken) -> Self {
+    Self { value: Some(value), api: api.thread_safe() }
   }
   pub fn get(&self, _token: MainThreadToken) -> &T {
-    &self.value
+    self.value.as_ref().expect("MainThreadOnly value already taken")
   }
-  pub fn take(self, _token: MainThreadToken) -> T {
-    self.value
+  pub fn take(mut self, _token: MainThreadToken) -> T {
+    self.value.take().expect("MainThreadOnly value already taken")
+  }
+}
+
+impl<T: 'static> Drop for MainThreadOnly<T> {
+  fn drop(&mut self) {
+    let Some(value) = self.value.take() else {
+      return;
+    };
+    if is_main_thread() {
+      return;
+    }
+    // Re-wrapped so it can be sent; that wrapper is dropped on the main
+    // thread, where the value is dropped directly.
+    let wrapped = MainThreadOnly { value: Some(value), api: self.api };
+    self.api.post_to_main(move |_token| drop(wrapped));
   }
 }
 
@@ -161,7 +184,7 @@ impl ExtNode {
     if analog.is_null() {
       None
     } else {
-      Some(ExtAnalogNode { node: self })
+      Some(ExtAnalogNode { _node: self })
     }
   }
 
@@ -185,35 +208,10 @@ impl Drop for ExtNode {
   }
 }
 
+/// Returned by ExtNode::analog when the node has the analog modality. Channel
+/// changes are reported per message by AnalogData::channels_changed.
 pub struct ExtAnalogNode<'a> {
-  node: &'a ExtNode,
-}
-
-impl<'a> ExtAnalogNode<'a> {
-  pub fn subscribe_analog_channels_changed<T: FnMut(ExtNode) + 'static>(
-    &self,
-    callback: T,
-  ) -> OnDrop {
-    let call_ptr = Box::into_raw(Box::new(NodeReadyArgs {
-      api: self.node.api,
-      callback,
-    }));
-    let void_ptr = call_ptr as *mut std::os::raw::c_void;
-
-    let connection = unsafe {
-      ((&*self.node.api.raw).node_channels_changed_connect.unwrap())(
-        self.node.node,
-        Some(node_ready_callback::<T>),
-        void_ptr,
-      )
-    };
-    let api = self.node.api;
-    let cleanup = move || unsafe {
-      ((&*api.raw).node_channels_changed_disconnect.unwrap())(connection);
-      drop(Box::from_raw(call_ptr));
-    };
-    OnDrop::new(cleanup)
-  }
+  _node: &'a ExtNode,
 }
 
 pub struct ExtNodeData<'a> {
@@ -226,24 +224,46 @@ impl<'a> NodeData for ExtNodeData<'a> {
     Duration::from_nanos(ns)
   }
 
+  /// A node with the analog modality doesn't have analog data in every
+  /// message (e.g. a media converter's image outputs), so this also asks
+  /// has_analog_data. Reading channels from a message without analog data
+  /// panics inside the upstream node's FFI functions.
   fn analog(&self) -> Option<&dyn AnalogData> {
     let analog = unsafe { (*self.node.node).analog };
-    if analog.is_null() { None } else { Some(self) }
+    if analog.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*analog).has_analog_data.unwrap())(self.node.node) != 0 };
+    if has_data { Some(self) } else { None }
   }
 
+  /// See analog(): this asks has_image_data, since e.g. a media converter's
+  /// audio outputs have no image.
   fn image(&self) -> Option<&dyn ImageData> {
     let image = unsafe { (*self.node.node).image };
-    if image.is_null() { None } else { Some(self) }
+    if image.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*image).has_image_data.unwrap())(self.node.node) != 0 };
+    if has_data { Some(self) } else { None }
   }
 
   fn mocap(&self) -> Option<&dyn MocapData> {
     let mocap = unsafe { (*self.node.node).mocap };
-    if mocap.is_null() { None } else { Some(self) }
+    if mocap.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*mocap).has_motion_data.unwrap())(self.node.node) != 0 };
+    if has_data { None } else { Some(self) }
   }
 
   fn text(&self) -> Option<&dyn TextData> {
     let text = unsafe { (*self.node.node).text };
-    if text.is_null() { None } else { Some(self) }
+    if text.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*text).has_text_data.unwrap())(self.node.node) != 0 };
+    if has_data { None } else { Some(self) }
   }
 }
 
@@ -393,6 +413,16 @@ impl<'a> AnalogData for ExtNodeData<'a> {
     unsafe {
       let analog = (*self.node.node).analog;
       (*analog).encoded_count.map_or(0, |encoded_count| encoded_count(self.node.node))
+    }
+  }
+  fn channels_changed(&self) -> bool {
+    // Older Thalamus builds' ThalamusAnalogNode ends before `channels_changed`.
+    if self.node.api.analog_node_version() < 5 {
+      return false;
+    }
+    unsafe {
+      let analog = (*self.node.node).analog;
+      (*analog).channels_changed.is_some_and(|channels_changed| channels_changed(self.node.node) != 0)
     }
   }
   fn sample_interval(&self, channel: i32) -> Duration {
@@ -782,6 +812,24 @@ pub struct ThalamusAPIThreadSafe {
   pub raw: *mut ThalamusAPIRaw,
 }
 unsafe impl Send for ThalamusAPIThreadSafe {}
+// SAFETY: it's Copy, so sharing a reference is no different from sending a
+// copy, and its functions may be called from any thread.
+unsafe impl Sync for ThalamusAPIThreadSafe {}
+
+/// A trace event begun by ThalamusAPIThreadSafe::trace_event; ends it when
+/// dropped.
+pub struct TraceEvent {
+  end: Option<unsafe extern "C" fn()>,
+  _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for TraceEvent {
+  fn drop(&mut self) {
+    if let Some(end) = self.end {
+      unsafe { end() };
+    }
+  }
+}
 
 pub enum NodeSelector {
   Name(String),
@@ -801,6 +849,43 @@ impl ThalamusAPIThreadSafe {
     unsafe {
       let time_ns = (&*self.raw).time_ns.unwrap();
       return Duration::from_nanos(time_ns());
+    }
+  }
+
+  /// Begins a trace event named `name` (category "plugin") on this thread's
+  /// track in Thalamus's Perfetto trace; it ends when the returned guard is
+  /// dropped. Begin and end must happen on the same thread, so the guard isn't
+  /// Send and can't be held across an await.
+  pub fn trace_event_dynamic(&self, name: &str) -> TraceEvent {
+    let api = unsafe { &*self.raw };
+    let end = match (api.trace_event_begin, api.trace_event_end) {
+      (Some(begin), Some(end)) => {
+        let span = ThalamusCharSpan {
+          data: name.as_ptr() as *const c_char,
+          size: name.len() as u64,
+          owns_data: 0,
+        };
+        // Thalamus copies the name, so it only has to live for this call.
+        unsafe { begin(&span) };
+        Some(end)
+      }
+      _ => None,
+    };
+    TraceEvent { end, _not_send: PhantomData }
+  }
+
+  /// Like trace_event, but Perfetto interns the name: it's written to the
+  /// trace once per thread and later events refer to it by id. Perfetto keys
+  /// names by address, so the name must be 'static (e.g. a c"..." literal).
+  /// On a Thalamus without trace_event_begin_static this is trace_event.
+  pub fn trace_event(&self, name: &'static CStr) -> TraceEvent {
+    let api = unsafe { &*self.raw };
+    match (api.trace_event_begin_static, api.trace_event_end) {
+      (Some(begin), Some(end)) => {
+        unsafe { begin(name.as_ptr()) };
+        TraceEvent { end: Some(end), _not_send: PhantomData }
+      }
+      _ => self.trace_event_dynamic(name.to_str().unwrap_or("")),
     }
   }
 
@@ -871,7 +956,8 @@ impl ThalamusAPIThreadSafe {
 impl ThalamusAPI {
   /// The number of fields after `name` in the ThalamusAnalogNodes Thalamus
   /// provides (2 once `buffer` and `encoding` exist, 4 once `format` and
-  /// `encoded_count` do), or 0 if the running Thalamus predates the query.
+  /// `encoded_count` do, 5 once `channels_changed` does), or 0 if the running
+  /// Thalamus predates the query.
   pub fn analog_node_version(&self) -> i32 {
     // copy_from_host leaves functions the host doesn't have as None.
     unsafe { (*self.raw).analog_node_version.map_or(0, |f| f()) }
@@ -908,13 +994,6 @@ impl ThalamusAPI {
       (*plugin_impl).data = Some(data);
       node_ready(node);
       (*plugin_impl).data = None;
-    })
-  }
-
-  pub fn channels_changed(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
-    token.with(|node| unsafe {
-      let node_channels_changed = (&*self.raw).node_channels_changed.unwrap();
-      node_channels_changed(node);
     })
   }
 
@@ -1081,7 +1160,7 @@ impl ThalamusAPI {
     match handle {
       Some(h) if !h.is_finished() => {
         let mt_api = self.thread_safe();
-        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), token);
+        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), *self, token);
         mt_api.post_to_threadpool(move || {
           let _ = h.join();
           mt_api.post_to_main(move |token| {
@@ -1117,7 +1196,7 @@ impl ThalamusAPI {
     match handle {
       Some(h) if !h.is_finished() => {
         let mt_api = self.thread_safe();
-        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), token);
+        let wrapped = MainThreadOnly::new((callback, Rc::clone(&running)), *self, token);
         self.tokio().as_ref().unwrap().spawn(async move {
           let _ = h.await;
           mt_api.post_to_main(move |token| {
@@ -3059,11 +3138,27 @@ pub trait AnalogData {
   fn encoded_count(&self) -> u64 {
     0
   }
+  /// Whether this message's channels differ from the previous message's:
+  /// their count, names, formats or sample intervals. Only the first message
+  /// after a change reports it, so a consumer checks it on every message and
+  /// treats the first message it sees as changed too.
+  fn channels_changed(&self) -> bool {
+    false
+  }
   fn scale(&self, _channel: i32) -> f64 {
     return 1.0;
   }
   fn offset(&self, _channel: i32) -> f64 {
     return 0.0;
+  }
+  fn count(&self, channel: i32) -> usize {
+    match self.analog_format(channel) {
+        AnalogFormat::Double => self.data(channel).len(),
+        AnalogFormat::Short => self.short_data(channel).len(),
+        AnalogFormat::Int => self.int_data(channel).len(),
+        AnalogFormat::ULong => self.ulong_data(channel).len(),
+        AnalogFormat::Encoded => self.encoded_count() as usize,
+    }
   }
 }
 

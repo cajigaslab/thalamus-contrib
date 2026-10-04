@@ -711,7 +711,7 @@ impl SleeveNodeInner {
             let api = lock.api.thread_safe();
             let node_token = lock.node_token.clone();
             let address = lock.address.clone();
-            let wrapped_state = MainThreadOnly::new(lock.state.clone(), lock.main_thread_token);
+            let wrapped_state = MainThreadOnly::new(lock.state.clone(), lock.api, lock.main_thread_token);
             let cancel_token = CancellationToken::new();
             lock.cancel_token = Some(cancel_token.clone());
             lock.bluetooth_handle = Some(api.tokio().as_ref().unwrap().spawn(async move {

@@ -892,7 +892,7 @@ impl ThorcamNode {
           let api = this.api.thread_safe();
           let signaler = this.signaler.clone();
           signaler.unblock();
-          let wrapped_state = MainThreadOnly::new(this.state.clone(), this.main_thread_token);
+          let wrapped_state = MainThreadOnly::new(this.state.clone(), this.api, this.main_thread_token);
           let settings = this.sync();
           let viewer_sink = this.viewer_sink.clone();
           let device_id = camera.device_id;

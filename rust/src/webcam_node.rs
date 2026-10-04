@@ -354,8 +354,6 @@ impl WebcamNode {
         format,
         frame_interval,
       };
-      // MJPEG frames are dropped by the viewer.
-      viewer_sink.update(&frame);
       match signaler.ready(&frame) {
         Ok(v) => {
           if !v {
@@ -365,6 +363,8 @@ impl WebcamNode {
         }
         Err(_) => break,
       }
+      // MJPEG frames are dropped by the viewer.
+      viewer_sink.update(&frame);
     }
     println!("webcam end");
   }
@@ -398,7 +398,7 @@ impl WebcamNode {
           let api = this.api.thread_safe();
           let signaler = this.signaler.clone();
           signaler.unblock();
-          let wrapped_state = MainThreadOnly::new(this.state.clone(), this.main_thread_token);
+          let wrapped_state = MainThreadOnly::new(this.state.clone(), this.api, this.main_thread_token);
           let settings = WebcamSettings::read(&this.state);
           let active_formats = this.active_formats.clone();
           let viewer_sink = this.viewer_sink.clone();

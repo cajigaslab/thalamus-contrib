@@ -1193,7 +1193,7 @@ async fn tick_loop(
       // with it this task's TaskScope. Doing that from inside this task's
       // own poll would deadlock (TaskScope::drop locks the same Task state
       // the poll is holding), so set View once the poll has returned.
-      let state = MainThreadOnly::new(state.clone(), token);
+      let state = MainThreadOnly::new(state.clone(), api, token);
       api.post_to_main(move |token| {
         state.take(token).set("View", false);
       });
