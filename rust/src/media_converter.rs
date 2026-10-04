@@ -21,7 +21,7 @@ impl MediaConverter {
   pub fn new(api: ThalamusAPIThreadSafe, params: MediaConverterParams) -> MediaConverter {
     MediaConverter {
       image: Converter::new(api, params.image),
-      audio: AudioConverter::new(params.audio),
+      audio: AudioConverter::new(api, params.audio),
       params,
     }
   }
@@ -29,26 +29,18 @@ impl MediaConverter {
   /// Reconfigures only the converters whose parameters changed, so e.g. an
   /// image setting doesn't reset the audio encoder.
   pub fn reconfigure(&mut self, params: MediaConverterParams) {
-    if !same_image_params(&params.image, &self.params.image) {
-      self.image.reconfigure(params.image);
-    }
+    self.image.reconfigure(params.image);
     self.audio.reconfigure(params.audio);
     self.params = params;
   }
 
-  pub fn needs_image_conversion(&self, data: &dyn NodeData) -> bool {
-    self.image.needs_conversion(data)
-  }
-
-  pub fn needs_audio_conversion(&self, data: &dyn NodeData) -> bool {
-    self.audio.needs_conversion(data)
+  pub fn channels_changed(&mut self) {
+    self.audio.channels_changed();
   }
 
   /// Queues whichever of `data`'s image and analog data needs converting.
   pub fn push(&mut self, data: &dyn NodeData) {
-    if self.image.needs_conversion(data) {
-      self.image.push(data);
-    }
+    self.image.push(data);
     self.audio.push(data);
   }
 
@@ -60,10 +52,4 @@ impl MediaConverter {
     }
     self.image.pull()
   }
-}
-
-/// ConverterParams doesn't implement PartialEq, and the image converter
-/// isn't changed here.
-fn same_image_params(a: &ConverterParams, b: &ConverterParams) -> bool {
-  a.format == b.format && a.width == b.width && a.height == b.height && a.quality == b.quality
 }

@@ -99,41 +99,13 @@ impl AnalogData for WithStats<'_> {
   }
 }
 
-/// Just the image half of a message, for forwarding it while its analog data
-/// is converted.
-struct ImageOnly<'a>(&'a dyn NodeData);
-
-impl NodeData for ImageOnly<'_> {
-  fn time(&self) -> Duration {
-    self.0.time()
-  }
-
-  fn image(&self) -> Option<&dyn ImageData> {
-    self.0.image()
-  }
-}
-
-/// Just the analog half of a message, for forwarding it while its image is
-/// converted, or when it has no image.
-struct AnalogOnly<'a>(&'a dyn NodeData);
-
-impl NodeData for AnalogOnly<'_> {
-  fn time(&self) -> Duration {
-    self.0.time()
-  }
-
-  fn analog(&self) -> Option<&dyn AnalogData> {
-    self.0.analog()
-  }
-}
-
 #[derive(Clone,Debug)]
 struct ParamsHolder {
   params: MediaConverterParams,
   dirty: bool,
 }
 
-pub struct ImageConverterNode {
+pub struct MediaConverterNode {
   api: ThalamusAPI,
   state: State,
   main_thread_token: MainThreadToken,
@@ -144,6 +116,7 @@ pub struct ImageConverterNode {
   state_connection: Option<OnDrop>,
   source_connection: Option<OnDrop>,
   data_connection: Option<OnDrop>,
+  channels_changed_connection: Option<OnDrop>,
   signaler: Arc<OffMainSignaler>,
   converter: Arc<Mutex<MediaConverter>>,
   notify: Arc<Notify>,
@@ -151,12 +124,12 @@ pub struct ImageConverterNode {
   arrivals: Arrivals,
 }
 
-impl NodeConsts for ImageConverterNode {
+impl NodeConsts for MediaConverterNode {
   const MODALITIES: u32 = THALAMUS_MODALITY_IMAGE | THALAMUS_MODALITY_ANALOG;
   const SIGNALS_OFFMAIN: bool = true;
 }
 
-impl ImageConverterNode {
+impl MediaConverterNode {
   fn on_state(rc: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
     let StateValue::String(key_str) = key else {
       return;
@@ -219,7 +192,7 @@ impl ImageConverterNode {
           lock.params.image.height = if v > 0 { Some(v as i32) } else { None };
         }
       },
-      "Quality" => {
+      "Video Quality" => {
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
@@ -257,6 +230,7 @@ impl ImageConverterNode {
           let mut borrow = this.borrow_mut();
           let params = borrow.params.clone();
           let converter = borrow.converter.clone();
+          let converter2 = converter.clone();
           let signaler = borrow.signaler.clone();
           let notify = borrow.notify.clone();
           let arrivals = borrow.arrivals.clone();
@@ -275,36 +249,18 @@ impl ImageConverterNode {
 
             let data = node.data();
             // Latency is only measured for images.
-            if data.image().is_some() {
-              record_arrival(&arrivals, data.time(), arrived);
-            }
-            let image_needs = converter.needs_image_conversion(&data);
-            let audio_needs = converter.needs_audio_conversion(&data);
-            if image_needs || audio_needs {
-              converter.push(&data);
-              notify.notify_one();
-            }
-
-            // Forward whatever isn't being converted. Images carry the stats
-            // channels, which replace the message's own analog data, so
-            // analog data is forwarded with an image only when neither half
-            // is converted (as before audio conversion existed).
-            let forward_image = data.image().is_some() && !image_needs;
-            let forward_analog = data.analog().is_some() && !audio_needs;
-            if forward_image {
-              let latency_ms = take_latency_ms(&arrivals, data.time(), api.time());
-              if let Some(image) = data.image() {
-                viewer_sink.update(image);
-              }
-              if audio_needs {
-                let _ = signaler.ready_this_thread(&WithStats::new(&ImageOnly(&data), latency_ms));
-              } else {
-                let _ = signaler.ready_this_thread(&WithStats::new(&data, latency_ms));
-              }
-            } else if forward_analog {
-              let _ = signaler.ready_this_thread(&AnalogOnly(&data));
-            }
+            //if data.image().is_some() {
+            //  record_arrival(&arrivals, data.time(), arrived);
+            //}
+            converter.push(&data);
+            notify.notify_one();
           }));
+
+          borrow.channels_changed_connection = node.analog().map(|n| {
+            n.subscribe_analog_channels_changed(move |_| {
+              converter2.lock().unwrap().channels_changed();
+            })
+          })
         }));
         rc.borrow_mut().source_connection = temp;
       }
@@ -328,17 +284,15 @@ impl ImageConverterNode {
       {
         let mut converter = converter.lock().unwrap();
         while let Some(output) = converter.pull() {
+          let _ = signaler.ready(&*output);
           let Some(image) = output.image() else {
-            // Converted audio has no stats channels (a message has one
-            // analog sample type, and the stats are f64).
-            let _ = signaler.ready(&*output);
             continue;
           };
           // Converted images keep their input's time, which is the key.
-          let latency_ms = take_latency_ms(&arrivals, output.time(), api.time());
+          //let latency_ms = take_latency_ms(&arrivals, output.time(), api.time());
           // Encoded (MPEG4) output is dropped by the viewer.
           viewer_sink.update(image);
-          let _ = signaler.ready(&WithStats::new(&*output, latency_ms));
+          //let _ = signaler.ready(&WithStats::new(&*output, latency_ms));
         }
       }
       notify.notified().await;
@@ -346,7 +300,7 @@ impl ImageConverterNode {
   }
 }
 
-impl Node for ImageConverterNode {
+impl Node for MediaConverterNode {
   fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Rc<RefCell<Self>> {
     let signaler = OffMainSignaler::new(api, node_token);
     signaler.unblock();
@@ -362,7 +316,7 @@ impl Node for ImageConverterNode {
       },
       dirty: true,
     };
-    let result = Rc::new(RefCell::new(ImageConverterNode {
+    let result = Rc::new(RefCell::new(MediaConverterNode {
       params: Arc::new(Mutex::new(params.clone())),
       converter: Arc::new(Mutex::new(MediaConverter::new(api.thread_safe(), params.params))),
       api,
@@ -373,6 +327,7 @@ impl Node for ImageConverterNode {
       state_connection: None,
       source_connection: None,
       data_connection: None,
+      channels_changed_connection: None,
       signaler,
       notify: Arc::new(Notify::new()),
       dropping: Arc::new(AtomicBool::new(false)),
@@ -383,7 +338,7 @@ impl Node for ImageConverterNode {
     let state_callback =
       move |s, a, k, v| {
         if let Some(lock) = change_ref.upgrade() {
-          ImageConverterNode::on_state(lock, s, a, k, v);
+          MediaConverterNode::on_state(lock, s, a, k, v);
         };
       };
 
@@ -398,7 +353,7 @@ impl Node for ImageConverterNode {
       let dropping = borrow.dropping.clone();
       let arrivals = borrow.arrivals.clone();
       let viewer_sink = borrow.viewer_sink.clone();
-      api.tokio().as_ref().unwrap().spawn(ImageConverterNode::converter_task(
+      api.tokio().as_ref().unwrap().spawn(MediaConverterNode::converter_task(
         converter,
         signaler,
         notify,

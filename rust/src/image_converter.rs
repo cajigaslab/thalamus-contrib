@@ -361,6 +361,7 @@ impl Converter {
 
       if self.decoder_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.decoder_frame);
+        self.decoder_frame = std::ptr::null_mut();
       }
       for f in self.writable_src_frames.iter_mut() {
         ffi::av_frame_free(f);
@@ -373,13 +374,16 @@ impl Converter {
       }
       if self.scaled_frame != std::ptr::null_mut() {
         ffi::av_frame_free(&mut self.scaled_frame);
+        self.scaled_frame = std::ptr::null_mut();
       }
 
       if self.packet != std::ptr::null_mut() {
         ffi::av_packet_free(&mut self.packet);
+        self.packet = std::ptr::null_mut();
       }
       if self.parser_packet != std::ptr::null_mut() {
         ffi::av_packet_free(&mut self.parser_packet);
+        self.parser_packet = std::ptr::null_mut();
       }
 
       let src_pix = image_to_pix(src_format);

@@ -3065,6 +3065,15 @@ pub trait AnalogData {
   fn offset(&self, _channel: i32) -> f64 {
     return 0.0;
   }
+  fn count(&self, channel: i32) -> usize {
+    match self.analog_format(channel) {
+        AnalogFormat::Double => self.data(channel).len(),
+        AnalogFormat::Short => self.short_data(channel).len(),
+        AnalogFormat::Int => self.int_data(channel).len(),
+        AnalogFormat::ULong => self.ulong_data(channel).len(),
+        AnalogFormat::Encoded => self.encoded_count() as usize,
+    }
+  }
 }
 
 /// How a channel's samples are stored, i.e. which AnalogData function reads
