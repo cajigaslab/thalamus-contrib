@@ -65,7 +65,7 @@ pub struct Converter {
   need_key_frame: bool,
 }
 
-#[derive(Debug,Clone,Copy)]
+#[derive(Debug,Clone,Copy,PartialEq)]
 pub struct ConverterParams {
   pub format: Option<ImageFormat>,
   pub width: Option<i32>,

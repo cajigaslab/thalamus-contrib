@@ -170,6 +170,27 @@ impl<'a> AnalogData for AudioOutput<'a> {
   }
 }
 
+/// How many samples per channel an audio frame's buffers can hold.
+unsafe fn frame_capacity(frame: *const ffi::AVFrame) -> i32 {
+  unsafe {
+    if (*frame).buf[0].is_null() {
+      return 0;
+    }
+    let format: ffi::AVSampleFormat = std::mem::transmute((*frame).format);
+    let bps = ffi::av_get_bytes_per_sample(format);
+    let bytes_per_sample = if ffi::av_sample_fmt_is_planar(format) != 0 {
+      bps
+    } else {
+      bps * (*frame).ch_layout.nb_channels
+    };
+    if bytes_per_sample <= 0 {
+      0
+    } else {
+      (*frame).linesize[0] / bytes_per_sample
+    }
+  }
+}
+
 enum FramePoolParams {
   Audio{layout: ffi::AVChannelLayout, format: ffi::AVSampleFormat, samplerate: i32}
 }
@@ -201,32 +222,28 @@ impl FramePool {
         !writable
       });
 
-      let frame = if !self.writable.is_empty() {
-        let frame = self.writable.pop_front().unwrap();
-        if (*frame).nb_samples < nb_samples {
+      // A recycled frame keeps its buffers, so reuse it when they're big enough
+      // and replace it otherwise (av_frame_get_buffer on a frame that has
+      // buffers leaks them).
+      if let Some(mut frame) = self.writable.pop_front() {
+        if frame_capacity(frame) >= nb_samples {
           (*frame).nb_samples = nb_samples;
-          let ret = ffi::av_frame_get_buffer(frame, 0);
-          assert!(ret >= 0, "ffi::av_frame_get_buffer: {}", av_error_string(ret));
+          return frame;
         }
-        frame
-      } else {
-        let frame = ffi::av_frame_alloc();
-        match self.params {
-          FramePoolParams::Audio { layout, format, samplerate } => {
-            ffi::av_channel_layout_copy(&mut (*frame).ch_layout, &layout);
-            (*frame).format = format as i32;
-            (*frame).sample_rate = samplerate;
-          }
-        };
-        frame
+        ffi::av_frame_free(&mut frame);
+      }
+
+      let frame = ffi::av_frame_alloc();
+      assert!(!frame.is_null(), "av_frame_alloc failed");
+      match self.params {
+        FramePoolParams::Audio { layout, format, samplerate } => {
+          ffi::av_channel_layout_copy(&mut (*frame).ch_layout, &layout);
+          (*frame).format = format as i32;
+          (*frame).sample_rate = samplerate;
+          (*frame).nb_samples = nb_samples;
+        }
       };
 
-      match self.params {
-        FramePoolParams::Audio { .. } => {
-          (*frame).nb_samples = nb_samples;
-        }
-      };
-      
       let ret = ffi::av_frame_get_buffer(frame, 0);
       assert!(ret >= 0, "ffi::av_frame_get_buffer: {}", av_error_string(ret));
       frame
@@ -285,6 +302,7 @@ pub struct AudioConverter {
   
   pts: i64,//
   pts_to_time: VecDeque<(i64, Duration)>,//
+  encoder_pts: i64,
   
   in_buffer: Vec<u8>,//
   out_buffer: Vec<u8>,//
@@ -378,6 +396,7 @@ fn audio_format_to_sample_format(format: AudioFormat) -> ffi::AVSampleFormat {
   }
 }
 
+/// The codec's supported values for `config`. Empty means it accepts anything.
 fn get_codec_config<T>(codec: *const ffi::AVCodec, config: ffi::AVCodecConfig) -> &'static [T] {
   unsafe {
     let mut count = 0;
@@ -385,48 +404,120 @@ fn get_codec_config<T>(codec: *const ffi::AVCodec, config: ffi::AVCodecConfig) -
     let ret = ffi::avcodec_get_supported_config(std::ptr::null_mut(), codec, config,
                                        0, &mut vals, &mut count);
     assert!(ret >= 0, "avcodec_get_supported_config error: {}", av_error_string(ret));
+    if vals.is_null() || count <= 0 {
+      return &[];
+    }
     std::slice::from_raw_parts(vals as *const T, count as usize)
   }
 }
 
 fn sample_format_for_codec(src_format: ffi::AVSampleFormat, codec: *const ffi::AVCodec) -> ffi::AVSampleFormat {
-  let mut formats: *const std::ffi::c_void  = std::ptr::null_mut();
-  let mut count = 0;
-  let formats = unsafe {
-    let ret = ffi::avcodec_get_supported_config(std::ptr::null_mut(), codec, AV_CODEC_CONFIG_SAMPLE_FORMAT,
-                                       0, &mut formats, &mut count);
-    assert!(ret >= 0, "avcodec_get_supported_config error: {}", av_error_string(ret));
-    std::slice::from_raw_parts(formats as *const ffi::AVSampleFormat, count as usize)
-  };
-  
-  if formats.contains(&src_format) {
+  let formats: &[ffi::AVSampleFormat] = get_codec_config(codec, AV_CODEC_CONFIG_SAMPLE_FORMAT);
+  if formats.is_empty() || formats.contains(&src_format) {
     src_format
   } else {
-    match formats.first() {
-      Some(s) => { *s },
-      None => panic!("No codec sample rates")
-    }
+    formats[0]
   }
 }
 
+/// The supported rate nearest `src_frequency`, so e.g. 44101 Hz from a
+/// truncated sample interval picks 44100 rather than the first listed rate.
 fn sample_rate_for_codec(src_frequency: i32, codec: *const ffi::AVCodec) -> i32 {
-  let mut rates: *const std::ffi::c_void  = std::ptr::null_mut();
-  let mut count = 0;
-  let rates = unsafe {
-    let ret = ffi::avcodec_get_supported_config(std::ptr::null_mut(), codec, AV_CODEC_CONFIG_SAMPLE_RATE,
-                                       0, &mut rates, &mut count);
-    assert!(ret >= 0, "avcodec_get_supported_config error: {}", av_error_string(ret));
-    std::slice::from_raw_parts(rates as *const std::os::raw::c_int, count as usize)
+  let rates: &[std::os::raw::c_int] = get_codec_config(codec, AV_CODEC_CONFIG_SAMPLE_RATE);
+  rates.iter().copied().min_by_key(|r| (r - src_frequency).abs()).unwrap_or(src_frequency)
+}
+
+const NANOS_PER_SEC: u128 = 1_000_000_000;
+
+/// Rates sources commonly run at. Sample intervals are whole nanoseconds, so
+/// e.g. 44.1 kHz arrives as 22675 or 22676 ns, which no integer rate inverts
+/// exactly; matching against known rates recovers 44100.
+const COMMON_SAMPLE_RATES: [i32; 14] = [
+  8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000, 176400, 192000,
+];
+
+/// How far a sample interval may be from 1/rate and still count as that rate.
+const RATE_MATCH_MARGIN_NANOS: u128 = 10;
+
+/// Whether `interval` is within RATE_MATCH_MARGIN_NANOS of 1/`rate`, i.e.
+/// |interval - 1e9/rate| < margin, checked without division as
+/// |interval * rate - 1e9| < margin * rate.
+fn interval_matches_rate(interval: Duration, rate: i32) -> bool {
+  rate > 0 && (interval.as_nanos() * rate as u128).abs_diff(NANOS_PER_SEC) < RATE_MATCH_MARGIN_NANOS * rate as u128
+}
+
+/// The sample rate of `interval`. `preferred` (the converter's output rate)
+/// and then the common rates win when the interval matches them to the
+/// nanosecond, so a source already at the output rate isn't resampled.
+/// Otherwise it's 1e9 / interval rounded to the nearest integer.
+fn interval_to_rate(interval: Duration, preferred: Option<i32>) -> i32 {
+  let nanos = interval.as_nanos();
+  preferred.into_iter()
+    .chain(COMMON_SAMPLE_RATES)
+    .find(|rate| interval_matches_rate(interval, *rate))
+    .unwrap_or_else(|| ((NANOS_PER_SEC + nanos / 2) / nanos) as i32)
+}
+
+/// The duration of `samples` samples at `rate`, rounded to the nanosecond.
+/// Converting a whole count at once keeps the rounding error under 1 ns
+/// instead of accumulating a rounded interval once per sample.
+fn samples_to_duration(samples: u64, rate: i32) -> Duration {
+  let rate = rate as u128;
+  Duration::from_nanos(((samples as u128 * NANOS_PER_SEC + rate / 2) / rate) as u64)
+}
+
+/// The number of samples at `rate` in `duration`, rounded.
+fn duration_to_samples(duration: Duration, rate: i32) -> u64 {
+  ((duration.as_nanos() * rate as u128 + NANOS_PER_SEC / 2) / NANOS_PER_SEC) as u64
+}
+
+/// ADTS sampling_frequency_index values.
+const AAC_SAMPLE_RATES: [i32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+
+/// A 7-byte ADTS header (no CRC) for an AAC-LC frame of `payload_len` bytes.
+/// The encoder outputs raw AAC frames; the header is what lets the AAC parser
+/// split them and the decoder configure itself without extradata.
+fn adts_header(payload_len: usize, sample_rate: i32, channels: i32) -> [u8; 7] {
+  let rate_index = AAC_SAMPLE_RATES.iter().position(|r| *r == sample_rate)
+    .unwrap_or_else(|| panic!("{} Hz has no ADTS sampling frequency index", sample_rate)) as u8;
+  // Channel configuration 7 is 7.1 (8 channels); 7 channels would need a PCE.
+  let channel_config = match channels {
+    1..=6 => channels as u8,
+    8 => 7,
+    _ => panic!("{} channels can't be described in an ADTS header", channels),
   };
-  let selected = rates.iter().copied().min_by_key(|r| (r - src_frequency).abs());
-  match selected {
-    Some(s) => { s },
-    None => panic!("No codec sample rates")
+  let frame_len = payload_len + 7;
+  // AAC-LC is audio object type 2, written as profile 1.
+  let profile = 1u8;
+  [
+    0xFF,
+    // Rest of the sync word, MPEG-4, layer 0, no CRC.
+    0xF1,
+    (profile << 6) | (rate_index << 2) | (channel_config >> 2),
+    ((channel_config & 3) << 6) | ((frame_len >> 11) as u8 & 0x03),
+    ((frame_len >> 3) & 0xFF) as u8,
+    (((frame_len & 7) as u8) << 5) | 0x1F,
+    // Buffer fullness 0x7FF (variable bitrate), one raw data block.
+    0xFC,
+  ]
+}
+
+/// Whether the trailing channel run of an input can be converted.
+fn is_supported_input(channels: &InputChannels) -> bool {
+  match channels.format {
+    AnalogFormat::Double | AnalogFormat::Short | AnalogFormat::Int => true,
+    AnalogFormat::Encoded => channels.encoding == AnalogEncoding::AAC,
+    AnalogFormat::ULong => false,
   }
 }
 
 fn encoder_time_base(frame_interval: Duration) -> ffi::AVRational {
-  unsafe { ffi::av_d2q(frame_interval.as_secs_f64(), 65535) }
+  // Exact: the interval is a whole number of nanoseconds.
+  let mut time_base = ffi::AVRational { num: 0, den: 1 };
+  unsafe {
+    ffi::av_reduce(&mut time_base.num, &mut time_base.den, frame_interval.as_nanos() as i64, NANOS_PER_SEC as i64, i32::MAX as i64);
+  }
+  time_base
 }
 
 fn single_channel(layout: &ffi::AVChannelLayout) -> ffi::AVChannelLayout {
@@ -476,6 +567,7 @@ impl AudioConverter {
       
       pts: 0,
       pts_to_time: VecDeque::new(),
+      encoder_pts: 0,
 
       in_buffer: vec![],
       out_buffer: vec![],
@@ -527,11 +619,13 @@ impl AudioConverter {
       if let Some(mut decoder) = self.decoder {
         ffi::avcodec_free_context(&mut decoder);
         ffi::av_parser_close(self.parser);
+        self.parser = std::ptr::null_mut();
         self.decoder = None;
       }
       if let Some(mut encoder) = self.encoder {
         ffi::avcodec_free_context(&mut encoder);
         ffi::av_audio_fifo_free(self.fifo);
+        self.fifo = std::ptr::null_mut();
         self.encoder = None;
       }
 
@@ -564,9 +658,19 @@ impl AudioConverter {
       }
       self.pts = 0;
       self.pts_to_time.clear();
+      self.encoder_pts = 0;
+      self.in_buffer.clear();
       self.out_buffer.clear();
       self.slice_to_pts.clear();
+      self.sample_buffers.clear();
+      self.sample_times.clear();
       self.need_key_frame = false;
+      // Pending frames are in the old output format.
+      self.dst_frame_pool = FramePool::new(FramePoolParams::Audio {
+        layout: std::mem::zeroed(),
+        format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE,
+        samplerate: 0,
+      });
     }
   }
 
@@ -640,26 +744,23 @@ impl AudioConverter {
         }
         codec
       });
-      let dst_sample_format = codec.map(|codec| {
-        let vals: &[ffi::AVSampleFormat] = get_codec_config(codec, ffi::AVCodecConfig::AV_CODEC_CONFIG_SAMPLE_FORMAT);
-        if vals.contains(&src_sample_format) {
-          src_sample_format
-        } else {
-          vals[0]
-        }
-      }).unwrap_or(audio_format_to_sample_format(dst_audio_format));
+      let dst_sample_format = codec
+        .map(|codec| sample_format_for_codec(src_sample_format, codec))
+        .unwrap_or_else(|| audio_format_to_sample_format(dst_audio_format));
 
-      let dst_sample_rate = codec.map(|codec| {
-        let vals: &[i32] = get_codec_config(codec, ffi::AVCodecConfig::AV_CODEC_CONFIG_SAMPLE_RATE);
-        if vals.contains(&src_sample_rate) {
-          src_sample_rate
-        } else {
-          vals[0]
-        }
-      }).unwrap_or(self.params.samplerate.unwrap_or(src_sample_rate));
+      let requested_rate = self.params.samplerate.unwrap_or(src_sample_rate);
+      let dst_sample_rate = codec
+        .map(|codec| sample_rate_for_codec(requested_rate, codec))
+        .unwrap_or(requested_rate);
       self.dst_sample_format = dst_sample_format;
       self.dst_sample_rate = dst_sample_rate;
-      self.dst_sample_interval = Duration::from_nanos(1_000_000_000/(self.dst_sample_rate as u64));
+      // Report exactly the input's interval when the rate is unchanged.
+      self.dst_sample_interval = if dst_sample_rate == src_sample_rate && !input_channels.sample_interval.is_zero() {
+        input_channels.sample_interval
+      } else {
+        samples_to_duration(1, dst_sample_rate)
+      };
+      self.encoder_pts = 0;
 
       self.encoder = codec.map(|codec| {
         let mut context = ffi::avcodec_alloc_context3(codec);
@@ -694,6 +795,8 @@ impl AudioConverter {
         ffi::av_channel_layout_copy(&mut (*self.fifo_frame).ch_layout, &(*encoder).ch_layout);
         (*self.fifo_frame).sample_rate = (*encoder).sample_rate;
         (*self.fifo_frame).nb_samples = (*encoder).frame_size;
+        let ret = ffi::av_frame_get_buffer(self.fifo_frame, 0);
+        assert!(ret >= 0, "av_frame_get_buffer: {}", av_error_string(ret));
 
         self.packet = ffi::av_packet_alloc();
         assert!(self.packet != std::ptr::null_mut(), "av_packet_alloc");
@@ -733,8 +836,10 @@ impl AudioConverter {
         std::ptr::null_mut(),
       );
       assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
+      let ret = ffi::swr_init(self.multi_sampler);
+      assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
 
-      self.single_samplers = self.input_channels.range.clone().map(|_| {
+      self.single_samplers =self.input_channels.range.clone().map(|_| {
         let mut sampler = std::ptr::null_mut();
         let ret = ffi::swr_alloc_set_opts2(
           &mut sampler,
@@ -748,10 +853,14 @@ impl AudioConverter {
           std::ptr::null_mut(),
         );
         assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
+        let ret = ffi::swr_init(sampler);
+        assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
         sampler
       }).collect();
 
-      let reducer_sample_format = ffi::av_get_packed_sample_fmt(dst_sample_format);
+      // The reducer joins the single-channel samplers' outputs, which are
+      // already in the destination format and rate, one plane per channel.
+      let reducer_sample_format = ffi::av_get_planar_sample_fmt(dst_sample_format);
       let ret = ffi::swr_alloc_set_opts2(
         &mut self.reducer_sampler,
         &self.layout,
@@ -759,11 +868,13 @@ impl AudioConverter {
         dst_sample_rate,
         &self.layout,
         reducer_sample_format,
-        src_sample_rate,
+        dst_sample_rate,
         0,
         std::ptr::null_mut(),
       );
       assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
+      let ret = ffi::swr_init(self.reducer_sampler);
+      assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
 
       let needs_decoding = self.decoder.is_some();
       let needs_encoding = self.encoder.is_some();
@@ -836,60 +947,64 @@ impl AudioConverter {
         (*frame).pts = pts;
         self.dst_frame_pool.push_pending(frame);
       } else {
-        let out_bps = ffi::av_get_bytes_per_sample(self.dst_sample_format);
-        for (ui, _) in self.input_channels.range.clone().enumerate() {
-          let sample_time = &mut self.sample_times[ui];
-          let sampler = self.single_samplers[ui];
+        // Buffers hold output-rate samples in the destination format; all
+        // counts below are in samples and converted to bytes only to index.
+        let out_bps = ffi::av_get_bytes_per_sample(self.dst_sample_format) as usize;
+        let out_rate = self.dst_sample_rate;
+        for ui in 0..self.input_channels.range.len() {
           let in_samples = in_counts[ui];
           if in_samples == 0 {
             continue;
           }
+          let sampler = self.single_samplers[ui];
           let out_samples = ffi::swr_get_out_samples(sampler, in_samples);
-          let out_bytes = out_bps*out_samples;
+          assert!(out_samples >= 0, "swr_get_out_samples: {}", av_error_string(out_samples));
 
           let buffer = &mut self.sample_buffers[ui];
           let old_length = buffer.len();
-          buffer.resize(old_length + out_bytes as usize, 0);
-          let buffer_slice = &mut buffer.as_mut_slice()[old_length..];
-
-          *sample_time = sample_time.or_else(|| {
-            Some(time - self.input_channels.sample_interval*((in_samples-1) as u32))
-          });
-
-          let ret = ffi::swr_convert(sampler, &mut buffer_slice.as_mut_ptr(), out_samples, &in_ptrs[ui], in_samples as i32);
+          buffer.resize(old_length + out_samples as usize * out_bps, 0);
+          let mut out_ptr = buffer[old_length..].as_mut_ptr();
+          let ret = ffi::swr_convert(sampler, &mut out_ptr, out_samples, &in_ptrs[ui], in_samples);
           assert!(ret >= 0, "swr_convert: {}", av_error_string(ret));
-          buffer.resize(old_length + (ret as usize), 0);
+          buffer.truncate(old_length + ret as usize * out_bps);
+
+          // Time of the channel's first buffered sample. `time` is the time
+          // of this message's last sample.
+          self.sample_times[ui].get_or_insert_with(|| {
+            time.saturating_sub(self.input_channels.sample_interval * (in_samples - 1) as u32)
+          });
         }
 
-        let latest = self.sample_times.iter().max().cloned();
-        let mut starts = Vec::<usize>::new();
-        starts.resize(self.sample_times.len(), 0);
+        let Some(latest) = self.sample_times.iter().flatten().max().copied() else {
+          return;
+        };
 
-        if let Some(Some(latest)) = latest {
-          for (ui, _) in self.input_channels.range.clone().enumerate() {
-            let Some(time) = self.sample_times[ui].as_mut() else {
-              continue
-            };
-            let start = &mut starts[ui];
-            *start = ((latest - *time).as_nanos()/self.input_channels.sample_interval.as_nanos()) as usize;
-          }
-        }
-
-        let sample_slices: Vec<_> = self.sample_buffers.iter().zip(starts.iter()).map(|(b, i)| {
-          &b[(i*out_bps as usize)..]
+        // Samples before the latest-starting channel's first sample can't be
+        // lined up with it, so each channel skips that many.
+        let starts: Vec<usize> = self.sample_times.iter().map(|t| match t {
+          Some(t) => duration_to_samples(latest - *t, out_rate) as usize,
+          None => 0,
         }).collect();
 
-        let min_size = sample_slices.iter().map(|b|b.len()).min().unwrap_or(0);
-        if min_size > 0 {
-          let ptrs: Vec<*const u8> = sample_slices.iter().map(|b| b.as_ptr()).collect();
-          let sizes = vec![min_size as i32; ptrs.len()];
-          self.convert_samples(self.reducer_sampler, ptrs.as_slice(), sizes.as_slice(), time, true);
+        let min_samples = self.sample_buffers.iter().zip(&starts)
+          .map(|(b, start)| (b.len() / out_bps).saturating_sub(*start))
+          .min()
+          .unwrap_or(0);
+        if min_samples > 0 {
+          let ptrs: Vec<*const u8> = self.sample_buffers.iter().zip(&starts)
+            .map(|(b, start)| b[start * out_bps..].as_ptr())
+            .collect();
+          let counts = vec![min_samples as i32; ptrs.len()];
+          // Recursing doesn't touch sample_buffers, so ptrs stay valid.
+          self.convert_samples(self.reducer_sampler, &ptrs, &counts, time, true);
         }
 
-        for ((start, buf), time) in starts.iter().zip(self.sample_buffers.iter_mut()).zip(self.sample_times.iter_mut()) {
-          let discarded = start+min_size;
-          buf.drain(..(discarded*out_bps as usize));
-          *time = (*time).map(|t| t + (discarded as u32)*self.input_channels.sample_interval);
+        for ((buffer, start), sample_time) in self.sample_buffers.iter_mut().zip(&starts).zip(self.sample_times.iter_mut()) {
+          let discarded = (start + min_samples).min(buffer.len() / out_bps);
+          buffer.drain(..discarded * out_bps);
+          if let Some(t) = sample_time {
+            *t += samples_to_duration(discarded as u64, out_rate);
+          }
         }
       }
     }
@@ -912,9 +1027,11 @@ impl AudioConverter {
 
     if !self.decoder_configured {
       let input_channels = self.get_input_range(input);
-      if input_channels.sample_interval.is_zero() {
-        if self.rejection_logged {
-          println!("Sample interval is required in AudioConverter input");
+      if input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels) {
+        if !self.rejection_logged {
+          println!(
+            "AudioConverter can't convert {:?} ({:?}) input with a {:?} sample interval",
+            input_channels.format, input_channels.encoding, input_channels.sample_interval);
         }
         self.rejection_logged = true;
         return;
@@ -936,16 +1053,10 @@ impl AudioConverter {
       self.in_buffer[buffer_pos..end].copy_from_slice(plane);
       self.slice_to_pts.push_back((end, pts));
     } else {
-      if !self.encoder_configured {
-        let src_sample_format = analog_to_sample_format(self.input_channels.format);
-        let src_sample_rate = (1_000_000_000/self.input_channels.sample_interval.as_nanos()) as i32;
-        self.configure_encoder(src_sample_format, src_sample_rate);
-      }
-      if !self.sampler_configured {
-        let src_sample_format = analog_to_sample_format(self.input_channels.format);
-        let src_sample_rate = (1_000_000_000/self.input_channels.sample_interval.as_nanos()) as i32;
-        self.configure_resampler(src_sample_format, src_sample_rate);
-      }
+      let src_sample_format = analog_to_sample_format(self.input_channels.format);
+      let src_sample_rate = interval_to_rate(self.input_channels.sample_interval, self.params.samplerate);
+      self.configure_encoder(src_sample_format, src_sample_rate);
+      self.configure_resampler(src_sample_format, src_sample_rate);
 
       let pointers: Vec<_> = self.input_channels.range.clone().map(|i| analog_data_ptr(input, i)).collect();
       let counts: Vec<_> = self.input_channels.range.clone().map(|i| input.count(i) as i32).collect();
@@ -953,144 +1064,238 @@ impl AudioConverter {
     }
   }
 
-  fn parser_to_decoder(&mut self, decoder: *mut ffi::AVCodecContext) {
+  /// Drops the first `used` bytes of buffered input along with the pts slices
+  /// that end inside them.
+  fn consume_input(&mut self, used: usize) {
+    if used == 0 {
+      return;
+    }
+    self.in_buffer.drain(..used);
+    self.num_input_bytes += used as i64;
+    while self.slice_to_pts.front().is_some_and(|(end, _)| *end <= used) {
+      self.slice_to_pts.pop_front();
+    }
+    for (end, _) in self.slice_to_pts.iter_mut() {
+      *end -= used;
+    }
+  }
+
+  /// Parses buffered input until one packet is sent to the decoder. Returns
+  /// false when no complete packet is buffered. Only called after
+  /// avcodec_receive_frame returned EAGAIN, so the decoder accepts the packet.
+  fn send_next_packet(&mut self, decoder: *mut ffi::AVCodecContext) -> bool {
+    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
     unsafe {
-      let mut offset = 0;
-      while offset + (AV_INPUT_BUFFER_PADDING_SIZE as usize) < self.in_buffer.len() {
-        let pts = loop {
-          let (end, pts) = self.slice_to_pts.front().expect("Ran out of pts while parsing");
-          if offset < *end {
-            break *pts;
-          }
-          self.slice_to_pts.pop_front();
-        };
+      loop {
+        let available = self.in_buffer.len().saturating_sub(padding);
+        if available == 0 {
+          return false;
+        }
+        let pts = self.slice_to_pts.front().map_or(ffi::AV_NOPTS_VALUE, |(_, pts)| *pts);
 
         let used = ffi::av_parser_parse2(
-          self.parser, decoder, 
+          self.parser, decoder,
           &mut (*self.parser_packet).data,
           &mut (*self.parser_packet).size,
-          self.in_buffer.as_ptr().add(offset),
-          (self.in_buffer.len() - (AV_INPUT_BUFFER_PADDING_SIZE as usize) - offset) as i32,
-          pts, ffi::AV_NOPTS_VALUE, 
+          self.in_buffer.as_ptr(),
+          available as i32,
+          pts, ffi::AV_NOPTS_VALUE,
           self.num_input_bytes
         );
-        offset += used as usize;
-        self.num_input_bytes += used as i64;
+        assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
+        self.consume_input(used as usize);
 
         if (*self.parser_packet).size > 0 {
-          let discard = false;//self.need_key_frame && (*self.parser).pict_type != ffi::AVPictureType::AV_PICTURE_TYPE_I as i32;
-          if !discard {
-            self.need_key_frame = false;
-            (*self.parser_packet).pts = (*self.parser).pts;
-            let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
-            if ret == AVERROR_EAGAIN {
-              return;
-            } 
-            assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
-          }
+          (*self.parser_packet).pts = (*self.parser).pts;
+          let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
+          assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+          return true;
         }
-        
-        if used == 0 && (*self.parser_packet).size == 0 {
-          break;
-        }
-      }
-      if offset > 0 {
-        self.in_buffer.drain(0..offset);
-        for (end, _) in self.slice_to_pts.iter_mut() {
-          *end -= offset;
+        if used == 0 {
+          return false;
         }
       }
     }
   }
 
-  pub fn pull(&mut self) -> Option<AudioOutput<'_>> {
+  /// The next frame to output or encode: a decoded (and, if needed,
+  /// resampled) frame for encoded input, or a converted frame for raw input.
+  fn next_frame(&mut self) -> Option<*mut ffi::AVFrame> {
+    let Some(decoder) = self.decoder else {
+      return self.dst_frame_pool.get_pending();
+    };
     unsafe {
-      let mut frame = if let Some(decoder) = self.decoder {
-        self.parser_to_decoder(decoder);
-
+      loop {
         let ret = ffi::avcodec_receive_frame(decoder, self.decoder_frame);
-        if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
-          return None;                   // needs more input / fully drained
+        if ret == AVERROR_EAGAIN {
+          if !self.send_next_packet(decoder) {
+            return None;
+          }
+          continue;
+        }
+        if ret == AVERROR_EOF {
+          return None;
         }
         assert!(ret >= 0, "avcodec_receive_frame: {}", av_error_string(ret));
+        break;
+      }
 
-        let src_sample_format = std::mem::transmute::<i32, ffi::AVSampleFormat>((*self.decoder_frame).format);
-        let src_sample_rate = (*self.decoder_frame).sample_rate;
-        let nb_samples = (*self.decoder_frame).nb_samples;
+      let src_sample_format = std::mem::transmute::<i32, ffi::AVSampleFormat>((*self.decoder_frame).format);
+      let src_sample_rate = (*self.decoder_frame).sample_rate;
+      let nb_samples = (*self.decoder_frame).nb_samples;
+      self.configure_encoder(src_sample_format, src_sample_rate);
+      self.configure_resampler(src_sample_format, src_sample_rate);
 
-        if self.encoder.is_some() && src_sample_format == self.dst_sample_format && src_sample_rate == self.dst_sample_rate {
-          self.decoder_frame
-        } else {
-          self.configure_encoder(src_sample_format, src_sample_rate);
-          self.configure_resampler(src_sample_format, src_sample_rate);
+      // Already in the output format: hand out a new reference to the
+      // decoded buffers instead of converting. decoder_frame is reused by the
+      // next avcodec_receive_frame, so it can't be handed out itself.
+      let same_layout = ffi::av_channel_layout_compare(&(*self.decoder_frame).ch_layout, &self.layout) == 0;
+      if same_layout && src_sample_format == self.dst_sample_format && src_sample_rate == self.dst_sample_rate {
+        let frame = ffi::av_frame_clone(self.decoder_frame);
+        assert!(!frame.is_null(), "av_frame_clone failed");
+        ffi::av_frame_unref(self.decoder_frame);
+        return Some(frame);
+      }
 
-          let frame = self.dst_frame_pool.get_writable(nb_samples);
-          ffi::swr_convert_frame(self.multi_sampler, frame, self.decoder_frame);
-          self.dst_frame_pool.push_pending(frame);
-          self.dst_frame_pool.get_pending().unwrap()
+      let out_samples = ffi::swr_get_out_samples(self.multi_sampler, nb_samples);
+      assert!(out_samples >= 0, "swr_get_out_samples: {}", av_error_string(out_samples));
+      let frame = self.dst_frame_pool.get_writable(out_samples);
+      let converted = ffi::swr_convert(
+        self.multi_sampler,
+        (*frame).extended_data,
+        out_samples,
+        (*self.decoder_frame).extended_data as *const *const u8,
+        nb_samples);
+      assert!(converted >= 0, "swr_convert: {}", av_error_string(converted));
+      (*frame).nb_samples = converted;
+      (*frame).pts = (*self.decoder_frame).pts;
+      ffi::av_frame_unref(self.decoder_frame);
+      self.dst_frame_pool.push_pending(frame);
+      self.dst_frame_pool.get_pending()
+    }
+  }
+
+  /// The time of the input message that produced `pts`. Earlier entries
+  /// belong to messages that produced no frame of their own and are dropped.
+  fn take_time(&mut self, pts: i64) -> Duration {
+    match self.pts_to_time.iter().position(|(p, _)| *p == pts) {
+      Some(i) => {
+        let time = self.pts_to_time[i].1;
+        self.pts_to_time.drain(..=i);
+        time
+      }
+      None => self.api.time(),
+    }
+  }
+
+  /// Sends `frame`'s samples through the FIFO into the encoder and appends
+  /// every packet it produces, ADTS framed, to out_buffer. Frees `frame`.
+  /// Returns the number of samples pushed, which the encoder will eventually
+  /// output even if it holds them in the FIFO or its own delay for now.
+  fn encode_frame(&mut self, encoder: *mut ffi::AVCodecContext, mut frame: *mut ffi::AVFrame) -> i32 {
+    unsafe {
+      let nb_samples = (*frame).nb_samples;
+      let ret = ffi::av_audio_fifo_write(self.fifo, (*frame).extended_data as *const *mut c_void, nb_samples);
+      assert!(ret == nb_samples, "av_audio_fifo_write {}", av_error_string(ret));
+      ffi::av_frame_free(&mut frame);
+
+      let frame_size = (*encoder).frame_size;
+      while ffi::av_audio_fifo_size(self.fifo) >= frame_size {
+        let ret = ffi::av_frame_make_writable(self.fifo_frame);
+        assert!(ret >= 0, "av_frame_make_writable {}", av_error_string(ret));
+
+        (*self.fifo_frame).nb_samples = frame_size;
+        let read = ffi::av_audio_fifo_read(self.fifo, (*self.fifo_frame).extended_data as *const *mut c_void, frame_size);
+        assert!(read == frame_size, "av_audio_fifo_read {}", av_error_string(read));
+        (*self.fifo_frame).pts = self.encoder_pts;
+        self.encoder_pts += i64::from(frame_size);
+
+        let ret = ffi::avcodec_send_frame(encoder, self.fifo_frame);
+        assert!(ret >= 0, "avcodec_send_frame: {}", av_error_string(ret));
+        // Drain after every send, or the next send can return EAGAIN.
+        self.receive_packets(encoder);
+      }
+      nb_samples
+    }
+  }
+
+  fn receive_packets(&mut self, encoder: *mut ffi::AVCodecContext) {
+    unsafe {
+      loop {
+        let ret = ffi::avcodec_receive_packet(encoder, self.packet);
+        if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
+          break;
         }
-      } else {
-        match self.dst_frame_pool.get_pending() {
-          Some(f) => { f }
-          None => {return None;}
-        }
-      };
+        assert!(ret >= 0, "Error during encoding: {}", av_error_string(ret));
 
-      let pts = match self.pts_to_time.iter().position(|(pts, _)| pts == &(*frame).pts) {
-        Some(i) => {
-          let temp = self.pts_to_time[i];
-          self.pts_to_time.remove(i);
-          temp.1
-        },
-        None => self.api.time()
-      };
-
-      self.out_buffer.clear();
-      if let Some(encoder) = self.encoder {
-        let nb_samples = (*frame).nb_samples;
-        let ret = ffi::av_audio_fifo_write(self.fifo, (*frame).extended_data as *const *mut c_void, nb_samples);
-        assert!(ret == nb_samples, "av_audio_fifo_write {}", av_error_string(ret));
-        ffi::av_frame_unref(frame);
-        if frame != self.decoder_frame {
-          ffi::av_frame_free(&mut frame);
-        }
-
-        let mut encoded_count = 0;
-        let frame_size = (*encoder).frame_size;
-        while ffi::av_audio_fifo_size(self.fifo) >= frame_size {
-          let ret = ffi::av_frame_make_writable(self.fifo_frame);
-          assert!(ret >= 0, "av_frame_make_writable {}", av_error_string(ret));
-
-          (*self.fifo_frame).nb_samples = frame_size;
-          let read = ffi::av_audio_fifo_read(self.fifo, (*self.fifo_frame).extended_data as *const *mut c_void, frame_size);
-          assert!(read == frame_size, "av_audio_fifo_read {}", av_error_string(ret));
-          encoded_count += frame_size;
-        
-          let ret = ffi::avcodec_send_frame(encoder, self.fifo_frame);
-          assert!(ret >= 0, "avcodec_send_frame: {}", av_error_string(ret));
-        }
-
-        loop {
-          let ret = ffi::avcodec_receive_packet(encoder, self.packet);
-          if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
-            break;
-          }
-          assert!(ret >= 0, "Error during encoding: {}", av_error_string(ret));
-
-          let slice = std::slice::from_raw_parts((*self.packet).data, (*self.packet).size as usize);
-          self.out_buffer.extend_from_slice(slice);
-        }
-
-        Some(AudioOutput { converter: self, frame: None, time: pts, encoded_count })
-      } else {
-        Some(AudioOutput { converter: self, frame: Some(frame), time: pts, encoded_count: 0 })
+        let size = (*self.packet).size as usize;
+        let header = adts_header(size, (*encoder).sample_rate, (*encoder).ch_layout.nb_channels);
+        self.out_buffer.extend_from_slice(&header);
+        self.out_buffer.extend_from_slice(std::slice::from_raw_parts((*self.packet).data, size));
+        ffi::av_packet_unref(self.packet);
       }
     }
+  }
+
+  /// One output per frame. Encoded outputs are emitted even when the encoder
+  /// produced no packets yet: the buffer is empty and encoded_count is the
+  /// number of samples pushed.
+  pub fn pull(&mut self) -> Option<AudioOutput<'_>> {
+    let frame = self.next_frame()?;
+    let time = self.take_time(unsafe { (*frame).pts });
+    let Some(encoder) = self.encoder else {
+      return Some(AudioOutput { converter: self, frame: Some(frame), time, encoded_count: 0 });
+    };
+    self.out_buffer.clear();
+    let encoded_count = self.encode_frame(encoder, frame);
+    Some(AudioOutput { converter: self, frame: None, time, encoded_count })
   }
 }
 
 impl Drop for AudioConverter {
   fn drop(&mut self) {
     self.cleanup();
+  }
+}
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn interval_to_rate_recovers_common_rates_from_rounded_or_truncated_intervals() {
+    // 1e9 / 44100 = 22675.73 ns
+    assert_eq!(interval_to_rate(Duration::from_nanos(22675), None), 44100);
+    assert_eq!(interval_to_rate(Duration::from_nanos(22676), None), 44100);
+    // 1e9 / 48000 = 20833.33 ns
+    assert_eq!(interval_to_rate(Duration::from_nanos(20833), None), 48000);
+    assert_eq!(interval_to_rate(Duration::from_nanos(20834), None), 48000);
+    assert_eq!(interval_to_rate(Duration::from_micros(125), None), 8000);
+  }
+
+  #[test]
+  fn interval_to_rate_prefers_the_output_rate() {
+    // 1e9 / 30000 = 33333.33 ns isn't a common rate
+    assert_eq!(interval_to_rate(Duration::from_nanos(33333), Some(30000)), 30000);
+    assert_eq!(interval_to_rate(Duration::from_nanos(33333), None), 30000);
+    // 1e9 / 44101 = 22675.22 ns: 22675 is within 1 ns of both, the preferred rate wins
+    assert_eq!(interval_to_rate(Duration::from_nanos(22675), Some(44101)), 44101);
+  }
+
+  #[test]
+  fn interval_to_rate_rounds_unknown_rates() {
+    // 1e9 / 50 us = 20000 Hz exactly, not a listed rate
+    assert_eq!(interval_to_rate(Duration::from_micros(50), None), 20000);
+    // 1e9 / 30001 ns = 33332.22 Hz
+    assert_eq!(interval_to_rate(Duration::from_nanos(30001), None), 33332);
+  }
+
+  #[test]
+  fn sample_durations_dont_accumulate_interval_rounding() {
+    // An hour of 44.1 kHz is exactly 3600 s; summing a 22676 ns interval
+    // per sample would be about 11 ms long.
+    assert_eq!(samples_to_duration(44_100 * 3600, 44100), Duration::from_secs(3600));
+    assert_eq!(samples_to_duration(1, 44100), Duration::from_nanos(22676));
+    assert_eq!(duration_to_samples(Duration::from_secs(3600), 44100), 44_100 * 3600);
+    assert_eq!(duration_to_samples(Duration::from_nanos(22675), 44100), 1);
   }
 }

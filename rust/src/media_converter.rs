@@ -29,8 +29,12 @@ impl MediaConverter {
   /// Reconfigures only the converters whose parameters changed, so e.g. an
   /// image setting doesn't reset the audio encoder.
   pub fn reconfigure(&mut self, params: MediaConverterParams) {
-    self.image.reconfigure(params.image);
-    self.audio.reconfigure(params.audio);
+    if params.image != self.params.image {
+      self.image.reconfigure(params.image);
+    }
+    if params.audio != self.params.audio {
+      self.audio.reconfigure(params.audio);
+    }
     self.params = params;
   }
 
