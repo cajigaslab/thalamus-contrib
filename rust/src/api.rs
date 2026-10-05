@@ -226,24 +226,46 @@ impl<'a> NodeData for ExtNodeData<'a> {
     Duration::from_nanos(ns)
   }
 
+  /// A node with the analog modality doesn't have analog data in every
+  /// message (e.g. a media converter's image outputs), so this also asks
+  /// has_analog_data. Reading channels from a message without analog data
+  /// panics inside the upstream node's FFI functions.
   fn analog(&self) -> Option<&dyn AnalogData> {
     let analog = unsafe { (*self.node.node).analog };
-    if analog.is_null() { None } else { Some(self) }
+    if analog.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*analog).has_analog_data.unwrap())(self.node.node) != 0 };
+    if has_data { Some(self) } else { None }
   }
 
+  /// See analog(): this asks has_image_data, since e.g. a media converter's
+  /// audio outputs have no image.
   fn image(&self) -> Option<&dyn ImageData> {
     let image = unsafe { (*self.node.node).image };
-    if image.is_null() { None } else { Some(self) }
+    if image.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*image).has_image_data.unwrap())(self.node.node) != 0 };
+    if has_data { Some(self) } else { None }
   }
 
   fn mocap(&self) -> Option<&dyn MocapData> {
     let mocap = unsafe { (*self.node.node).mocap };
-    if mocap.is_null() { None } else { Some(self) }
+    if mocap.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*mocap).has_motion_data.unwrap())(self.node.node) != 0 };
+    if has_data { None } else { Some(self) }
   }
 
   fn text(&self) -> Option<&dyn TextData> {
     let text = unsafe { (*self.node.node).text };
-    if text.is_null() { None } else { Some(self) }
+    if text.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*text).has_text_data.unwrap())(self.node.node) != 0 };
+    if has_data { None } else { Some(self) }
   }
 }
 

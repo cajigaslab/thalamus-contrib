@@ -51,18 +51,24 @@ def widgets():
       UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation X', 0.0, []),
       UserData(UserDataType.DOUBLE_SPINBOX, 'Fixation Y', 0.0, []),
     ]),
-    'IMAGE_CONVERTER': Factory(None, [
+    'MEDIA_CONVERTER': Factory(None, [
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
-      UserData(UserDataType.COMBO_BOX, 'Format', 'RGB', [
+      UserData(UserDataType.COMBO_BOX, 'Video Format', 'RGB', [
         'PASSTHROUGH', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4'
       ]),
-      UserData(UserDataType.SPINBOX, 'Quality', 5, []),
-      UserData(UserDataType.SPINBOX, 'Width', 0, []),
-      UserData(UserDataType.SPINBOX, 'Height', 0, []),
+      UserData(UserDataType.SPINBOX, 'Video Quality', 5, []),
+      UserData(UserDataType.SPINBOX, 'Video Width', 0, []),
+      UserData(UserDataType.SPINBOX, 'Video Height', 0, []),
       UserData(UserDataType.COMBO_BOX, 'Audio Format', 'PASSTHROUGH', [
         'PASSTHROUGH', 'integer', 'decimal', 'AAC'
       ]),
-      UserData(UserDataType.SPINBOX, 'Audio Bitrate', 0, []),
+      # kbit/s for the whole stream, 0 for 64 kbit/s
+      UserData(UserDataType.SPINBOX, 'Audio Bit Rate', 0, []),
+      # Hz, 0 to keep the source's sample rate
+      UserData(UserDataType.SPINBOX, 'Audio Sample Rate', 0, []),
+      # Channel to start selecting input channels at: 0, 1, ... count from the
+      # first channel forwards, -1, -2, ... from the last channel backwards
+      UserData(UserDataType.SPINBOX, 'Audio Index', -1, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
     ]),
     'SLEEVE': Factory(None, [

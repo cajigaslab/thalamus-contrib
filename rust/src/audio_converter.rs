@@ -32,12 +32,23 @@ fn av_error_string(ret: i32) -> String {
   }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AudioConverterParams {
   pub format: Option<AudioFormat>,
   pub bitrate: Option<i64>,
-  pub input_index: Option<usize>,
+  /// The channel to start selecting input channels at. Non-negative indexes
+  /// count from the first channel and select forwards; negative ones count
+  /// from the end (-1 is the last channel) and select backwards. Selection
+  /// takes the run of channels with the same format and sample interval as
+  /// the starting channel.
+  pub input_index: i32,
   pub samplerate: Option<i32>
+}
+
+impl Default for AudioConverterParams {
+  fn default() -> Self {
+    AudioConverterParams { format: None, bitrate: None, input_index: -1, samplerate: None }
+  }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -502,7 +513,26 @@ fn adts_header(payload_len: usize, sample_rate: i32, channels: i32) -> [u8; 7] {
   ]
 }
 
-/// Whether the trailing channel run of an input can be converted.
+/// The channels to convert out of `num_channels`: the run of channels whose
+/// `kind` (format and sample interval) matches the channel at `index`, going
+/// forwards from a non-negative index or backwards from a negative one (-1 is
+/// the last channel). None if `index` is outside the channels.
+fn select_input_channels<K: PartialEq>(index: i32, num_channels: i32, kind: impl Fn(i32) -> K) -> Option<Range<i32>> {
+  let start = if index >= 0 { index } else { num_channels + index };
+  if start < 0 || start >= num_channels {
+    return None;
+  }
+  let start_kind = kind(start);
+  if index >= 0 {
+    let end = (start..num_channels).find(|&i| kind(i) != start_kind).unwrap_or(num_channels);
+    Some(start..end)
+  } else {
+    let first = (0..=start).rev().find(|&i| kind(i) != start_kind).map_or(0, |i| i + 1);
+    Some(first..start + 1)
+  }
+}
+
+/// Whether the selected channel run of an input can be converted.
 fn is_supported_input(channels: &InputChannels) -> bool {
   match channels.format {
     AnalogFormat::Double | AnalogFormat::Short | AnalogFormat::Int => true,
@@ -883,37 +913,24 @@ impl AudioConverter {
     }
   }
 
+  /// The run of channels with the same format and sample interval that
+  /// starts at params.input_index (see AudioConverterParams). An index
+  /// outside the input gives no channels, which push rejects.
   fn get_input_range(&self, input: &dyn AnalogData) -> InputChannels {
-    let num_channels = input.num_channels();
-    let mut format: Option<(AnalogFormat, Duration)> = None;
     let encoding = input.encoding();
-    for i in (0..num_channels).rev() {
-      let next_format = input.analog_format(i);
-      let next_samplerate = input.sample_interval(i);
-      let next = (next_format, next_samplerate);
-      match format {
-        Some(f) => {
-          if f != next {
-            let range = (i+1)..num_channels;
-            let names = range.clone().map(|i| input.name(i).to_string()).collect();
-            return InputChannels {
-              range,
-              names,
-              format: f.0,
-              sample_interval: f.1,
-              encoding,
-            };
-          }
-        }
-        None => {
-          format = Some(next);
-        }
-      }
-    }
-    let range = 0..num_channels;
+    let kind = |i: i32| (input.analog_format(i), input.sample_interval(i));
+    let Some(range) = select_input_channels(self.params.input_index, input.num_channels(), kind) else {
+      return InputChannels {
+        range: 0..0,
+        names: vec![],
+        format: AnalogFormat::Double,
+        sample_interval: Duration::ZERO,
+        encoding,
+      };
+    };
+    let (format, sample_interval) = kind(range.start);
     let names = range.clone().map(|i| input.name(i).to_string()).collect();
-    let result_format = format.unwrap_or((AnalogFormat::Double, Duration::default()));
-    InputChannels { range, format: result_format.0, sample_interval: result_format.1, names, encoding }
+    InputChannels { range, format, sample_interval, names, encoding }
   }
 
   fn convert_samples(&mut self, multi_sampler: *mut ffi::SwrContext, in_ptrs: &[*const u8], in_counts: &[i32], time: Duration, recursing: bool) {
@@ -1027,11 +1044,17 @@ impl AudioConverter {
 
     if !self.decoder_configured {
       let input_channels = self.get_input_range(input);
-      if input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels) {
+      if input_channels.range.is_empty() || input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels) {
         if !self.rejection_logged {
-          println!(
-            "AudioConverter can't convert {:?} ({:?}) input with a {:?} sample interval",
-            input_channels.format, input_channels.encoding, input_channels.sample_interval);
+          if input_channels.range.is_empty() {
+            println!(
+              "AudioConverter: Audio Index {} is outside the input's {} channels",
+              self.params.input_index, input.num_channels());
+          } else {
+            println!(
+              "AudioConverter can't convert {:?} ({:?}) input with a {:?} sample interval",
+              input_channels.format, input_channels.encoding, input_channels.sample_interval);
+          }
         }
         self.rejection_logged = true;
         return;
@@ -1103,12 +1126,23 @@ impl AudioConverter {
           self.num_input_bytes
         );
         assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
-        self.consume_input(used as usize);
 
-        if (*self.parser_packet).size > 0 {
+        // The packet can point into in_buffer, so it has to be sent before
+        // consume_input shifts the buffer.
+        let sent = if (*self.parser_packet).size > 0 {
           (*self.parser_packet).pts = (*self.parser).pts;
           let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
-          assert!(ret >= 0, "avcodec_send_packet {}", av_error_string(ret));
+          if ret < 0 {
+            // A corrupt packet loses its audio but shouldn't stop the stream.
+            println!("AudioConverter: dropping undecodable packet: {}", av_error_string(ret));
+          }
+          ret >= 0
+        } else {
+          false
+        };
+        self.consume_input(used as usize);
+
+        if sent {
           return true;
         }
         if used == 0 {
@@ -1297,5 +1331,26 @@ mod tests {
     assert_eq!(samples_to_duration(1, 44100), Duration::from_nanos(22676));
     assert_eq!(duration_to_samples(Duration::from_secs(3600), 44100), 44_100 * 3600);
     assert_eq!(duration_to_samples(Duration::from_nanos(22675), 44100), 1);
+  }
+
+  #[test]
+  fn input_channels_are_selected_from_the_audio_index() {
+    // A media converter's AAC output: two stats channels, then two audio channels.
+    let kinds = ['s', 's', 'a', 'a'];
+    let select = |index| select_input_channels(index, 4, |i| kinds[i as usize]);
+    // Negative indexes count from the end and go backwards.
+    assert_eq!(select(-1), Some(2..4));
+    assert_eq!(select(-2), Some(2..3));
+    assert_eq!(select(-3), Some(0..2));
+    assert_eq!(select(-4), Some(0..1));
+    // Non-negative indexes count from the start and go forwards.
+    assert_eq!(select(0), Some(0..2));
+    assert_eq!(select(1), Some(1..2));
+    assert_eq!(select(2), Some(2..4));
+    assert_eq!(select(3), Some(3..4));
+    // Outside the channels.
+    assert_eq!(select(4), None);
+    assert_eq!(select(-5), None);
+    assert_eq!(select_input_channels(-1, 0, |i| kinds[i as usize]), None);
   }
 }

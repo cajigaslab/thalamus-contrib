@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use crate::api::{
-  AnalogData, ImageData, ImageFormat,
+  AnalogData, AnalogEncoding, AnalogFormat, ImageData, ImageFormat,
   MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OffMainSignaler, OnDrop, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
@@ -17,17 +17,26 @@ use crate::image_converter::ConverterParams;
 use crate::media_converter::{MediaConverter, MediaConverterParams};
 use crate::image_viewer::{ImageSink, ImageViewer};
 
-/// Input image time (NodeData::time) -> when that image arrived, for images
-/// that haven't come out of the node yet.
-type Arrivals = Arc<Mutex<HashMap<Duration, Duration>>>;
+/// Input time (NodeData::time) -> when that input arrived, for inputs that
+/// haven't come out of the node yet.
+type ArrivalMap = Arc<Mutex<HashMap<Duration, Duration>>>;
 
-/// Images the converter drops (e.g. on reconfiguration or a decode error)
-/// never come out, so once this many are tracked, entries older than
+/// Arrivals are tracked separately for images and analog data, since one
+/// message can carry both with the same time.
+#[derive(Clone, Default)]
+struct Arrivals {
+  image: ArrivalMap,
+  analog: ArrivalMap,
+}
+
+/// Inputs the converter drops (e.g. on reconfiguration or a decode error) or
+/// merges (several analog messages into one output) never come out under
+/// their own time, so once this many are tracked, entries older than
 /// STALE_ARRIVAL are forgotten.
 const MAX_TRACKED_ARRIVALS: usize = 256;
 const STALE_ARRIVAL: Duration = Duration::from_secs(10);
 
-fn record_arrival(arrivals: &Arrivals, time: Duration, now: Duration) {
+fn record_arrival(arrivals: &ArrivalMap, time: Duration, now: Duration) {
   let mut arrivals = arrivals.lock().unwrap();
   if arrivals.len() >= MAX_TRACKED_ARRIVALS {
     arrivals.retain(|_, arrived| now.saturating_sub(*arrived) < STALE_ARRIVAL);
@@ -35,27 +44,61 @@ fn record_arrival(arrivals: &Arrivals, time: Duration, now: Duration) {
   arrivals.insert(time, now);
 }
 
-/// Milliseconds since the image with input time `time` arrived, if it was
+/// Milliseconds since the input with time `time` arrived, if it was
 /// recorded; forgets it either way.
-fn take_latency_ms(arrivals: &Arrivals, time: Duration, now: Duration) -> Option<f64> {
+fn take_latency_ms(arrivals: &ArrivalMap, time: Duration, now: Duration) -> Option<f64> {
   let arrived = arrivals.lock().unwrap().remove(&time)?;
   Some(now.saturating_sub(arrived).as_secs_f64() * 1000.0)
 }
 
-/// An outgoing image plus a two-channel analog signal: its conversion latency
-/// (no sample when it isn't known) and the number of bytes in its planes.
+/// The number of stats channels WithStats puts in front of an output's own
+/// analog channels.
+const STATS_CHANNELS: i32 = 2;
+
+fn image_bytes(image: &dyn ImageData) -> usize {
+  (0..image.num_planes()).map(|i| image.plane(i as i32).len()).sum()
+}
+
+/// Bytes of sample data plus any encoded buffer.
+fn analog_bytes(analog: &dyn AnalogData) -> usize {
+  let samples: usize = (0..analog.num_channels()).map(|channel| {
+    let bytes_per_sample = match analog.analog_format(channel) {
+      AnalogFormat::Double | AnalogFormat::ULong => 8,
+      AnalogFormat::Int => 4,
+      AnalogFormat::Short => 2,
+      // Encoded samples are in the buffer.
+      AnalogFormat::Encoded => 0,
+    };
+    bytes_per_sample * analog.count(channel)
+  }).sum();
+  samples + analog.buffer().len()
+}
+
+/// An outgoing image or audio message plus two stats channels: its
+/// conversion latency (no sample when it isn't known) and its size in bytes.
+/// The stats come before the message's own analog channels so those stay the
+/// trailing run of channels, which is what a downstream converter reads.
 struct WithStats<'a> {
   inner: &'a dyn NodeData,
+  analog: Option<&'a dyn AnalogData>,
   latency_ms: Option<f64>,
   output_bytes: f64,
 }
 
 impl<'a> WithStats<'a> {
   fn new(inner: &'a dyn NodeData, latency_ms: Option<f64>) -> Self {
-    let output_bytes = inner.image().map_or(0, |image| {
-      (0..image.num_planes()).map(|i| image.plane(i as i32).len()).sum::<usize>()
-    });
-    WithStats { inner, latency_ms, output_bytes: output_bytes as f64 }
+    let analog = inner.analog();
+    let output_bytes = inner.image().map_or(0, image_bytes) + analog.map_or(0, analog_bytes);
+    WithStats { inner, analog, latency_ms, output_bytes: output_bytes as f64 }
+  }
+
+  /// The inner analog data and its channel index for `channel`, if it isn't
+  /// a stats channel.
+  fn inner_channel(&self, channel: i32) -> Option<(&'a dyn AnalogData, i32)> {
+    if channel < STATS_CHANNELS {
+      return None;
+    }
+    self.analog.map(|analog| (analog, channel - STATS_CHANNELS))
   }
 }
 
@@ -78,24 +121,65 @@ impl AnalogData for WithStats<'_> {
     match channel {
       0 => self.latency_ms.as_slice(),
       1 => std::slice::from_ref(&self.output_bytes),
-      _ => &[],
+      _ => self.inner_channel(channel).map_or(&[], |(a, c)| a.data(c)),
     }
   }
 
-  fn num_channels(&self) -> i32 {
-    2
+  fn short_data(&self, channel: i32) -> &[i16] {
+    self.inner_channel(channel).map_or(&[], |(a, c)| a.short_data(c))
   }
 
-  fn sample_interval(&self, _channel: i32) -> Duration {
-    Duration::ZERO
+  fn int_data(&self, channel: i32) -> &[i32] {
+    self.inner_channel(channel).map_or(&[], |(a, c)| a.int_data(c))
+  }
+
+  fn ulong_data(&self, channel: i32) -> &[u64] {
+    self.inner_channel(channel).map_or(&[], |(a, c)| a.ulong_data(c))
+  }
+
+  fn num_channels(&self) -> i32 {
+    STATS_CHANNELS + self.analog.map_or(0, |a| a.num_channels())
+  }
+
+  fn sample_interval(&self, channel: i32) -> Duration {
+    self.inner_channel(channel).map_or(Duration::ZERO, |(a, c)| a.sample_interval(c))
   }
 
   fn name(&self, channel: i32) -> &str {
     match channel {
       0 => "Latency (ms)",
       1 => "Output Bytes",
-      _ => "",
+      _ => self.inner_channel(channel).map_or("", |(a, c)| a.name(c)),
     }
+  }
+
+  /// Formats are per channel: the stats are doubles whatever the audio is.
+  fn analog_format(&self, channel: i32) -> AnalogFormat {
+    self.inner_channel(channel).map_or(AnalogFormat::Double, |(a, c)| a.analog_format(c))
+  }
+
+  fn is_transformed(&self) -> bool {
+    self.analog.is_some_and(|a| a.is_transformed())
+  }
+
+  fn buffer(&self) -> &[u8] {
+    self.analog.map_or(&[], |a| a.buffer())
+  }
+
+  fn encoding(&self) -> AnalogEncoding {
+    self.analog.map_or(AnalogEncoding::None, |a| a.encoding())
+  }
+
+  fn encoded_count(&self) -> u64 {
+    self.analog.map_or(0, |a| a.encoded_count())
+  }
+
+  fn scale(&self, channel: i32) -> f64 {
+    self.inner_channel(channel).map_or(1.0, |(a, c)| a.scale(c))
+  }
+
+  fn offset(&self, channel: i32) -> f64 {
+    self.inner_channel(channel).map_or(0.0, |(a, c)| a.offset(c))
   }
 }
 
@@ -137,7 +221,7 @@ impl MediaConverterNode {
 
     let mut this = rc.borrow_mut();
     match key_str.as_str() {
-      "Format" => {
+      "Video Format" => {
         let StateValue::String(v) = value else {
           return;
         };
@@ -170,7 +254,7 @@ impl MediaConverterNode {
           _ => None
         };
       },
-      "Audio Bitrate" => {
+      "Audio Bit Rate" => {
         // kbit/s for the whole stream; 0 means 64 kbit/s per channel.
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
@@ -178,14 +262,30 @@ impl MediaConverterNode {
           lock.params.audio.bitrate = if v > 0 { Some(v * 1000) } else { None };
         }
       },
-      "Width" => {
+      "Audio Sample Rate" => {
+        // Hz; 0 keeps the source's sample rate.
+        if let StateValue::Int(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.audio.samplerate = if v > 0 { Some(v as i32) } else { None };
+        }
+      },
+      "Audio Index" => {
+        // See AudioConverterParams::input_index.
+        if let StateValue::Int(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.audio.input_index = v as i32;
+        }
+      },
+      "Video Width" => {
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
           lock.params.image.width = if v > 0 { Some(v as i32) } else { None };
         }
       },
-      "Height" => {
+      "Video Height" => {
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
@@ -231,10 +331,8 @@ impl MediaConverterNode {
           let params = borrow.params.clone();
           let converter = borrow.converter.clone();
           let converter2 = converter.clone();
-          let signaler = borrow.signaler.clone();
           let notify = borrow.notify.clone();
           let arrivals = borrow.arrivals.clone();
-          let viewer_sink = borrow.viewer_sink.clone();
           let api = borrow.api.thread_safe();
           borrow.data_connection = Some(node.subscribe_multithreaded(move |node| {
             let arrived = api.time();
@@ -248,10 +346,12 @@ impl MediaConverterNode {
             }
 
             let data = node.data();
-            // Latency is only measured for images.
-            //if data.image().is_some() {
-            //  record_arrival(&arrivals, data.time(), arrived);
-            //}
+            if data.image().is_some() {
+              record_arrival(&arrivals.image, data.time(), arrived);
+            }
+            if data.analog().is_some() {
+              record_arrival(&arrivals.analog, data.time(), arrived);
+            }
             converter.push(&data);
             notify.notify_one();
           }));
@@ -284,15 +384,15 @@ impl MediaConverterNode {
       {
         let mut converter = converter.lock().unwrap();
         while let Some(output) = converter.pull() {
-          let _ = signaler.ready(&*output);
-          let Some(image) = output.image() else {
-            continue;
-          };
-          // Converted images keep their input's time, which is the key.
-          //let latency_ms = take_latency_ms(&arrivals, output.time(), api.time());
-          // Encoded (MPEG4) output is dropped by the viewer.
-          viewer_sink.update(image);
-          //let _ = signaler.ready(&WithStats::new(&*output, latency_ms));
+          // Outputs keep their input's time, which is the key. Each output
+          // is either an image or audio.
+          let arrivals = if output.image().is_some() { &arrivals.image } else { &arrivals.analog };
+          let latency_ms = take_latency_ms(arrivals, output.time(), api.time());
+          let _ = signaler.ready(&WithStats::new(&*output, latency_ms));
+          if let Some(image) = output.image() {
+            // Encoded (MPEG4) output is dropped by the viewer.
+            viewer_sink.update(image);
+          }
         }
       }
       notify.notified().await;
@@ -331,7 +431,7 @@ impl Node for MediaConverterNode {
       signaler,
       notify: Arc::new(Notify::new()),
       dropping: Arc::new(AtomicBool::new(false)),
-      arrivals: Arc::new(Mutex::new(HashMap::new())),
+      arrivals: Arrivals::default(),
     }));
 
     let change_ref = Rc::downgrade(&result);
