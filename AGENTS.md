@@ -18,7 +18,10 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     imgui preview window nodes open with "View".
   - `src/image_converter.rs`, `audio_converter.rs`, `media_converter.rs`:
     FFmpeg-based conversion used by MEDIA_CONVERTER
-    (`media_converter_node.rs`).
+    (`media_converter_node.rs`). `frame_pool.rs` is the frame pool both
+    converters share.
+  - `src/node_copy.rs`: `AnalogDataCopy`, `ImageDataCopy` and `NodeDataCopy`,
+    owned copies of node data for using it after a callback returns.
   - `src/shaders/*.comp`: GLSL compute shaders, compiled by `build.rs`.
   - `include/thalamus/`: `plugin.h` and `modalities.h` vendored from Thalamus.
 - `src/thalamus/contrib/`: the Python package; `__init__.py` declares each
@@ -96,6 +99,10 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   channels in front of i16 audio). Then the message-wide `is_*` functions are
   false, so consumers must read each channel by `analog_format(channel)`;
   Thalamus's `visit_node` readers don't (see its AGENTS.md).
+- `AnalogData::channels_changed()` is true on the first message whose
+  channels (count, names, formats or sample intervals) differ from the
+  previous message's. Consumers check it on every message and treat the
+  first message they see as changed; AudioConverter resets on it.
 - Upstream data (`ExtNodeData`) reports `image()`/`analog()` per message via
   `has_image_data`/`has_analog_data`, not just per node type, because nodes
   like MEDIA_CONVERTER emit image-only and audio-only messages.
@@ -109,20 +116,51 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 
 ## Image and audio conversion
 
-- `image_converter::Converter` converts images (FFmpeg scaling, MPEG4
-  encode/decode). Keep audio out of it; `AudioConverter` handles analog data
-  and `MediaConverter` combines the two for MEDIA_CONVERTER.
-- `push()` only copies input; conversion happens in `pull()`, which the node
-  runs on the tokio pool. Both converters see every message and pass through
-  what needs no conversion; the node doesn't forward anything itself.
-- MEDIA_CONVERTER parameters: `Video Format`/`Video Quality`/`Video Width`/
-  `Video Height`, `Audio Format` (`PASSTHROUGH` keeps the input format, so
-  AAC input is decoded and re-encoded), `Audio Bit Rate` (kbit/s, 0 = 64),
-  `Audio Sample Rate` (0 = source rate) and `Audio Index`: the input channel
-  to start at, forwards from 0, 1, ... or backwards from -1 (last), -2, ...;
-  it takes the run of channels with that channel's format and interval
-  (`select_input_channels`). The node's state keys and the widget names in
-  `__init__.py` must match exactly.
+- `ImageConverter` converts images (FFmpeg scaling, MPEG4 encode/decode) and
+  `AudioConverter` analog data. Keep them separate; `MediaConverter`
+  combines them for MEDIA_CONVERTER, and its single `pull()` (audio first,
+  then images) is how the node gets output.
+- Both converters are `Sync` and follow the same pattern:
+  - `push()` runs on the source's thread (the node's subscription callback).
+    Raw input is converted there (images always go through `sws_scale`,
+    which copies when the formats match); encoded input is only appended to
+    the parser's buffer.
+  - `pull()` runs in the node's tokio task. It parses one packet at a time
+    under the input lock, copies it out (`av_packet_ref`) and decodes and
+    encodes outside that lock, so pull never holds up push.
+  - State is split into `CodecState` (pull's decoder/encoder), `InputState`
+    (push's parser, scaler, timestamps) and a `FramePool`, always locked in
+    that order. A reset (new parameters, a new input format/size, or
+    `channels_changed`) replaces `InputState` and the pool with a new
+    generation; pull rebuilds `CodecState` when it sees the generation
+    change, and frames converted for an older generation are dropped.
+  - For encoded input the output format, frame pool and scaler are chosen
+    from the first decoded frame, since they depend on what the decoder
+    produces. For raw input they're chosen in push from the first message.
+  - Encoded output is limited to what its encoder supports (`choose_output`):
+    the encoder's pixel/sample formats and rates, sizes rounded down to
+    whole chroma blocks and capped at the codec's maximum, and quality
+    clamped to its qscale range.
+  - Outputs borrow the converter: encoded outputs hold the `CodecState`
+    lock while read, raw image outputs own a frame reference.
+  - Both converters see every message and pass through what needs no
+    conversion; the node doesn't forward anything itself.
+- MEDIA_CONVERTER parameters:
+  - Formats: `Video Format` and `Audio Format`, compared case
+    insensitively. `Passthrough` keeps the input format, so encoded input
+    is decoded and re-encoded. `Decoded` passes raw input through and
+    outputs encoded input as the decoder produces it: the decoder's pixel
+    format, or for AAC (decoded as floats) doubles, since Thalamus has no
+    float format.
+  - `Video Quality`, `Video Width`, `Video Height`, and `Complete Frames`
+    (MPEG4 input arrives one whole frame per message; see below).
+  - `Audio Bit Rate` (kbit/s, 0 = 64) and `Audio Sample Rate` (0 = source
+    rate).
+  - `Audio Index`: the input channel to start at, forwards from 0, 1, ... or
+    backwards from -1 (last), -2, .... It takes the run of channels with
+    that channel's format and interval (`select_input_channels`).
+  - The node's state keys and the widget names in `__init__.py` must match
+    exactly.
 - Every output is wrapped in `WithStats`: two f64 channels, `Latency (ms)`
   (arrival to output) and `Output Bytes`, in front of any audio channels so
   the audio stays the trailing run a downstream converter selects by default.
@@ -139,8 +177,17 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   buffer, so send it before shifting the buffer; a decoded frame can be
   handed out as `av_frame_clone` when no conversion is needed.
 - MPEG-4 part 2 quirks: a fresh decoder needs the VOL header, and the parser
-  never sets `key_frame`, so key frames are detected with `pict_type`.
-  Recordings can start mid-GOP, before the first VOL header.
+  never sets `key_frame`, so key frames are detected with `pict_type` and
+  packets before the first one are skipped. Recordings can start mid-GOP,
+  before the first VOL header.
+- The MPEG4 parser only ends a frame when it sees the next frame's start
+  code, which delays decoding by one frame (~33 ms at 30 fps).
+  `PARSER_FLAG_COMPLETE_FRAMES` (the `Complete Frames` option) removes the
+  lag, but then each parse call must be exactly one frame, so the converter
+  parses one queued message at a time.
+- Encoded image streams carry their nominal frame rate (the encoder's time
+  base, from the source's frame interval), which webcams don't keep; use
+  message times, not the stream's rate, for timing.
 
 ## Image viewer and imgui windows
 
@@ -193,7 +240,9 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   start nodes with `python -m thalamus.registry -p '$.nodes[0].Running' -s
   true` (`-p` alone prints a value). Read node output with a small gRPC client
   (`ThalamusStub.analog`, with or without `native_formats`, or `graph`, which
-  the UI plots use).
+  the UI plots use; `ThalamusStub.image` for image format and size).
+  MEDIA_CONVERTER's `Latency (ms)` and `Output Bytes` channels are a quick
+  check of a conversion path.
 - A Rust panic in a callback aborts Thalamus with a message on stderr; a
   native crash only leaves a minidump (see Thalamus's AGENTS.md for reading
   them).
