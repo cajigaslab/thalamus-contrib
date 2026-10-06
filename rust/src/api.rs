@@ -161,7 +161,7 @@ impl ExtNode {
     if analog.is_null() {
       None
     } else {
-      Some(ExtAnalogNode { node: self })
+      Some(ExtAnalogNode { _node: self })
     }
   }
 
@@ -185,35 +185,10 @@ impl Drop for ExtNode {
   }
 }
 
+/// Returned by ExtNode::analog when the node has the analog modality. Channel
+/// changes are reported per message by AnalogData::channels_changed.
 pub struct ExtAnalogNode<'a> {
-  node: &'a ExtNode,
-}
-
-impl<'a> ExtAnalogNode<'a> {
-  pub fn subscribe_analog_channels_changed<T: FnMut(ExtNode) + 'static>(
-    &self,
-    callback: T,
-  ) -> OnDrop {
-    let call_ptr = Box::into_raw(Box::new(NodeReadyArgs {
-      api: self.node.api,
-      callback,
-    }));
-    let void_ptr = call_ptr as *mut std::os::raw::c_void;
-
-    let connection = unsafe {
-      ((&*self.node.api.raw).node_channels_changed_connect.unwrap())(
-        self.node.node,
-        Some(node_ready_callback::<T>),
-        void_ptr,
-      )
-    };
-    let api = self.node.api;
-    let cleanup = move || unsafe {
-      ((&*api.raw).node_channels_changed_disconnect.unwrap())(connection);
-      drop(Box::from_raw(call_ptr));
-    };
-    OnDrop::new(cleanup)
-  }
+  _node: &'a ExtNode,
 }
 
 pub struct ExtNodeData<'a> {
@@ -415,6 +390,16 @@ impl<'a> AnalogData for ExtNodeData<'a> {
     unsafe {
       let analog = (*self.node.node).analog;
       (*analog).encoded_count.map_or(0, |encoded_count| encoded_count(self.node.node))
+    }
+  }
+  fn channels_changed(&self) -> bool {
+    // Older Thalamus builds' ThalamusAnalogNode ends before `channels_changed`.
+    if self.node.api.analog_node_version() < 5 {
+      return false;
+    }
+    unsafe {
+      let analog = (*self.node.node).analog;
+      (*analog).channels_changed.is_some_and(|channels_changed| channels_changed(self.node.node) != 0)
     }
   }
   fn sample_interval(&self, channel: i32) -> Duration {
@@ -893,7 +878,8 @@ impl ThalamusAPIThreadSafe {
 impl ThalamusAPI {
   /// The number of fields after `name` in the ThalamusAnalogNodes Thalamus
   /// provides (2 once `buffer` and `encoding` exist, 4 once `format` and
-  /// `encoded_count` do), or 0 if the running Thalamus predates the query.
+  /// `encoded_count` do, 5 once `channels_changed` does), or 0 if the running
+  /// Thalamus predates the query.
   pub fn analog_node_version(&self) -> i32 {
     // copy_from_host leaves functions the host doesn't have as None.
     unsafe { (*self.raw).analog_node_version.map_or(0, |f| f()) }
@@ -930,13 +916,6 @@ impl ThalamusAPI {
       (*plugin_impl).data = Some(data);
       node_ready(node);
       (*plugin_impl).data = None;
-    })
-  }
-
-  pub fn channels_changed(&self, token: &NodeToken) -> Result<(), NodeDestroyed> {
-    token.with(|node| unsafe {
-      let node_channels_changed = (&*self.raw).node_channels_changed.unwrap();
-      node_channels_changed(node);
     })
   }
 
@@ -3080,6 +3059,13 @@ pub trait AnalogData {
   /// output them yet.
   fn encoded_count(&self) -> u64 {
     0
+  }
+  /// Whether this message's channels differ from the previous message's:
+  /// their count, names, formats or sample intervals. Only the first message
+  /// after a change reports it, so a consumer checks it on every message and
+  /// treats the first message it sees as changed too.
+  fn channels_changed(&self) -> bool {
+    false
   }
   fn scale(&self, _channel: i32) -> f64 {
     return 1.0;

@@ -116,6 +116,8 @@ struct Chunk {
   names: Arc<Vec<String>>,
   sample_interval: Duration,
   time: Duration,
+  /// Set on the first chunk a stream queues; a stream's channels don't change.
+  channels_changed: bool,
 }
 
 impl NodeData for Chunk {
@@ -149,6 +151,10 @@ fn channel_slice<T>(channels: &[Vec<T>], channel: i32) -> &[T] {
 }
 
 impl AnalogData for Chunk {
+  fn channels_changed(&self) -> bool {
+    self.channels_changed
+  }
+
   fn data(&self, channel: i32) -> &[f64] {
     match &self.samples {
       Samples::Double(c) => channel_slice(c, channel),
@@ -329,7 +335,6 @@ impl MicSettings {
 pub struct MicNode {
   api: ThalamusAPI,
   _state_connection: OnDrop,
-  node_token: NodeToken,
   main_thread_token: MainThreadToken,
   state: State,
   signaler: Arc<OffMainSignaler>,
@@ -351,15 +356,21 @@ fn build_stream<T: CaptureSample>(
 ) -> Result<cpal::Stream, cpal::Error> {
   let channel_count = usize::from(config.channels);
   let sample_interval = Duration::from_secs_f64(1.0 / f64::from(config.sample_rate));
+  // Stays set until a chunk is actually queued: full queues drop chunks.
+  let mut channels_changed = true;
   device.build_input_stream::<T, _, _>(
     config.clone(),
     move |data: &[T], _| {
-      let _ = sender.try_send(Chunk {
+      let queued = sender.try_send(Chunk {
         samples: T::samples(data, channel_count),
         names: names.clone(),
         sample_interval,
         time: clock(),
+        channels_changed,
       });
+      if queued.is_ok() {
+        channels_changed = false;
+      }
     },
     move |e| {
       println!("MIC stream error: {e}");
@@ -464,10 +475,7 @@ impl MicNode {
         return;
       }
     };
-    // Resolved here rather than on the mic thread so downstream nodes can be
-    // told about the channels before the first samples arrive.
     let names = channel_names(config.channels());
-    let _ = self.api.channels_changed(&self.node_token);
 
     self.stop.store(false, Ordering::SeqCst);
     let api = self.api.thread_safe();
@@ -570,7 +578,6 @@ impl Node for MicNode {
       RefCell::new(Self {
         api,
         _state_connection,
-        node_token: node_token.clone(),
         main_thread_token,
         state: state.clone(),
         signaler,
@@ -656,6 +663,7 @@ mod tests {
       names,
       sample_interval: Duration::from_micros(20),
       time: Duration::from_secs(1),
+      channels_changed: false,
     }
   }
 

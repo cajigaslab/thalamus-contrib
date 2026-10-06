@@ -260,6 +260,15 @@ pub extern "C" fn c_node_analog_format(raw_node: *mut ThalamusNode, channel: i32
   }
 }
 
+pub extern "C" fn c_node_analog_channels_changed(raw_node: *mut ThalamusNode) -> c_char {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let changed = deref_plugin_impl(c_node)
+    .data
+    .and_then(|data| data.analog())
+    .is_some_and(|analog| analog.channels_changed());
+  if changed { 1 } else { 0 }
+}
+
 pub extern "C" fn c_node_analog_encoded_count(raw_node: *mut ThalamusNode) -> u64 {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let analog = deref_plugin_impl(c_node).data.unwrap().analog().unwrap();
@@ -446,6 +455,7 @@ fn wrap_analog(c_node: &mut ThalamusNode) {
     (*c_node.analog).encoding = Some(c_node_analog_encoding);
     (*c_node.analog).format = Some(c_node_analog_format);
     (*c_node.analog).encoded_count = Some(c_node_analog_encoded_count);
+    (*c_node.analog).channels_changed = Some(c_node_analog_channels_changed);
   }
 }
 
@@ -615,10 +625,10 @@ impl ThalamusNodeFactory {
 }
 
 /// The number of fields after `name` in this plugin's ThalamusAnalogNodes:
-/// `buffer`, `encoding`, `format` and `encoded_count`.
+/// `buffer`, `encoding`, `format`, `encoded_count` and `channels_changed`.
 #[unsafe(no_mangle)]
 pub extern "C" fn thalamus_get_analog_node_version() -> i32 {
-  4
+  5
 }
 
 #[unsafe(no_mangle)]

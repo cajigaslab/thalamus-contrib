@@ -83,13 +83,25 @@ struct WithStats<'a> {
   analog: Option<&'a dyn AnalogData>,
   latency_ms: Option<f64>,
   output_bytes: f64,
+  /// Whether this message's channels differ from the previous output's; set
+  /// by the converter task, which sees every output.
+  channels_changed: bool,
+}
+
+/// A message's channels as subscribers see them, to tell when they change.
+type ChannelLayout = Vec<(String, AnalogFormat, Duration)>;
+
+fn channel_layout(analog: &dyn AnalogData) -> ChannelLayout {
+  (0..analog.num_channels())
+    .map(|c| (analog.name(c).to_string(), analog.analog_format(c), analog.sample_interval(c)))
+    .collect()
 }
 
 impl<'a> WithStats<'a> {
   fn new(inner: &'a dyn NodeData, latency_ms: Option<f64>) -> Self {
     let analog = inner.analog();
     let output_bytes = inner.image().map_or(0, image_bytes) + analog.map_or(0, analog_bytes);
-    WithStats { inner, analog, latency_ms, output_bytes: output_bytes as f64 }
+    WithStats { inner, analog, latency_ms, output_bytes: output_bytes as f64, channels_changed: false }
   }
 
   /// The inner analog data and its channel index for `channel`, if it isn't
@@ -174,6 +186,10 @@ impl AnalogData for WithStats<'_> {
     self.analog.map_or(0, |a| a.encoded_count())
   }
 
+  fn channels_changed(&self) -> bool {
+    self.channels_changed
+  }
+
   fn scale(&self, channel: i32) -> f64 {
     self.inner_channel(channel).map_or(1.0, |(a, c)| a.scale(c))
   }
@@ -200,7 +216,6 @@ pub struct MediaConverterNode {
   state_connection: Option<OnDrop>,
   source_connection: Option<OnDrop>,
   data_connection: Option<OnDrop>,
-  channels_changed_connection: Option<OnDrop>,
   signaler: Arc<OffMainSignaler>,
   converter: Arc<Mutex<MediaConverter>>,
   notify: Arc<Notify>,
@@ -330,7 +345,6 @@ impl MediaConverterNode {
           let mut borrow = this.borrow_mut();
           let params = borrow.params.clone();
           let converter = borrow.converter.clone();
-          let converter2 = converter.clone();
           let notify = borrow.notify.clone();
           let arrivals = borrow.arrivals.clone();
           let api = borrow.api.thread_safe();
@@ -355,12 +369,6 @@ impl MediaConverterNode {
             converter.push(&data);
             notify.notify_one();
           }));
-
-          borrow.channels_changed_connection = node.analog().map(|n| {
-            n.subscribe_analog_channels_changed(move |_| {
-              converter2.lock().unwrap().channels_changed();
-            })
-          })
         }));
         rc.borrow_mut().source_connection = temp;
       }
@@ -377,6 +385,7 @@ impl MediaConverterNode {
     arrivals: Arrivals,
     viewer_sink: ImageSink,
   ) {
+    let mut last_layout: Option<ChannelLayout> = None;
     loop {
       if dropping.load(Ordering::SeqCst) {
         return;
@@ -388,7 +397,13 @@ impl MediaConverterNode {
           // is either an image or audio.
           let arrivals = if output.image().is_some() { &arrivals.image } else { &arrivals.analog };
           let latency_ms = take_latency_ms(arrivals, output.time(), api.time());
-          let _ = signaler.ready(&WithStats::new(&*output, latency_ms));
+          let mut stats = WithStats::new(&*output, latency_ms);
+          // Format, sample rate, Audio Index and image vs audio outputs all
+          // show up as a different layout.
+          let layout = channel_layout(&stats);
+          stats.channels_changed = last_layout.as_ref() != Some(&layout);
+          last_layout = Some(layout);
+          let _ = signaler.ready(&stats);
           if let Some(image) = output.image() {
             // Encoded (MPEG4) output is dropped by the viewer.
             viewer_sink.update(image);
@@ -427,7 +442,6 @@ impl Node for MediaConverterNode {
       state_connection: None,
       source_connection: None,
       data_connection: None,
-      channels_changed_connection: None,
       signaler,
       notify: Arc::new(Notify::new()),
       dropping: Arc::new(AtomicBool::new(false)),
