@@ -1127,16 +1127,15 @@ impl AudioConverter {
   /// Starts over with `params`; pull picks it up without push waiting for it.
   pub fn reconfigure(&self, params: AudioConverterParams) {
     let mut input = self.input.lock().unwrap();
+    self.reset(&mut input, params);
+  }
+
+  /// Replaces the input state and frame pool with ones of the next
+  /// generation; pull rebuilds its codec state when it sees it.
+  fn reset(&self, input: &mut InputState, params: AudioConverterParams) {
     let generation = input.generation + 1;
     *input = InputState::new(params, generation);
     *self.pool.lock().unwrap() = FramePool::new(FramePoolParams::empty(), generation);
-  }
-
-  /// Starts over with the current parameters, e.g. when the input's channels
-  /// change.
-  pub fn channels_changed(&self) {
-    let params = self.input.lock().unwrap().params;
-    self.reconfigure(params);
   }
 
   /// Queues `data`'s analog data for conversion. Raw input is converted here;
@@ -1146,6 +1145,12 @@ impl AudioConverter {
       return;
     };
     let mut guard = self.input.lock().unwrap();
+    // The input channels are picked once, so a change starts over with the
+    // current parameters; pull picks up the new generation.
+    if analog.channels_changed() {
+      let params = guard.params;
+      self.reset(&mut guard, params);
+    }
     let state = &mut *guard;
 
     if state.input.is_none() {

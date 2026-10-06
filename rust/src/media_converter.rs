@@ -47,11 +47,6 @@ impl MediaConverter {
   /// Queues whichever of `data`'s image and analog data needs converting.
   pub fn push(&self, data: &dyn NodeData) {
     self.image.lock().unwrap().push(data);
-    // The audio converter picks its input channels once, so it starts over
-    // when they change.
-    if data.analog().is_some_and(|analog| analog.channels_changed()) {
-      self.audio.channels_changed();
-    }
     self.audio.push(data);
   }
 
