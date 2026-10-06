@@ -17,6 +17,7 @@ use ffmpeg_sys_next::AVCodecConfig::{AV_CODEC_CONFIG_SAMPLE_FORMAT, AV_CODEC_CON
 use ffmpeg_sys_next::{self as ffi, AV_INPUT_BUFFER_PADDING_SIZE};
 
 use crate::api::{AnalogData, AnalogEncoding, AnalogFormat, NodeData, ThalamusAPIThreadSafe};
+use crate::frame_pool::{FramePool, FramePoolParams};
 use crate::image_converter::AVERROR_EOF;
 
 const AVERROR_EAGAIN: i32 = -ffi::EAGAIN;
@@ -185,148 +186,6 @@ impl<'a> AnalogData for AudioOutput<'a> {
   }
 }
 
-/// How many samples per channel an audio frame's buffers can hold.
-unsafe fn frame_capacity(frame: *const ffi::AVFrame) -> i32 {
-  unsafe {
-    if (*frame).buf[0].is_null() {
-      return 0;
-    }
-    let format: ffi::AVSampleFormat = std::mem::transmute((*frame).format);
-    let bps = ffi::av_get_bytes_per_sample(format);
-    let bytes_per_sample = if ffi::av_sample_fmt_is_planar(format) != 0 {
-      bps
-    } else {
-      bps * (*frame).ch_layout.nb_channels
-    };
-    if bytes_per_sample <= 0 {
-      0
-    } else {
-      (*frame).linesize[0] / bytes_per_sample
-    }
-  }
-}
-
-#[derive(Clone, Copy)]
-enum FramePoolParams {
-  Audio{layout: ffi::AVChannelLayout, format: ffi::AVSampleFormat, samplerate: i32}
-}
-
-impl FramePoolParams {
-  fn empty() -> FramePoolParams {
-    FramePoolParams::Audio {
-      layout: unsafe { std::mem::zeroed() },
-      format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE,
-      samplerate: 0,
-    }
-  }
-}
-
-/// Converted frames waiting for pull, and frames to reuse. Both sides lock it
-/// briefly: push (raw input) and pull (decoded input) queue frames, pull
-/// takes them. A reset replaces it with a pool of the new generation, and
-/// frames converted for an older generation are dropped rather than queued.
-struct FramePool {
-  writable: VecDeque<*mut ffi::AVFrame>,
-  pending: VecDeque<*mut ffi::AVFrame>,
-  used: VecDeque<*mut ffi::AVFrame>,
-  params: FramePoolParams,
-  generation: u64,
-}
-
-// SAFETY: the frames are only touched under the pool's mutex, apart from the
-// clones handed out, which own their own references.
-unsafe impl Send for FramePool {}
-
-impl FramePool {
-  fn new(params: FramePoolParams, generation: u64) -> FramePool {
-    FramePool {
-      params,
-      generation,
-      writable: VecDeque::new(),
-      pending: VecDeque::new(),
-      used: VecDeque::new(),
-    }
-  }
-
-  fn get_writable(&mut self, nb_samples: i32) -> *mut ffi::AVFrame {
-    unsafe {
-      self.used.retain(|f| {
-        let writable = ffi::av_frame_is_writable(*f) != 0;
-        if writable {
-          self.writable.push_back(*f);
-        }
-        !writable
-      });
-
-      // A recycled frame keeps its buffers, so reuse it when they're big enough
-      // and replace it otherwise (av_frame_get_buffer on a frame that has
-      // buffers leaks them).
-      if let Some(mut frame) = self.writable.pop_front() {
-        if frame_capacity(frame) >= nb_samples {
-          (*frame).nb_samples = nb_samples;
-          return frame;
-        }
-        ffi::av_frame_free(&mut frame);
-      }
-
-      let frame = ffi::av_frame_alloc();
-      assert!(!frame.is_null(), "av_frame_alloc failed");
-      match self.params {
-        FramePoolParams::Audio { layout, format, samplerate } => {
-          ffi::av_channel_layout_copy(&mut (*frame).ch_layout, &layout);
-          (*frame).format = format as i32;
-          (*frame).sample_rate = samplerate;
-          (*frame).nb_samples = nb_samples;
-        }
-      };
-
-      let ret = ffi::av_frame_get_buffer(frame, 0);
-      assert!(ret >= 0, "ffi::av_frame_get_buffer: {}", av_error_string(ret));
-      frame
-    }
-  }
-
-  /// Queues `frame` for pull, or frees it if it was converted for an older
-  /// generation. Returns whether it was queued.
-  fn push_pending(&mut self, mut frame: *mut ffi::AVFrame, generation: u64) -> bool {
-    if generation != self.generation {
-      unsafe { ffi::av_frame_free(&mut frame) };
-      return false;
-    }
-    self.pending.push_back(frame);
-    true
-  }
-
-  /// A new reference to the next queued frame of `generation`.
-  fn get_pending(&mut self, generation: u64) -> Option<*mut ffi::AVFrame> {
-    if generation != self.generation {
-      return None;
-    }
-    let result = self.pending.pop_front();
-    result.map(|r| {
-      let new_ref = unsafe { ffi::av_frame_clone(r) };
-      self.used.push_back(r);
-      new_ref
-    })
-  }
-}
-
-impl Drop for FramePool {
-  fn drop(&mut self) {
-    unsafe {
-      for f in self.writable.iter_mut() {
-        ffi::av_frame_free(f);
-      }
-      for f in self.pending.iter_mut() {
-        ffi::av_frame_free(f);
-      }
-      for f in self.used.iter_mut() {
-        ffi::av_frame_free(f);
-      }
-    }
-  }
-}
-
 #[derive(Clone)]
 struct InputChannels {
   range: Range<i32>,
@@ -389,7 +248,7 @@ fn audio_format_to_sample_format(format: AudioFormat) -> ffi::AVSampleFormat {
 }
 
 /// The codec's supported values for `config`. Empty means it accepts anything.
-fn get_codec_config<T>(codec: *const ffi::AVCodec, config: ffi::AVCodecConfig) -> &'static [T] {
+pub(crate) fn get_codec_config<T>(codec: *const ffi::AVCodec, config: ffi::AVCodecConfig) -> &'static [T] {
   unsafe {
     let mut count = 0;
     let mut vals: *const std::ffi::c_void  = std::ptr::null_mut();

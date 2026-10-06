@@ -59,6 +59,7 @@ def widgets():
       UserData(UserDataType.SPINBOX, 'Video Quality', 5, []),
       UserData(UserDataType.SPINBOX, 'Video Width', 0, []),
       UserData(UserDataType.SPINBOX, 'Video Height', 0, []),
+      UserData(UserDataType.CHECK_BOX, 'Complete Frames', False, []),
       UserData(UserDataType.COMBO_BOX, 'Audio Format', 'PASSTHROUGH', [
         'PASSTHROUGH', 'integer', 'decimal', 'AAC'
       ]),

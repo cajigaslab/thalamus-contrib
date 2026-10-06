@@ -314,6 +314,13 @@ impl MediaConverterNode {
           lock.params.image.quality = if v > 0 { Some(v as i32) } else { None };
         }
       },
+      "Complete Frames" => {
+        if let StateValue::Bool(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.image.complete_frames = v;
+        }
+      },
       "View" => {
         if value != StateValue::Bool(true) {
           this.viewer = None;
@@ -406,16 +413,12 @@ impl MediaConverterNode {
       if dropping.load(Ordering::SeqCst) {
         return;
       }
-      // Pulling audio doesn't hold up pushes; pulling images holds the image
-      // converter's lock.
+      // Neither pull holds up pushes.
       while let Some(output) = converter.audio().pull() {
         emit(&output);
       }
-      {
-        let mut image = converter.image();
-        while let Some(output) = image.pull() {
-          emit(&*output);
-        }
+      while let Some(output) = converter.image().pull() {
+        emit(&*output);
       }
       notify.notified().await;
     }
@@ -433,6 +436,7 @@ impl Node for MediaConverterNode {
           width: None,
           height: None,
           quality: None,
+          complete_frames: false,
         },
         audio: AudioConverterParams::default(),
       },
