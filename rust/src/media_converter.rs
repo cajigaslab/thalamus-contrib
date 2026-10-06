@@ -50,13 +50,12 @@ impl MediaConverter {
     self.audio.push(data);
   }
 
-  /// Converted audio comes from AudioConverter::pull.
-  pub fn audio(&self) -> &AudioConverter {
-    &self.audio
-  }
-
-  /// Converted images come from ImageConverter::pull.
-  pub fn image(&self) -> &ImageConverter {
-    &self.image
+  /// The next converted message: audio if there is any, otherwise an image.
+  /// Neither converter's pull holds up pushes.
+  pub fn pull(&self) -> Option<Box<dyn NodeData + '_>> {
+    if let Some(output) = self.audio.pull() {
+      return Some(Box::new(output));
+    }
+    self.image.pull()
   }
 }

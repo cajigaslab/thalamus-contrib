@@ -13,7 +13,7 @@ use crate::api::{
   ThalamusAPIThreadSafe,
 };
 use crate::audio_converter::{AudioConverterParams, AudioFormat};
-use crate::image_converter::ConverterParams;
+use crate::image_converter::{ConverterParams, VideoFormat};
 use crate::media_converter::{MediaConverter, MediaConverterParams};
 use crate::image_viewer::{ImageSink, ImageViewer};
 
@@ -243,15 +243,17 @@ impl MediaConverterNode {
 
         let mut lock = this.params.lock().unwrap();
         lock.dirty = true;
+        // Compared case insensitively; anything else is passthrough.
         lock.params.image.format = match v.to_uppercase().as_str() {
-          "GRAY" => Some(ImageFormat::Gray),
-          "RGB" => Some(ImageFormat::RGB), 
-          "YUYV422" => Some(ImageFormat::YUYV422), 
-          "YUV420P" => Some(ImageFormat::YUV420P), 
-          "YUVJ420P" => Some(ImageFormat::YUVJ420P), 
-          "NV12" => Some(ImageFormat::NV12), 
-          "BGR" => Some(ImageFormat::BGR), 
-          "MPEG4" => Some(ImageFormat::MPEG4),
+          "DECODED" => Some(VideoFormat::Decoded),
+          "GRAY" => Some(VideoFormat::Image(ImageFormat::Gray)),
+          "RGB" => Some(VideoFormat::Image(ImageFormat::RGB)),
+          "YUYV422" => Some(VideoFormat::Image(ImageFormat::YUYV422)),
+          "YUV420P" => Some(VideoFormat::Image(ImageFormat::YUV420P)),
+          "YUVJ420P" => Some(VideoFormat::Image(ImageFormat::YUVJ420P)),
+          "NV12" => Some(VideoFormat::Image(ImageFormat::NV12)),
+          "BGR" => Some(VideoFormat::Image(ImageFormat::BGR)),
+          "MPEG4" => Some(VideoFormat::Image(ImageFormat::MPEG4)),
           _ => None
         };
       },
@@ -262,7 +264,9 @@ impl MediaConverterNode {
 
         let mut lock = this.params.lock().unwrap();
         lock.dirty = true;
+        // Compared case insensitively; anything else is passthrough.
         lock.params.audio.format = match v.to_uppercase().as_str() {
+          "DECODED" => Some(AudioFormat::Decoded),
           "INTEGER" => Some(AudioFormat::Integer),
           "DECIMAL" => Some(AudioFormat::Decimal),
           "AAC" => Some(AudioFormat::AAC),
@@ -413,11 +417,7 @@ impl MediaConverterNode {
       if dropping.load(Ordering::SeqCst) {
         return;
       }
-      // Neither pull holds up pushes.
-      while let Some(output) = converter.audio().pull() {
-        emit(&output);
-      }
-      while let Some(output) = converter.image().pull() {
+      while let Some(output) = converter.pull() {
         emit(&*output);
       }
       notify.notified().await;

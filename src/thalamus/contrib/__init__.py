@@ -54,14 +54,14 @@ def widgets():
     'MEDIA_CONVERTER': Factory(None, [
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
       UserData(UserDataType.COMBO_BOX, 'Video Format', 'RGB', [
-        'PASSTHROUGH', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4'
+        'Passthrough', 'Decoded', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4'
       ]),
       UserData(UserDataType.SPINBOX, 'Video Quality', 5, []),
       UserData(UserDataType.SPINBOX, 'Video Width', 0, []),
       UserData(UserDataType.SPINBOX, 'Video Height', 0, []),
       UserData(UserDataType.CHECK_BOX, 'Complete Frames', False, []),
-      UserData(UserDataType.COMBO_BOX, 'Audio Format', 'PASSTHROUGH', [
-        'PASSTHROUGH', 'integer', 'decimal', 'AAC'
+      UserData(UserDataType.COMBO_BOX, 'Audio Format', 'Passthrough', [
+        'Passthrough', 'Decoded', 'Integer', 'Decimal', 'AAC'
       ]),
       # kbit/s for the whole stream, 0 for 64 kbit/s
       UserData(UserDataType.SPINBOX, 'Audio Bit Rate', 0, []),

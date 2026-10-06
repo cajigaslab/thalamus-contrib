@@ -20,9 +20,18 @@ fn encoder_time_base(frame_interval: Duration) -> ffi::AVRational {
   unsafe { ffi::av_d2q(frame_interval.as_secs_f64(), 65535) }
 }
 
+/// The requested output format. None (passthrough) keeps the input's.
+#[derive(Debug,Clone,Copy,PartialEq)]
+pub enum VideoFormat {
+  /// Encoded input is output in the pixel format its decoder produces; raw
+  /// input passes through.
+  Decoded,
+  Image(ImageFormat),
+}
+
 #[derive(Debug,Clone,Copy,PartialEq)]
 pub struct ConverterParams {
-  pub format: Option<ImageFormat>,
+  pub format: Option<VideoFormat>,
   pub width: Option<i32>,
   pub height: Option<i32>,
   pub quality: Option<i32>,
@@ -179,6 +188,22 @@ fn image_to_pix(format: ImageFormat) -> AVPixelFormat {
   }
 }
 
+/// The raw format with pixel format `pix`, if there is one.
+fn pix_to_image(pix: AVPixelFormat) -> Option<ImageFormat> {
+  match pix {
+    AVPixelFormat::AV_PIX_FMT_GRAY8 => Some(ImageFormat::Gray),
+    AVPixelFormat::AV_PIX_FMT_RGB24 => Some(ImageFormat::RGB),
+    AVPixelFormat::AV_PIX_FMT_YUYV422 => Some(ImageFormat::YUYV422),
+    AVPixelFormat::AV_PIX_FMT_YUV420P => Some(ImageFormat::YUV420P),
+    AVPixelFormat::AV_PIX_FMT_YUVJ420P => Some(ImageFormat::YUVJ420P),
+    AVPixelFormat::AV_PIX_FMT_NV12 => Some(ImageFormat::NV12),
+    AVPixelFormat::AV_PIX_FMT_BGR24 => Some(ImageFormat::BGR),
+    GRAY16_NATIVE => Some(ImageFormat::Gray16),
+    RGB48_NATIVE => Some(ImageFormat::RGB16),
+    _ => None,
+  }
+}
+
 /// An encoded (MPEG4) output. Its bytes are in the codec state's buffer, so
 /// it holds the codec lock while it's read, which only holds up other pulls.
 pub struct EncodedImage<'a> {
@@ -309,14 +334,21 @@ struct OutputConfig {
 /// The output for `source`, which for encoded input is the decoded frames'
 /// format and size. Encoded output is limited to what its encoder supports.
 fn choose_output(params: &ConverterParams, source: &ImageSource) -> OutputConfig {
-  let format = params.format.unwrap_or(source.format);
+  let format = match params.format {
+    None => source.format,
+    // The decoder's pixel format, or YUV420P if no raw format matches it.
+    Some(VideoFormat::Decoded) if is_compressed(source.format) =>
+      pix_to_image(source.pix).unwrap_or(ImageFormat::YUV420P),
+    Some(VideoFormat::Decoded) => source.format,
+    Some(VideoFormat::Image(format)) => format,
+  };
   let width = params.width.unwrap_or(source.width);
   let height = params.height.unwrap_or(source.height);
   let quality = params.quality.unwrap_or(5);
   if !is_compressed(format) {
     return OutputConfig {
       format,
-      pix: params.format.map(image_to_pix).unwrap_or(source.pix),
+      pix: image_to_pix(format),
       width,
       height,
       codec_id: None,
@@ -955,7 +987,7 @@ mod tests {
   #[test]
   fn encoded_output_is_limited_to_what_the_encoder_supports() {
     let params = ConverterParams {
-      format: Some(ImageFormat::MPEG4),
+      format: Some(VideoFormat::Image(ImageFormat::MPEG4)),
       width: Some(641),
       height: Some(10000),
       quality: Some(100),
@@ -976,9 +1008,43 @@ mod tests {
   }
 
   #[test]
+  fn decoded_output_uses_the_decoders_pixel_format() {
+    let params = ConverterParams {
+      format: Some(VideoFormat::Decoded),
+      width: None,
+      height: None,
+      quality: None,
+      complete_frames: false,
+    };
+    // Encoded input: choose_output sees the decoded frames' format.
+    let decoded = ImageSource {
+      format: ImageFormat::MPEG4,
+      pix: AVPixelFormat::AV_PIX_FMT_YUV420P,
+      width: 1920,
+      height: 1080,
+    };
+    let output = choose_output(&params, &decoded);
+    assert_eq!(output.format, ImageFormat::YUV420P);
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUV420P);
+    assert_eq!(output.codec_id, None);
+
+    // Raw input passes through.
+    let raw = ImageSource {
+      format: ImageFormat::NV12,
+      pix: AVPixelFormat::AV_PIX_FMT_NV12,
+      width: 1920,
+      height: 1080,
+    };
+    let output = choose_output(&params, &raw);
+    assert_eq!(output.format, ImageFormat::NV12);
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_NV12);
+    assert_eq!(output.codec_id, None);
+  }
+
+  #[test]
   fn raw_output_is_not_limited() {
     let params = ConverterParams {
-      format: Some(ImageFormat::Gray),
+      format: Some(VideoFormat::Image(ImageFormat::Gray)),
       width: Some(641),
       height: None,
       quality: None,

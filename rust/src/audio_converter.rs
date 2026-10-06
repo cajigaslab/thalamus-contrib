@@ -58,6 +58,10 @@ pub enum AudioFormat {
   Integer,
   Decimal,
   AAC,
+  /// Encoded input is output in the sample format its decoder produces (as
+  /// doubles when Thalamus has no matching format); raw input passes
+  /// through.
+  Decoded,
 }
 
 
@@ -134,8 +138,20 @@ impl<'a> AnalogData for AudioOutput<'a> {
     }
   }
 
+  fn int_data(&self, channel: i32) -> &[i32] {
+    if self.av_format() == ffi::AVSampleFormat::AV_SAMPLE_FMT_S32P {
+      planar_channel(self.frame, channel as usize)
+    } else {
+      &[]
+    }
+  }
+
   fn is_short_data(&self) -> bool {
     self.av_format() == ffi::AVSampleFormat::AV_SAMPLE_FMT_S16P
+  }
+
+  fn is_int_data(&self) -> bool {
+    self.av_format() == ffi::AVSampleFormat::AV_SAMPLE_FMT_S32P
   }
 
   /// AAC output reports its channels (names and sample intervals) with no
@@ -236,6 +252,7 @@ fn audio_format_to_encoding(format: AudioFormat) -> Option<ffi::AVCodecID> {
     AudioFormat::Integer => None,
     AudioFormat::Decimal => None,
     AudioFormat::AAC => Some(ffi::AVCodecID::AV_CODEC_ID_AAC),
+    AudioFormat::Decoded => None,
   }
 }
 
@@ -244,6 +261,17 @@ fn audio_format_to_sample_format(format: AudioFormat) -> ffi::AVSampleFormat {
     AudioFormat::Integer => ffi::AVSampleFormat::AV_SAMPLE_FMT_S16P,
     AudioFormat::Decimal => ffi::AVSampleFormat::AV_SAMPLE_FMT_DBLP,
     _ => panic!("audio_format_to_sample_format {:?}", format),
+  }
+}
+
+/// The planar version of a decoder's sample format, when a Thalamus analog
+/// format holds it, and doubles otherwise (e.g. AAC's floats).
+fn decoded_sample_format(decoded: ffi::AVSampleFormat) -> ffi::AVSampleFormat {
+  match unsafe { ffi::av_get_planar_sample_fmt(decoded) } {
+    planar @ (ffi::AVSampleFormat::AV_SAMPLE_FMT_S16P
+      | ffi::AVSampleFormat::AV_SAMPLE_FMT_S32P
+      | ffi::AVSampleFormat::AV_SAMPLE_FMT_DBLP) => planar,
+    _ => ffi::AVSampleFormat::AV_SAMPLE_FMT_DBLP,
   }
 }
 
@@ -431,7 +459,11 @@ struct OutputConfig {
 fn choose_output(params: &AudioConverterParams, input: &InputChannels,
                  src_sample_format: ffi::AVSampleFormat, src_sample_rate: i32) -> OutputConfig {
   let src_audio_format = analog_to_audio_format(input.format, input.encoding);
-  let dst_audio_format = params.format.unwrap_or(src_audio_format);
+  let dst_audio_format = match params.format {
+    None => src_audio_format,
+    Some(AudioFormat::Decoded) if !is_compressed_audio_format(src_audio_format) => src_audio_format,
+    Some(format) => format,
+  };
   let codec_id = audio_format_to_encoding(dst_audio_format);
   let codec = codec_id.map(|codec_id| {
     let codec = unsafe { ffi::avcodec_find_encoder(codec_id) };
@@ -442,7 +474,11 @@ fn choose_output(params: &AudioConverterParams, input: &InputChannels,
   });
   let sample_format = codec
     .map(|codec| sample_format_for_codec(src_sample_format, codec))
-    .unwrap_or_else(|| audio_format_to_sample_format(dst_audio_format));
+    .unwrap_or_else(|| if dst_audio_format == AudioFormat::Decoded {
+      decoded_sample_format(src_sample_format)
+    } else {
+      audio_format_to_sample_format(dst_audio_format)
+    });
   let requested_rate = params.samplerate.unwrap_or(src_sample_rate);
   let sample_rate = codec
     .map(|codec| sample_rate_for_codec(requested_rate, codec))
@@ -1249,6 +1285,16 @@ impl AudioConverter {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn decoded_samples_keep_their_format_when_thalamus_has_it() {
+    use ffi::AVSampleFormat::*;
+    assert_eq!(decoded_sample_format(AV_SAMPLE_FMT_S16), AV_SAMPLE_FMT_S16P);
+    assert_eq!(decoded_sample_format(AV_SAMPLE_FMT_S32P), AV_SAMPLE_FMT_S32P);
+    assert_eq!(decoded_sample_format(AV_SAMPLE_FMT_DBL), AV_SAMPLE_FMT_DBLP);
+    // AAC decodes to floats, which Thalamus has no format for.
+    assert_eq!(decoded_sample_format(AV_SAMPLE_FMT_FLTP), AV_SAMPLE_FMT_DBLP);
+  }
 
   #[test]
   fn interval_to_rate_recovers_common_rates_from_rounded_or_truncated_intervals() {
