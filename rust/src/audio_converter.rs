@@ -211,10 +211,6 @@ struct InputChannels {
   names: Vec<String>,
 }
 
-fn is_compressed(encoding: AnalogEncoding) -> bool {
-  encoding == AnalogEncoding::AAC
-}
-
 fn is_compressed_audio_format(encoding: AudioFormat) -> bool {
   encoding == AudioFormat::AAC
 }
@@ -418,18 +414,6 @@ fn encoder_time_base(frame_interval: Duration) -> ffi::AVRational {
   time_base
 }
 
-fn single_channel(layout: &ffi::AVChannelLayout) -> ffi::AVChannelLayout {
-  unsafe {
-    let channel = ffi::av_channel_layout_channel_from_index(layout, 0);
-    assert!((channel as i32) >= 0, "av_channel_layout_channel_from_index returned negative");
-    
-    let mut mono: ffi::AVChannelLayout = std::mem::zeroed();
-    let ret = ffi::av_channel_layout_from_mask(&mut mono, 1u64 << (channel as u32));
-    assert!(ret >= 0, "av_channel_layout_from_mask: {}", av_error_string(ret));
-    mono
-  }
-}
-
 fn analog_data_ptr(analog: &dyn AnalogData, channel: i32) -> *const u8 {
   match analog.analog_format(channel) {
     AnalogFormat::Double => analog.data(channel).as_ptr() as *const u8,
@@ -438,10 +422,6 @@ fn analog_data_ptr(analog: &dyn AnalogData, channel: i32) -> *const u8 {
     AnalogFormat::ULong => analog.ulong_data(channel).as_ptr() as *const u8,
     AnalogFormat::Encoded => panic!("Can't get ptr to encoded data"),
   }
-}
-
-fn analog_data_ptr_range(analog: &dyn AnalogData, channel: Range<i32>) -> impl Iterator<Item=*const u8> {
-  channel.map(|i| analog_data_ptr(analog, i))
 }
 
 /// The output format, chosen from the parameters and the input's format and
@@ -489,7 +469,8 @@ fn choose_output(params: &AudioConverterParams, input: &InputChannels,
   } else {
     samples_to_duration(1, sample_rate)
   };
-  OutputConfig { sample_format, sample_rate, sample_interval, codec_id, bitrate: params.bitrate.unwrap_or(64_000) }
+  // Bit rate for the whole stream; 256 kbit/s is near transparent stereo AAC.
+  OutputConfig { sample_format, sample_rate, sample_interval, codec_id, bitrate: params.bitrate.unwrap_or(256_000) }
 }
 
 fn default_layout(channels: usize) -> ffi::AVChannelLayout {
@@ -1243,6 +1224,8 @@ impl AudioConverter {
   /// even when the encoder produced no packets yet: the buffer is empty and
   /// encoded_count is the number of samples pushed.
   pub fn pull(&self) -> Option<AudioOutput<'_>> {
+    // Ends when pull returns, so it includes waiting for the codec lock.
+    let _trace = self.api.trace_event(c"AudioConverter::pull");
     let mut codec = self.codec.lock().unwrap();
 
     // Catch up with the input side: a reset there starts the codec state
@@ -1264,6 +1247,7 @@ impl AudioConverter {
     };
 
     let frame = if encoded {
+      let _trace = self.api.trace_event(c"AudioConverter::decode");
       self.next_decoded_frame(&mut codec)?
     } else {
       self.pool.lock().unwrap().get_pending(codec.generation)?
@@ -1275,9 +1259,12 @@ impl AudioConverter {
     let Some(codec_id) = output.codec_id else {
       return Some(AudioOutput { codec, frame: Some(frame), time, encoded_count: 0 });
     };
-    let encoder = codec.open_encoder(codec_id, &output);
-    codec.out_buffer.clear();
-    let encoded_count = codec.encode_frame(encoder, frame);
+    let encoded_count = {
+      let _trace = self.api.trace_event(c"AudioConverter::encode");
+      let encoder = codec.open_encoder(codec_id, &output);
+      codec.out_buffer.clear();
+      codec.encode_frame(encoder, frame)
+    };
     Some(AudioOutput { codec, frame: None, time, encoded_count })
   }
 }

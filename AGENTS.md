@@ -87,6 +87,13 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   `source == node_state` filters to the node's own keys.
 - Dropping a `TaskScope` from inside its own task deadlocks; post the work
   that drops it to the main thread instead.
+- Tracing: `ThalamusAPIThreadSafe::trace_event(name)` and
+  `trace_event_static(c"name")` return a guard that ends the event (category
+  "plugin") when dropped. It isn't Send: Perfetto ties begin and end to the
+  thread, so don't hold it across an await. Static names are interned by
+  address (written once per thread, then referenced by id); prefer them for
+  frequent events. Run Thalamus with `-t` to record
+  `thalamus_<time>.perfetto-trace`.
 
 ## Analog data
 
@@ -107,7 +114,11 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   `has_image_data`/`has_analog_data`, not just per node type, because nodes
   like MEDIA_CONVERTER emit image-only and audio-only messages.
 - MIC emits whatever format `cpal` captures (f32 converted to f64), one
-  message per audio callback; buffer sizes vary and aren't fixed frames.
+  message per audio callback; buffer sizes vary and aren't fixed frames. It
+  signals from inside cpal's audio callback, so multithreaded subscribers
+  (e.g. MEDIA_CONVERTER's push) run on the audio thread and must be quick.
+  The node owns the `cpal::Stream` on the main thread; dropping it stops the
+  callbacks.
 - Sample intervals are whole nanoseconds, so 44.1 kHz arrives as 22675 or
   22676 ns. Convert intervals to rates with `interval_to_rate` (matches the
   output and common rates within 10 ns) and sample counts to durations with
@@ -154,7 +165,7 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     float format.
   - `Video Quality`, `Video Width`, `Video Height`, and `Complete Frames`
     (MPEG4 input arrives one whole frame per message; see below).
-  - `Audio Bit Rate` (kbit/s, 0 = 64) and `Audio Sample Rate` (0 = source
+  - `Audio Bit Rate` (kbit/s for the whole stream, 0 = 256) and `Audio Sample Rate` (0 = source
     rate).
   - `Audio Index`: the input channel to start at, forwards from 0, 1, ... or
     backwards from -1 (last), -2, .... It takes the run of channels with

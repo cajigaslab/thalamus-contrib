@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 use std::{
+  ffi::CStr,
   os::raw::{c_char, c_void},
   sync::OnceLock,
 };
@@ -793,6 +794,21 @@ unsafe impl Send for ThalamusAPIThreadSafe {}
 // copy, and its functions may be called from any thread.
 unsafe impl Sync for ThalamusAPIThreadSafe {}
 
+/// A trace event begun by ThalamusAPIThreadSafe::trace_event; ends it when
+/// dropped.
+pub struct TraceEvent {
+  end: Option<unsafe extern "C" fn()>,
+  _not_send: PhantomData<*const ()>,
+}
+
+impl Drop for TraceEvent {
+  fn drop(&mut self) {
+    if let Some(end) = self.end {
+      unsafe { end() };
+    }
+  }
+}
+
 pub enum NodeSelector {
   Name(String),
   Type(String),
@@ -811,6 +827,43 @@ impl ThalamusAPIThreadSafe {
     unsafe {
       let time_ns = (&*self.raw).time_ns.unwrap();
       return Duration::from_nanos(time_ns());
+    }
+  }
+
+  /// Begins a trace event named `name` (category "plugin") on this thread's
+  /// track in Thalamus's Perfetto trace; it ends when the returned guard is
+  /// dropped. Begin and end must happen on the same thread, so the guard isn't
+  /// Send and can't be held across an await.
+  pub fn trace_event_dynamic(&self, name: &str) -> TraceEvent {
+    let api = unsafe { &*self.raw };
+    let end = match (api.trace_event_begin, api.trace_event_end) {
+      (Some(begin), Some(end)) => {
+        let span = ThalamusCharSpan {
+          data: name.as_ptr() as *const c_char,
+          size: name.len() as u64,
+          owns_data: 0,
+        };
+        // Thalamus copies the name, so it only has to live for this call.
+        unsafe { begin(&span) };
+        Some(end)
+      }
+      _ => None,
+    };
+    TraceEvent { end, _not_send: PhantomData }
+  }
+
+  /// Like trace_event, but Perfetto interns the name: it's written to the
+  /// trace once per thread and later events refer to it by id. Perfetto keys
+  /// names by address, so the name must be 'static (e.g. a c"..." literal).
+  /// On a Thalamus without trace_event_begin_static this is trace_event.
+  pub fn trace_event(&self, name: &'static CStr) -> TraceEvent {
+    let api = unsafe { &*self.raw };
+    match (api.trace_event_begin_static, api.trace_event_end) {
+      (Some(begin), Some(end)) => {
+        unsafe { begin(name.as_ptr()) };
+        TraceEvent { end: Some(end), _not_send: PhantomData }
+      }
+      _ => self.trace_event_dynamic(name.to_str().unwrap_or("")),
     }
   }
 

@@ -922,6 +922,8 @@ impl ImageConverter {
 
   /// The next converted image: one per frame.
   pub fn pull(&self) -> Option<Box<dyn NodeData + '_>> {
+    // Ends when pull returns, so it includes waiting for the codec lock.
+    let _trace = self.api.trace_event(c"ImageConverter::pull");
     let mut codec = self.codec.lock().unwrap();
 
     // Catch up with the input side: a reset there starts the codec state
@@ -942,6 +944,7 @@ impl ImageConverter {
     };
 
     let frame = if encoded {
+      let _trace = self.api.trace_event(c"ImageConverter::decode");
       self.next_decoded_frame(&mut codec)?
     } else {
       self.pool.lock().unwrap().get_pending(codec.generation)?
@@ -961,8 +964,11 @@ impl ImageConverter {
         time,
       }));
     };
-    let encoder = codec.open_encoder(codec_id, &output);
-    codec.encode_frame(encoder, frame, output.quality);
+    {
+      let _trace = self.api.trace_event(c"ImageConverter::encode");
+      let encoder = codec.open_encoder(codec_id, &output);
+      codec.encode_frame(encoder, frame, output.quality);
+    }
     Some(Box::new(EncodedImage {
       codec,
       frame_interval,

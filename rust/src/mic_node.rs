@@ -3,27 +3,18 @@ use cpal::{I24, SampleFormat, SizedSample, U24};
 use std::{
   cell::RefCell,
   rc::{Rc, Weak},
-  sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-  },
+  sync::{Arc, Mutex},
   time::Duration,
 };
 
 use crate::api::{
   self, AnalogData, Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken,
   OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG,
-  ThalamusAPI, ThalamusAPIThreadSafe,
+  ThalamusAPI,
 };
 
 /// Sample rates offered for devices that report a range of supported rates.
 const STANDARD_SAMPLE_RATES: [u32; 9] = [8000, 11025, 16000, 22050, 32000, 44100, 48000, 88200, 96000];
-
-/// Buffers queued between the audio callback and the node's thread; when the
-/// node's thread falls this far behind, new buffers are dropped rather than
-/// blocking the audio thread.
-const QUEUE_DEPTH: usize = 64;
 
 /// Captured samples, one Vec per channel, in the Thalamus analog type that
 /// holds the stream's sample format without loss. Formats Thalamus has no
@@ -48,6 +39,17 @@ impl Samples {
       Samples::Int(c) => c.len(),
       Samples::ULong(c) => c.len(),
       Samples::Double(c) => c.len(),
+    }
+  }
+
+  /// Samples per channel.
+  #[cfg(test)]
+  fn frames(&self) -> usize {
+    match self {
+      Samples::Short(c) => c.first().map_or(0, Vec::len),
+      Samples::Int(c) => c.first().map_or(0, Vec::len),
+      Samples::ULong(c) => c.first().map_or(0, Vec::len),
+      Samples::Double(c) => c.first().map_or(0, Vec::len),
     }
   }
 }
@@ -116,7 +118,8 @@ struct Chunk {
   names: Arc<Vec<String>>,
   sample_interval: Duration,
   time: Duration,
-  /// Set on the first chunk a stream queues; a stream's channels don't change.
+  /// Set until a stream's first chunk is delivered; a stream's channels don't
+  /// change.
   channels_changed: bool,
 }
 
@@ -332,50 +335,54 @@ impl MicSettings {
   }
 }
 
+/// The node's state, for setting Running to false when the stream fails. The
+/// error callback runs on the audio thread, so it doesn't own the State
+/// (which must be dropped on the main thread): it takes it from here and
+/// posts it to the main thread, and stop_mic clears it otherwise.
+type FailureState = Arc<Mutex<Option<MainThreadOnly<State>>>>;
+
 pub struct MicNode {
   api: ThalamusAPI,
   _state_connection: OnDrop,
   main_thread_token: MainThreadToken,
   state: State,
   signaler: Arc<OffMainSignaler>,
-  mic_thread: Option<std::thread::JoinHandle<()>>,
-  /// Tells the mic thread to stop even if no audio is arriving.
-  stop: Arc<AtomicBool>,
+  /// The capture stream while Running. cpal calls its callback on its own
+  /// audio thread until it's dropped.
+  stream: Option<cpal::Stream>,
+  failure_state: Option<FailureState>,
 }
 
 /// Opens an input stream whose callback converts each buffer into a Chunk
-/// (timestamped by `clock`) and queues it on `sender`. Buffers are dropped
-/// when the queue is full; the callback never blocks the audio thread.
+/// (timestamped by `clock`) and passes it to `on_chunk`, which returns whether
+/// it was delivered. Both callbacks run on cpal's audio thread.
 fn build_stream<T: CaptureSample>(
   device: &cpal::Device,
   config: &cpal::StreamConfig,
   names: Arc<Vec<String>>,
   clock: impl Fn() -> Duration + Send + 'static,
-  sender: mpsc::SyncSender<Chunk>,
-  failed: Arc<AtomicBool>,
+  mut on_chunk: impl FnMut(&Chunk) -> bool + Send + 'static,
+  on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, cpal::Error> {
   let channel_count = usize::from(config.channels);
   let sample_interval = Duration::from_secs_f64(1.0 / f64::from(config.sample_rate));
-  // Stays set until a chunk is actually queued: full queues drop chunks.
+  // Stays set until a chunk is delivered.
   let mut channels_changed = true;
   device.build_input_stream::<T, _, _>(
     config.clone(),
     move |data: &[T], _| {
-      let queued = sender.try_send(Chunk {
+      let chunk = Chunk {
         samples: T::samples(data, channel_count),
         names: names.clone(),
         sample_interval,
         time: clock(),
         channels_changed,
-      });
-      if queued.is_ok() {
+      };
+      if on_chunk(&chunk) {
         channels_changed = false;
       }
     },
-    move |e| {
-      println!("MIC stream error: {e}");
-      failed.store(true, Ordering::SeqCst);
-    },
+    on_error,
     None,
   )
 }
@@ -386,13 +393,13 @@ fn open_stream(
   config: &cpal::SupportedStreamConfig,
   names: Arc<Vec<String>>,
   clock: impl Fn() -> Duration + Send + 'static,
-  sender: mpsc::SyncSender<Chunk>,
-  failed: Arc<AtomicBool>,
+  on_chunk: impl FnMut(&Chunk) -> bool + Send + 'static,
+  on_error: impl FnMut(cpal::Error) + Send + 'static,
 ) -> Result<cpal::Stream, String> {
   let stream_config = config.config();
   macro_rules! build {
     ($t:ty) => {
-      build_stream::<$t>(device, &stream_config, names, clock, sender, failed)
+      build_stream::<$t>(device, &stream_config, names, clock, on_chunk, on_error)
     };
   }
   let stream = match config.sample_format() {
@@ -414,52 +421,19 @@ fn open_stream(
 
 impl MicNode {
   fn stop_mic(&mut self) {
-    self.stop.store(true, Ordering::SeqCst);
+    // Blocked first so a callback already running can't signal anymore;
+    // dropping the stream then stops the callbacks.
     self.signaler.block();
-    self.mic_thread.take().map(|h| h.join());
+    self.stream = None;
+    // The State is dropped here, on the main thread, unless a failure already
+    // posted it there.
+    if let Some(failure_state) = self.failure_state.take() {
+      failure_state.lock().unwrap().take();
+    }
   }
 
-  /// Runs on the mic thread: owns the cpal stream (which isn't Send on every
-  /// platform) and forwards its buffers until stopped or the stream fails.
-  fn mic(
-    signaler: Arc<OffMainSignaler>,
-    device_id: Option<String>,
-    config: cpal::SupportedStreamConfig,
-    names: Arc<Vec<String>>,
-    api: ThalamusAPIThreadSafe,
-    stop: Arc<AtomicBool>,
-  ) {
-    let Some(device) = find_device(device_id.as_deref()) else {
-      println!("MIC: audio device not found");
-      return;
-    };
-    let (sender, receiver) = mpsc::sync_channel(QUEUE_DEPTH);
-    let failed = Arc::new(AtomicBool::new(false));
-    let stream = match open_stream(&device, &config, names, move || api.time(), sender, failed.clone()) {
-      Ok(stream) => stream,
-      Err(e) => {
-        println!("MIC: failed to open stream: {e}");
-        return;
-      }
-    };
-    if let Err(e) = stream.play() {
-      println!("MIC: failed to start stream: {e}");
-      return;
-    }
-
-    while !stop.load(Ordering::SeqCst) && !failed.load(Ordering::SeqCst) {
-      match receiver.recv_timeout(Duration::from_millis(100)) {
-        Ok(chunk) => match signaler.ready(&chunk) {
-          Ok(true) => {}
-          _ => break,
-        },
-        Err(mpsc::RecvTimeoutError::Timeout) => {}
-        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-      }
-    }
-    println!("mic end");
-  }
-
+  /// Opens and starts the capture stream. Its callback signals each buffer as
+  /// it arrives, on cpal's audio thread.
   fn start_mic(&mut self) {
     let settings = MicSettings::read(&self.state);
     let Some(device) = find_device(settings.device_id.as_deref()) else {
@@ -477,23 +451,46 @@ impl MicNode {
     };
     let names = channel_names(config.channels());
 
-    self.stop.store(false, Ordering::SeqCst);
     let api = self.api.thread_safe();
     let signaler = self.signaler.clone();
     signaler.unblock();
-    let wrapped_state = MainThreadOnly::new(self.state.clone(), self.main_thread_token);
-    let stop = self.stop.clone();
-    let device_id = settings.device_id;
-    self.mic_thread = Some(std::thread::spawn(move || {
-      MicNode::mic(signaler, device_id, config, names, api, stop);
-      api.post_to_main(|main_thread_token| {
-        let state = wrapped_state.take(main_thread_token);
-        state.set(
-          api::StateKey::String("Running".to_string()),
-          api::StateValue::Bool(false),
-        );
-      });
-    }));
+    let failure_state: FailureState =
+      Arc::new(Mutex::new(Some(MainThreadOnly::new(self.state.clone(), self.main_thread_token))));
+    let on_failure = failure_state.clone();
+    let stream = open_stream(
+      &device,
+      &config,
+      names,
+      move || api.time(),
+      // Ok(false) means the signaler is blocked: the node is stopping.
+      move |chunk| matches!(signaler.ready(chunk), Ok(true)),
+      move |e| {
+        println!("MIC stream error: {e}");
+        if let Some(state) = on_failure.lock().unwrap().take() {
+          api.post_to_main(move |main_thread_token| {
+            state.take(main_thread_token).set(
+              api::StateKey::String("Running".to_string()),
+              api::StateValue::Bool(false),
+            );
+          });
+        }
+      },
+    );
+    let stream = match stream {
+      Ok(stream) => stream,
+      Err(e) => {
+        println!("MIC: failed to open stream: {e}");
+        self.set_running_false();
+        return;
+      }
+    };
+    if let Err(e) = stream.play() {
+      println!("MIC: failed to start stream: {e}");
+      self.set_running_false();
+      return;
+    }
+    self.stream = Some(stream);
+    self.failure_state = Some(failure_state);
   }
 
   /// Posted rather than set directly: this runs inside the state callback.
@@ -581,8 +578,8 @@ impl Node for MicNode {
         main_thread_token,
         state: state.clone(),
         signaler,
-        mic_thread: None,
-        stop: Arc::new(AtomicBool::new(false)),
+        stream: None,
+        failure_state: None,
       })
     });
 
@@ -611,6 +608,8 @@ impl Drop for MicNode {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::sync::atomic::{AtomicBool, Ordering};
+  use std::sync::mpsc;
 
   #[test]
   fn deinterleave_splits_channels_and_drops_partial_frames() {
@@ -713,25 +712,28 @@ mod tests {
     let config = choose_config(&device, None).unwrap();
     println!("config {config:?}");
 
-    let (sender, receiver) = mpsc::sync_channel(QUEUE_DEPTH);
+    let (sender, receiver) = mpsc::channel();
     let failed = Arc::new(AtomicBool::new(false));
+    let on_error_failed = failed.clone();
     let start = std::time::Instant::now();
     let names = channel_names(config.channels());
-    let stream = open_stream(&device, &config, names, move || start.elapsed(), sender, failed.clone()).unwrap();
+    let stream = open_stream(
+      &device,
+      &config,
+      names,
+      move || start.elapsed(),
+      move |chunk| sender.send((chunk.num_channels(), chunk.samples.frames())).is_ok(),
+      move |_| on_error_failed.store(true, Ordering::SeqCst),
+    ).unwrap();
     stream.play().unwrap();
 
     let mut buffers = 0;
     let mut frames = 0;
     while start.elapsed() < Duration::from_millis(500) {
-      if let Ok(chunk) = receiver.recv_timeout(Duration::from_millis(100)) {
-        assert_eq!(chunk.num_channels(), i32::from(config.channels()));
+      if let Ok((channels, chunk_frames)) = receiver.recv_timeout(Duration::from_millis(100)) {
+        assert_eq!(channels, i32::from(config.channels()));
         buffers += 1;
-        frames += match &chunk.samples {
-          Samples::Short(c) => c[0].len(),
-          Samples::Int(c) => c[0].len(),
-          Samples::ULong(c) => c[0].len(),
-          Samples::Double(c) => c[0].len(),
-        };
+        frames += chunk_frames;
       }
     }
     println!("buffers {buffers} frames {frames}");

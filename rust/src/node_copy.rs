@@ -2,6 +2,10 @@
 //! callback to another thread or task: the original is only valid during
 //! the callback.
 
+// Nothing uses these copies at the moment; they're kept for nodes that need
+// to hand data to another thread or task.
+#![allow(dead_code)]
+
 use std::time::Duration;
 
 use crate::api::{AnalogData, AnalogEncoding, AnalogFormat, ImageData, ImageFormat, NodeData};

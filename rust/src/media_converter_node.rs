@@ -274,7 +274,7 @@ impl MediaConverterNode {
         };
       },
       "Audio Bit Rate" => {
-        // kbit/s for the whole stream; 0 means 64 kbit/s per channel.
+        // kbit/s for the whole stream; 0 means 256 kbit/s.
         if let StateValue::Int(v) = value {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
@@ -417,7 +417,14 @@ impl MediaConverterNode {
       if dropping.load(Ordering::SeqCst) {
         return;
       }
-      while let Some(output) = converter.pull() {
+      loop {
+        let output = {
+          let _trace = api.trace_event(c"MediaConverter::pull");
+          converter.pull()
+        };
+        let Some(output) = output else {
+          break;
+        };
         emit(&*output);
       }
       notify.notified().await;
