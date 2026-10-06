@@ -789,6 +789,9 @@ pub struct ThalamusAPIThreadSafe {
   pub raw: *mut ThalamusAPIRaw,
 }
 unsafe impl Send for ThalamusAPIThreadSafe {}
+// SAFETY: it's Copy, so sharing a reference is no different from sending a
+// copy, and its functions may be called from any thread.
+unsafe impl Sync for ThalamusAPIThreadSafe {}
 
 pub enum NodeSelector {
   Name(String),

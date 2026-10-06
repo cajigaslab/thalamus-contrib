@@ -217,7 +217,7 @@ pub struct MediaConverterNode {
   source_connection: Option<OnDrop>,
   data_connection: Option<OnDrop>,
   signaler: Arc<OffMainSignaler>,
-  converter: Arc<Mutex<MediaConverter>>,
+  converter: Arc<MediaConverter>,
   notify: Arc<Notify>,
   dropping: Arc<AtomicBool>,
   arrivals: Arrivals,
@@ -350,7 +350,6 @@ impl MediaConverterNode {
           let api = borrow.api.thread_safe();
           borrow.data_connection = Some(node.subscribe_multithreaded(move |node| {
             let arrived = api.time();
-            let mut converter = converter.lock().unwrap();
             {
               let mut params = params.lock().unwrap();
               if params.dirty {
@@ -377,7 +376,7 @@ impl MediaConverterNode {
   }
 
   async fn converter_task(
-    converter: Arc<Mutex<MediaConverter>>,
+    converter: Arc<MediaConverter>,
     signaler: Arc<OffMainSignaler>,
     notify: Arc<Notify>,
     dropping: Arc<AtomicBool>,
@@ -386,28 +385,36 @@ impl MediaConverterNode {
     viewer_sink: ImageSink,
   ) {
     let mut last_layout: Option<ChannelLayout> = None;
+    let mut emit = |output: &dyn NodeData| {
+      // Outputs keep their input's time, which is the key. Each output is
+      // either an image or audio.
+      let arrivals = if output.image().is_some() { &arrivals.image } else { &arrivals.analog };
+      let latency_ms = take_latency_ms(arrivals, output.time(), api.time());
+      let mut stats = WithStats::new(output, latency_ms);
+      // Format, sample rate, Audio Index and image vs audio outputs all show
+      // up as a different layout.
+      let layout = channel_layout(&stats);
+      stats.channels_changed = last_layout.as_ref() != Some(&layout);
+      last_layout = Some(layout);
+      let _ = signaler.ready(&stats);
+      if let Some(image) = output.image() {
+        // Encoded (MPEG4) output is dropped by the viewer.
+        viewer_sink.update(image);
+      }
+    };
     loop {
       if dropping.load(Ordering::SeqCst) {
         return;
       }
+      // Pulling audio doesn't hold up pushes; pulling images holds the image
+      // converter's lock.
+      while let Some(output) = converter.audio().pull() {
+        emit(&output);
+      }
       {
-        let mut converter = converter.lock().unwrap();
-        while let Some(output) = converter.pull() {
-          // Outputs keep their input's time, which is the key. Each output
-          // is either an image or audio.
-          let arrivals = if output.image().is_some() { &arrivals.image } else { &arrivals.analog };
-          let latency_ms = take_latency_ms(arrivals, output.time(), api.time());
-          let mut stats = WithStats::new(&*output, latency_ms);
-          // Format, sample rate, Audio Index and image vs audio outputs all
-          // show up as a different layout.
-          let layout = channel_layout(&stats);
-          stats.channels_changed = last_layout.as_ref() != Some(&layout);
-          last_layout = Some(layout);
-          let _ = signaler.ready(&stats);
-          if let Some(image) = output.image() {
-            // Encoded (MPEG4) output is dropped by the viewer.
-            viewer_sink.update(image);
-          }
+        let mut image = converter.image();
+        while let Some(output) = image.pull() {
+          emit(&*output);
         }
       }
       notify.notified().await;
@@ -433,7 +440,7 @@ impl Node for MediaConverterNode {
     };
     let result = Rc::new(RefCell::new(MediaConverterNode {
       params: Arc::new(Mutex::new(params.clone())),
-      converter: Arc::new(Mutex::new(MediaConverter::new(api.thread_safe(), params.params))),
+      converter: Arc::new(MediaConverter::new(api.thread_safe(), params.params)),
       api,
       state: state.clone(),
       main_thread_token: token,

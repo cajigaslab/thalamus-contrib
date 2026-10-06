@@ -10,12 +10,13 @@
 use std::collections::VecDeque;
 use std::ops::{Range};
 use std::os::raw::c_void;
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ffmpeg_sys_next::AVCodecConfig::{AV_CODEC_CONFIG_SAMPLE_FORMAT, AV_CODEC_CONFIG_SAMPLE_RATE};
-use ffmpeg_sys_next::{self as ffi, AV_INPUT_BUFFER_PADDING_SIZE, EAGAIN};
+use ffmpeg_sys_next::{self as ffi, AV_INPUT_BUFFER_PADDING_SIZE};
 
-use crate::api::{AnalogData, AnalogEncoding, AnalogFormat, NodeData, ThalamusAPI, ThalamusAPIThreadSafe};
+use crate::api::{AnalogData, AnalogEncoding, AnalogFormat, NodeData, ThalamusAPIThreadSafe};
 use crate::image_converter::AVERROR_EOF;
 
 const AVERROR_EAGAIN: i32 = -ffi::EAGAIN;
@@ -59,9 +60,10 @@ pub enum AudioFormat {
 }
 
 
-/// One converted analog message.
+/// One converted analog message. It holds the converter's codec state while
+/// it's read, which only holds up other pulls, not pushes.
 pub struct AudioOutput<'a> {
-  converter: &'a AudioConverter,
+  codec: MutexGuard<'a, CodecState>,
   frame: Option<*mut ffi::AVFrame>,
   time: Duration,
   encoded_count: i32
@@ -138,23 +140,25 @@ impl<'a> AnalogData for AudioOutput<'a> {
   /// AAC output reports its channels (names and sample intervals) with no
   /// samples; the audio is in the buffer.
   fn num_channels(&self) -> i32 {
-    self.converter.input_channels.range.len() as i32
+    self.codec.input.as_ref().map_or(0, |input| input.names.len() as i32)
   }
 
   fn sample_interval(&self, _channel: i32) -> Duration {
-    self.converter.dst_sample_interval
+    self.codec.output.map_or(Duration::ZERO, |output| output.sample_interval)
   }
 
   fn name(&self, channel: i32) -> &str {
-    self.converter.input_channels.names[channel as usize].as_str()
+    self.codec.input.as_ref()
+      .and_then(|input| input.names.get(channel as usize))
+      .map_or("", |name| name.as_str())
   }
 
   fn buffer(&self) -> &[u8] {
-    self.converter.out_buffer.as_slice()
+    self.codec.out_buffer.as_slice()
   }
 
   fn encoding(&self) -> AnalogEncoding {
-    if let Some(encoder) = self.converter.encoder {
+    if let Some(encoder) = self.codec.encoder {
       unsafe {
         match (*encoder).codec_id {
           ffi::AVCodecID::AV_CODEC_ID_AAC => AnalogEncoding::AAC,
@@ -202,21 +206,42 @@ unsafe fn frame_capacity(frame: *const ffi::AVFrame) -> i32 {
   }
 }
 
+#[derive(Clone, Copy)]
 enum FramePoolParams {
   Audio{layout: ffi::AVChannelLayout, format: ffi::AVSampleFormat, samplerate: i32}
 }
 
+impl FramePoolParams {
+  fn empty() -> FramePoolParams {
+    FramePoolParams::Audio {
+      layout: unsafe { std::mem::zeroed() },
+      format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE,
+      samplerate: 0,
+    }
+  }
+}
+
+/// Converted frames waiting for pull, and frames to reuse. Both sides lock it
+/// briefly: push (raw input) and pull (decoded input) queue frames, pull
+/// takes them. A reset replaces it with a pool of the new generation, and
+/// frames converted for an older generation are dropped rather than queued.
 struct FramePool {
   writable: VecDeque<*mut ffi::AVFrame>,
   pending: VecDeque<*mut ffi::AVFrame>,
   used: VecDeque<*mut ffi::AVFrame>,
-  params: FramePoolParams
+  params: FramePoolParams,
+  generation: u64,
 }
 
+// SAFETY: the frames are only touched under the pool's mutex, apart from the
+// clones handed out, which own their own references.
+unsafe impl Send for FramePool {}
+
 impl FramePool {
-  fn new(params: FramePoolParams) -> FramePool {
+  fn new(params: FramePoolParams, generation: u64) -> FramePool {
     FramePool {
       params,
+      generation,
       writable: VecDeque::new(),
       pending: VecDeque::new(),
       used: VecDeque::new(),
@@ -261,11 +286,22 @@ impl FramePool {
     }
   }
 
-  fn push_pending(&mut self, frame: *mut ffi::AVFrame) {
+  /// Queues `frame` for pull, or frees it if it was converted for an older
+  /// generation. Returns whether it was queued.
+  fn push_pending(&mut self, mut frame: *mut ffi::AVFrame, generation: u64) -> bool {
+    if generation != self.generation {
+      unsafe { ffi::av_frame_free(&mut frame) };
+      return false;
+    }
     self.pending.push_back(frame);
+    true
   }
 
-  fn get_pending(&mut self) -> Option<*mut ffi::AVFrame> {
+  /// A new reference to the next queued frame of `generation`.
+  fn get_pending(&mut self, generation: u64) -> Option<*mut ffi::AVFrame> {
+    if generation != self.generation {
+      return None;
+    }
     let result = self.pending.pop_front();
     result.map(|r| {
       let new_ref = unsafe { ffi::av_frame_clone(r) };
@@ -291,62 +327,7 @@ impl Drop for FramePool {
   }
 }
 
-/// Converts analog data to a target audio format. Like the image Converter,
-/// push() only copies the input; the conversion happens in pull(), so it
-/// runs wherever pull() is called.
-pub struct AudioConverter {
-  params: AudioConverterParams,
-  api: ThalamusAPIThreadSafe,
-
-  multi_sampler: *mut ffi::SwrContext,//
-  reducer_sampler: *mut ffi::SwrContext,//
-  single_samplers: Vec<*mut ffi::SwrContext>,//
-
-  parser: *mut ffi::AVCodecParserContext,//
-  encoder: Option<*mut ffi::AVCodecContext>,//
-  decoder: Option<*mut ffi::AVCodecContext>,//
-
-  decoder_frame: *mut ffi::AVFrame,//
-  fifo_frame: *mut ffi::AVFrame,//
-  
-  needs_conversion: bool,
-  
-  pts: i64,//
-  pts_to_time: VecDeque<(i64, Duration)>,//
-  encoder_pts: i64,
-  
-  in_buffer: Vec<u8>,//
-  out_buffer: Vec<u8>,//
-  slice_to_pts: VecDeque<(usize, i64)>,//
-
-  dst_frame_pool: FramePool,//
-
-  dst_sample_format: ffi::AVSampleFormat,//
-  dst_sample_rate: i32,//
-  dst_sample_interval: Duration,//
-  fifo: *mut ffi::AVAudioFifo,//
-  layout: ffi::AVChannelLayout,//
-  single_layout: ffi::AVChannelLayout,//
-
-  packet: *mut ffi::AVPacket,//
-  parser_packet: *mut ffi::AVPacket,//
-  decoder_configured: bool,//
-  encoder_configured: bool,//
-  sampler_configured: bool,//
-  input_channels: InputChannels,//
-
-  sample_buffers: Vec<Vec<u8>>,//
-  sample_times: Vec<Option<Duration>>,//
-  num_input_bytes: i64,//
-  need_key_frame: bool,//
-  rejection_logged: bool,
-}
-
-// SAFETY: the FFmpeg contexts are only used through &mut self, and FFmpeg
-// codec contexts may move between threads as long as they aren't used
-// concurrently.
-unsafe impl Send for AudioConverter {}
-
+#[derive(Clone)]
 struct InputChannels {
   range: Range<i32>,
   format: AnalogFormat,
@@ -576,312 +557,218 @@ fn analog_data_ptr_range(analog: &dyn AnalogData, channel: Range<i32>) -> impl I
   channel.map(|i| analog_data_ptr(analog, i))
 }
 
-impl AudioConverter {
-  pub fn new(api: ThalamusAPIThreadSafe, params: AudioConverterParams) -> AudioConverter {
-    AudioConverter {
-      params,
-      api,
+/// The output format, chosen from the parameters and the input's format and
+/// rate.
+#[derive(Debug, Clone, Copy)]
+struct OutputConfig {
+  sample_format: ffi::AVSampleFormat,
+  sample_rate: i32,
+  sample_interval: Duration,
+  /// The encoder to use, if any. Only pull opens it.
+  codec_id: Option<ffi::AVCodecID>,
+  bitrate: i64,
+}
 
+fn choose_output(params: &AudioConverterParams, input: &InputChannels,
+                 src_sample_format: ffi::AVSampleFormat, src_sample_rate: i32) -> OutputConfig {
+  let src_audio_format = analog_to_audio_format(input.format, input.encoding);
+  let dst_audio_format = params.format.unwrap_or(src_audio_format);
+  let codec_id = audio_format_to_encoding(dst_audio_format);
+  let codec = codec_id.map(|codec_id| {
+    let codec = unsafe { ffi::avcodec_find_encoder(codec_id) };
+    if codec.is_null() {
+      panic!("no {:?} encoder in this FFmpeg build", codec_id);
+    }
+    codec
+  });
+  let sample_format = codec
+    .map(|codec| sample_format_for_codec(src_sample_format, codec))
+    .unwrap_or_else(|| audio_format_to_sample_format(dst_audio_format));
+  let requested_rate = params.samplerate.unwrap_or(src_sample_rate);
+  let sample_rate = codec
+    .map(|codec| sample_rate_for_codec(requested_rate, codec))
+    .unwrap_or(requested_rate);
+  // Report exactly the input's interval when the rate is unchanged.
+  let sample_interval = if sample_rate == src_sample_rate && !input.sample_interval.is_zero() {
+    input.sample_interval
+  } else {
+    samples_to_duration(1, sample_rate)
+  };
+  OutputConfig { sample_format, sample_rate, sample_interval, codec_id, bitrate: params.bitrate.unwrap_or(64_000) }
+}
+
+fn default_layout(channels: usize) -> ffi::AVChannelLayout {
+  unsafe {
+    let mut layout: ffi::AVChannelLayout = std::mem::zeroed();
+    ffi::av_channel_layout_default(&mut layout, channels as i32);
+    layout
+  }
+}
+
+/// The run of channels with the same format and sample interval that starts
+/// at params.input_index (see AudioConverterParams). An index outside the
+/// input gives no channels, which push rejects.
+fn get_input_range(params: &AudioConverterParams, input: &dyn AnalogData) -> InputChannels {
+  let encoding = input.encoding();
+  let kind = |i: i32| (input.analog_format(i), input.sample_interval(i));
+  let Some(range) = select_input_channels(params.input_index, input.num_channels(), kind) else {
+    return InputChannels {
+      range: 0..0,
+      names: vec![],
+      format: AnalogFormat::Double,
+      sample_interval: Duration::ZERO,
+      encoding,
+    };
+  };
+  let (format, sample_interval) = kind(range.start);
+  let names = range.clone().map(|i| input.name(i).to_string()).collect();
+  InputChannels { range, format, sample_interval, names, encoding }
+}
+
+/// What push works on, under the input lock: the input's channels, the
+/// message times, the AAC parser's input and the raw input's conversion.
+/// Resetting replaces it with a fresh state of the next generation.
+struct InputState {
+  params: AudioConverterParams,
+  generation: u64,
+  /// Picked by the first message after a reset.
+  input: Option<InputChannels>,
+  rejection_logged: bool,
+
+  pts: i64,
+  pts_to_time: VecDeque<(i64, Duration)>,
+
+  // Encoded input: bytes waiting for the parser, which pull runs.
+  parser: *mut ffi::AVCodecParserContext,
+  parser_packet: *mut ffi::AVPacket,
+  in_buffer: Vec<u8>,
+  slice_to_pts: VecDeque<(usize, i64)>,
+  num_input_bytes: i64,
+
+  // Raw input, converted here.
+  output: Option<OutputConfig>,
+  layout: ffi::AVChannelLayout,
+  single_layout: ffi::AVChannelLayout,
+  multi_sampler: *mut ffi::SwrContext,
+  reducer_sampler: *mut ffi::SwrContext,
+  single_samplers: Vec<*mut ffi::SwrContext>,
+  sample_buffers: Vec<Vec<u8>>,
+  sample_times: Vec<Option<Duration>>,
+}
+
+// SAFETY: the FFmpeg contexts are only used under the input mutex.
+unsafe impl Send for InputState {}
+
+impl InputState {
+  fn new(params: AudioConverterParams, generation: u64) -> InputState {
+    InputState {
+      params,
+      generation,
+      input: None,
+      rejection_logged: false,
+      pts: 0,
+      pts_to_time: VecDeque::new(),
+      parser: std::ptr::null_mut(),
+      parser_packet: std::ptr::null_mut(),
+      in_buffer: vec![],
+      slice_to_pts: VecDeque::new(),
+      num_input_bytes: 0,
+      output: None,
+      layout: unsafe { std::mem::zeroed() },
+      single_layout: unsafe { std::mem::zeroed() },
       multi_sampler: std::ptr::null_mut(),
       reducer_sampler: std::ptr::null_mut(),
       single_samplers: vec![],
-
-      parser: std::ptr::null_mut(),
-      encoder: None,
-      decoder: None,
-
-      decoder_frame: std::ptr::null_mut(),
-
-      fifo: std::ptr::null_mut(),
-      fifo_frame: std::ptr::null_mut(),
-      
-      pts: 0,
-      pts_to_time: VecDeque::new(),
-      encoder_pts: 0,
-
-      in_buffer: vec![],
-      out_buffer: vec![],
-      slice_to_pts: VecDeque::new(),
-      rejection_logged: false,
-
-      dst_sample_format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE,
-      dst_sample_rate: -1,
-      dst_sample_interval: Duration::ZERO,
-
-      packet: std::ptr::null_mut(),
-      parser_packet: std::ptr::null_mut(),
-
       sample_buffers: vec![],
       sample_times: vec![],
-      need_key_frame: false,
-
-      layout: unsafe { std::mem::zeroed() },
-      single_layout: unsafe { std::mem::zeroed() },
-      decoder_configured: false,
-      encoder_configured: false,
-      sampler_configured: false,
-      input_channels: InputChannels { range: 0..0, format: AnalogFormat::Double, encoding: AnalogEncoding::None, sample_interval: Duration::default(), names: vec![] },
-      num_input_bytes: 0,
-      dst_frame_pool: FramePool::new(
-        FramePoolParams::Audio { 
-          layout: unsafe { std::mem::zeroed() }, 
-          format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE, 
-          samplerate: 0,
-        }),
-      needs_conversion: true,
     }
   }
 
-  pub fn channels_changed(&mut self) {
-    self.cleanup();
-  }
-
-  fn cleanup(&mut self) {
-    self.decoder_configured = false;
-    self.encoder_configured = false;
-    self.sampler_configured = false;
-    self.rejection_logged = false;
-    self.needs_conversion = true;
+  fn configure_parser(&mut self, encoding: AnalogEncoding) {
     unsafe {
-      ffi::av_channel_layout_uninit(&mut self.layout);
-      ffi::av_channel_layout_uninit(&mut self.single_layout);
-
-      if let Some(mut decoder) = self.decoder {
-        ffi::avcodec_free_context(&mut decoder);
-        ffi::av_parser_close(self.parser);
-        self.parser = std::ptr::null_mut();
-        self.decoder = None;
-      }
-      if let Some(mut encoder) = self.encoder {
-        ffi::avcodec_free_context(&mut encoder);
-        ffi::av_audio_fifo_free(self.fifo);
-        self.fifo = std::ptr::null_mut();
-        self.encoder = None;
-      }
-
-      if self.decoder_frame != std::ptr::null_mut() {
-        ffi::av_frame_free(&mut self.decoder_frame);
-        self.decoder_frame = std::ptr::null_mut();
-      }
-      if self.fifo_frame != std::ptr::null_mut() {
-        ffi::av_frame_free(&mut self.fifo_frame);
-        self.fifo_frame = std::ptr::null_mut();
-      }
-
-      if self.packet != std::ptr::null_mut() {
-        ffi::av_packet_free(&mut self.packet);
-        self.packet = std::ptr::null_mut();
-      }
-      if self.parser_packet != std::ptr::null_mut() {
-        ffi::av_packet_free(&mut self.parser_packet);
-        self.parser_packet = std::ptr::null_mut();
-      }
-      
-      if self.multi_sampler != std::ptr::null_mut() {
-        ffi::swr_free(&mut self.multi_sampler);
-      }
-      if self.reducer_sampler != std::ptr::null_mut() {
-        ffi::swr_free(&mut self.reducer_sampler);
-      }
-      for mut sampler in std::mem::take(&mut self.single_samplers) {
-        ffi::swr_free(&mut sampler);
-      }
-      self.pts = 0;
-      self.pts_to_time.clear();
-      self.encoder_pts = 0;
-      self.in_buffer.clear();
-      self.out_buffer.clear();
-      self.slice_to_pts.clear();
-      self.sample_buffers.clear();
-      self.sample_times.clear();
-      self.need_key_frame = false;
-      // Pending frames are in the old output format.
-      self.dst_frame_pool = FramePool::new(FramePoolParams::Audio {
-        layout: std::mem::zeroed(),
-        format: ffi::AVSampleFormat::AV_SAMPLE_FMT_NONE,
-        samplerate: 0,
-      });
+      let codec_id = encoding_codec(encoding);
+      self.parser = ffi::av_parser_init(codec_id as i32);
+      assert!(!self.parser.is_null(), "Failed to create parser");
+      self.parser_packet = ffi::av_packet_alloc();
+      assert!(!self.parser_packet.is_null(), "Failed to create parser_packet");
+      self.in_buffer.resize(AV_INPUT_BUFFER_PADDING_SIZE as usize, 0);
     }
   }
 
-  fn configure_decoder(&mut self, input_channels: InputChannels) {
-    if self.decoder_configured {
+  /// Appends an encoded message's bytes for the parser.
+  fn queue_encoded(&mut self, time: Duration, bytes: &[u8]) {
+    let pts = self.pts;
+    self.pts_to_time.push_back((pts, time));
+    self.pts += 1;
+
+    let buffer_pos = self.in_buffer.len() - AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    self.in_buffer.resize(self.in_buffer.len() + bytes.len(), 0);
+    let end = buffer_pos + bytes.len();
+    self.in_buffer[buffer_pos..end].copy_from_slice(bytes);
+    self.slice_to_pts.push_back((end, pts));
+  }
+
+  /// Drops the first `used` bytes of buffered input along with the pts slices
+  /// that end inside them.
+  fn consume_input(&mut self, used: usize) {
+    if used == 0 {
       return;
     }
-    self.decoder_configured = true;
-    let src_encoding = input_channels.encoding;
-    unsafe {
-      ffi::av_channel_layout_default(&mut self.layout, input_channels.range.len() as i32);
-      ffi::av_channel_layout_default(&mut self.single_layout, 1);
-
-      let time_base = encoder_time_base(input_channels.sample_interval);
-      self.num_input_bytes = 0;
-
-      if input_channels.format == AnalogFormat::Encoded {
-        let codec_id = encoding_codec(src_encoding);
-        let codec = ffi::avcodec_find_decoder(codec_id);
-        if codec.is_null() {
-          panic!("no {:?} decoder in this FFmpeg build", codec_id);
-        }
-
-        let mut context = ffi::avcodec_alloc_context3(codec);
-        if context.is_null() {
-          panic!("avcodec_alloc_context3 failed");
-        }
-
-        (*context).pkt_timebase = time_base;
-        (*context).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
-
-        let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
-        if ret < 0 {
-          ffi::avcodec_free_context(&mut context);
-          panic!("opening {:?} decoder failed: {}", codec_id, av_error_string(ret));
-        }
-
-        self.decoder = Some(context);
-
-        self.parser = ffi::av_parser_init(codec_id as i32);
-        self.in_buffer.resize(AV_INPUT_BUFFER_PADDING_SIZE as usize, 0);
-        assert!(self.parser != std::ptr::null_mut(), "Failed to create parser");
-
-        self.parser_packet = ffi::av_packet_alloc();
-        assert!(self.parser_packet != std::ptr::null_mut(), "Failed to create parser_packet");
-
-        self.decoder_frame = ffi::av_frame_alloc();
-        self.needs_conversion = true;
-      }
-
-      self.input_channels = input_channels;
+    self.in_buffer.drain(..used);
+    self.num_input_bytes += used as i64;
+    while self.slice_to_pts.front().is_some_and(|(end, _)| *end <= used) {
+      self.slice_to_pts.pop_front();
+    }
+    for (end, _) in self.slice_to_pts.iter_mut() {
+      *end -= used;
     }
   }
 
-  fn configure_encoder(&mut self, src_sample_format: ffi::AVSampleFormat, src_sample_rate: i32) {
-    if self.encoder_configured {
-      return;
-    }
-    self.encoder_configured = true;
-    let input_channels = &self.input_channels;
-    let src_encoding = input_channels.encoding;
-    unsafe {
-      let src_audio_format = analog_to_audio_format(input_channels.format, src_encoding);
-
-      let dst_audio_format = self.params.format.unwrap_or(src_audio_format);
-      let dst_codec_id = audio_format_to_encoding(dst_audio_format);
-      let codec = dst_codec_id.map(|codec_id| {
-        let codec = ffi::avcodec_find_encoder(codec_id);
-        if codec.is_null() {
-          panic!("no {:?} encoder in this FFmpeg build", codec_id);
-        }
-        codec
-      });
-      let dst_sample_format = codec
-        .map(|codec| sample_format_for_codec(src_sample_format, codec))
-        .unwrap_or_else(|| audio_format_to_sample_format(dst_audio_format));
-
-      let requested_rate = self.params.samplerate.unwrap_or(src_sample_rate);
-      let dst_sample_rate = codec
-        .map(|codec| sample_rate_for_codec(requested_rate, codec))
-        .unwrap_or(requested_rate);
-      self.dst_sample_format = dst_sample_format;
-      self.dst_sample_rate = dst_sample_rate;
-      // Report exactly the input's interval when the rate is unchanged.
-      self.dst_sample_interval = if dst_sample_rate == src_sample_rate && !input_channels.sample_interval.is_zero() {
-        input_channels.sample_interval
-      } else {
-        samples_to_duration(1, dst_sample_rate)
-      };
-      self.encoder_pts = 0;
-
-      self.encoder = codec.map(|codec| {
-        let mut context = ffi::avcodec_alloc_context3(codec);
-        if context.is_null() {
-          panic!("avcodec_alloc_context3 failed");
-        }
-
-        (*context).sample_fmt = dst_sample_format;
-        (*context).sample_rate = dst_sample_rate;
-        (*context).time_base = ffi::AVRational { num: 1, den: dst_sample_rate };
-        (*context).bit_rate = self.params.bitrate.unwrap_or(64_000);
-        ffi::av_channel_layout_copy(&mut (*context).ch_layout, &self.layout);
-
-        let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
-        if ret < 0 {
-          ffi::avcodec_free_context(&mut context);
-          panic!("opening {:?} encoder failed: {}", (*codec).id, av_error_string(ret));
-        }
-
-        context
-      });
-
-      if let Some(encoder) = self.encoder {
-        self.fifo = ffi::av_audio_fifo_alloc(
-          (*encoder).sample_fmt,
-          (*encoder).ch_layout.nb_channels,
-          (*encoder).frame_size.max(1),
-        );
-        self.fifo_frame = ffi::av_frame_alloc();
-
-        (*self.fifo_frame).format = (*encoder).sample_fmt as i32;
-        ffi::av_channel_layout_copy(&mut (*self.fifo_frame).ch_layout, &(*encoder).ch_layout);
-        (*self.fifo_frame).sample_rate = (*encoder).sample_rate;
-        (*self.fifo_frame).nb_samples = (*encoder).frame_size;
-        let ret = ffi::av_frame_get_buffer(self.fifo_frame, 0);
-        assert!(ret >= 0, "av_frame_get_buffer: {}", av_error_string(ret));
-
-        self.packet = ffi::av_packet_alloc();
-        assert!(self.packet != std::ptr::null_mut(), "av_packet_alloc");
-      }
-    }
+  /// The time of the input message that produced `pts`. Earlier entries
+  /// belong to messages that produced no frame of their own and are dropped.
+  fn take_time(&mut self, pts: i64) -> Option<Duration> {
+    let i = self.pts_to_time.iter().position(|(p, _)| *p == pts)?;
+    let time = self.pts_to_time[i].1;
+    self.pts_to_time.drain(..=i);
+    Some(time)
   }
 
-  fn configure_resampler(&mut self, src_sample_format: ffi::AVSampleFormat, src_sample_rate: i32) {
-    if self.sampler_configured {
-      return;
-    }
-    self.sampler_configured = true;
-    self.sample_buffers.clear();
-    self.sample_buffers.resize(self.input_channels.range.len(), vec![]);
-    self.sample_times.clear();
-    self.sample_times.resize(self.input_channels.range.len(), None);
+  /// Chooses the raw input's output format and sets up its resamplers and
+  /// the frame pool.
+  fn configure_raw(&mut self, pool: &Mutex<FramePool>) {
+    let input = self.input.clone().expect("configure_raw without an input");
+    let src_sample_format = analog_to_sample_format(input.format);
+    let src_sample_rate = interval_to_rate(input.sample_interval, self.params.samplerate);
+    let output = choose_output(&self.params, &input, src_sample_format, src_sample_rate);
+    let channels = input.range.len();
+    self.layout = default_layout(channels);
+    self.single_layout = default_layout(1);
+    self.sample_buffers = vec![vec![]; channels];
+    self.sample_times = vec![None; channels];
+
+    *pool.lock().unwrap() = FramePool::new(FramePoolParams::Audio {
+      layout: self.layout,
+      format: output.sample_format,
+      samplerate: output.sample_rate,
+    }, self.generation);
 
     unsafe {
-      let (dst_sample_format, dst_sample_rate) = 
-        (self.dst_sample_format, self.dst_sample_rate);
-
-      self.dst_frame_pool = FramePool::new(FramePoolParams::Audio {
-        layout: self.layout,
-        format: dst_sample_format,
-        samplerate: dst_sample_rate
-      });
-
       let ret = ffi::swr_alloc_set_opts2(
         &mut self.multi_sampler,
-        &self.layout,
-        dst_sample_format,
-        dst_sample_rate,
-        &self.layout,
-        src_sample_format,
-        src_sample_rate,
-        0,
-        std::ptr::null_mut(),
-      );
+        &self.layout, output.sample_format, output.sample_rate,
+        &self.layout, src_sample_format, src_sample_rate,
+        0, std::ptr::null_mut());
       assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
       let ret = ffi::swr_init(self.multi_sampler);
       assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
 
-      self.single_samplers =self.input_channels.range.clone().map(|_| {
+      self.single_samplers = (0..channels).map(|_| {
         let mut sampler = std::ptr::null_mut();
         let ret = ffi::swr_alloc_set_opts2(
           &mut sampler,
-          &self.single_layout,
-          dst_sample_format,
-          dst_sample_rate,
-          &self.single_layout,
-          src_sample_format,
-          src_sample_rate,
-          0,
-          std::ptr::null_mut(),
-        );
+          &self.single_layout, output.sample_format, output.sample_rate,
+          &self.single_layout, src_sample_format, src_sample_rate,
+          0, std::ptr::null_mut());
         assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
         let ret = ffi::swr_init(sampler);
         assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
@@ -890,85 +777,50 @@ impl AudioConverter {
 
       // The reducer joins the single-channel samplers' outputs, which are
       // already in the destination format and rate, one plane per channel.
-      let reducer_sample_format = ffi::av_get_planar_sample_fmt(dst_sample_format);
+      let reducer_sample_format = ffi::av_get_planar_sample_fmt(output.sample_format);
       let ret = ffi::swr_alloc_set_opts2(
         &mut self.reducer_sampler,
-        &self.layout,
-        dst_sample_format,
-        dst_sample_rate,
-        &self.layout,
-        reducer_sample_format,
-        dst_sample_rate,
-        0,
-        std::ptr::null_mut(),
-      );
+        &self.layout, output.sample_format, output.sample_rate,
+        &self.layout, reducer_sample_format, output.sample_rate,
+        0, std::ptr::null_mut());
       assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
       let ret = ffi::swr_init(self.reducer_sampler);
       assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
-
-      let needs_decoding = self.decoder.is_some();
-      let needs_encoding = self.encoder.is_some();
-      let needs_sampling = dst_sample_rate != src_sample_rate || dst_sample_format != src_sample_format;
-      self.needs_conversion = needs_decoding || needs_encoding || needs_sampling;
     }
+    self.output = Some(output);
   }
 
-  /// The run of channels with the same format and sample interval that
-  /// starts at params.input_index (see AudioConverterParams). An index
-  /// outside the input gives no channels, which push rejects.
-  fn get_input_range(&self, input: &dyn AnalogData) -> InputChannels {
-    let encoding = input.encoding();
-    let kind = |i: i32| (input.analog_format(i), input.sample_interval(i));
-    let Some(range) = select_input_channels(self.params.input_index, input.num_channels(), kind) else {
-      return InputChannels {
-        range: 0..0,
-        names: vec![],
-        format: AnalogFormat::Double,
-        sample_interval: Duration::ZERO,
-        encoding,
-      };
-    };
-    let (format, sample_interval) = kind(range.start);
-    let names = range.clone().map(|i| input.name(i).to_string()).collect();
-    InputChannels { range, format, sample_interval, names, encoding }
-  }
-
-  fn convert_samples(&mut self, multi_sampler: *mut ffi::SwrContext, in_ptrs: &[*const u8], in_counts: &[i32], time: Duration, recursing: bool) {
+  /// Converts raw samples into frames of the output format and queues them in
+  /// `pool`. The pool is only locked to take and queue frames.
+  fn convert_samples(&mut self, pool: &Mutex<FramePool>, multi_sampler: *mut ffi::SwrContext, in_ptrs: &[*const u8], in_counts: &[i32], time: Duration, recursing: bool) {
+    let input_interval = self.input.as_ref().map_or(Duration::ZERO, |input| input.sample_interval);
+    let output = self.output.expect("convert_samples without an output");
     unsafe {
       if in_counts.iter().sum::<i32>() == 0 {
         return;
       }
       let first_count = in_counts[0];
-      let use_multi = 'check_multi: {
-        if recursing {
-          break 'check_multi true;
-        }
-        let sizes_equal = self.input_channels.range.clone().enumerate().all(|(i, _)| first_count == in_counts[i]);
-        let buffers_empty = self.sample_buffers.iter().all(|b|b.is_empty());
-        sizes_equal && buffers_empty
-      };
+      let use_multi = recursing || (
+        in_counts.iter().all(|c| *c == first_count) && self.sample_buffers.iter().all(|b| b.is_empty()));
 
       if use_multi {
         let pts = self.pts;
         self.pts_to_time.push_back((pts, time));
         self.pts += 1;
 
-        let in_samples = first_count;
-        let out_samples = ffi::swr_get_out_samples(multi_sampler, in_samples as i32);
-
-        let frame = self.dst_frame_pool.get_writable(out_samples as i32);
-        
-        let converted = ffi::swr_convert(multi_sampler, (*frame).extended_data, out_samples, in_ptrs.as_ptr(), in_samples as i32);
+        let out_samples = ffi::swr_get_out_samples(multi_sampler, first_count);
+        let frame = pool.lock().unwrap().get_writable(out_samples);
+        let converted = ffi::swr_convert(multi_sampler, (*frame).extended_data, out_samples, in_ptrs.as_ptr(), first_count);
         assert!(converted >= 0, "swr_convert: {}", av_error_string(converted));
         (*frame).nb_samples = converted;
         (*frame).pts = pts;
-        self.dst_frame_pool.push_pending(frame);
+        pool.lock().unwrap().push_pending(frame, self.generation);
       } else {
         // Buffers hold output-rate samples in the destination format; all
         // counts below are in samples and converted to bytes only to index.
-        let out_bps = ffi::av_get_bytes_per_sample(self.dst_sample_format) as usize;
-        let out_rate = self.dst_sample_rate;
-        for ui in 0..self.input_channels.range.len() {
+        let out_bps = ffi::av_get_bytes_per_sample(output.sample_format) as usize;
+        let out_rate = output.sample_rate;
+        for ui in 0..self.sample_buffers.len() {
           let in_samples = in_counts[ui];
           if in_samples == 0 {
             continue;
@@ -988,7 +840,7 @@ impl AudioConverter {
           // Time of the channel's first buffered sample. `time` is the time
           // of this message's last sample.
           self.sample_times[ui].get_or_insert_with(|| {
-            time.saturating_sub(self.input_channels.sample_interval * (in_samples - 1) as u32)
+            time.saturating_sub(input_interval * (in_samples - 1) as u32)
           });
         }
 
@@ -1013,7 +865,7 @@ impl AudioConverter {
             .collect();
           let counts = vec![min_samples as i32; ptrs.len()];
           // Recursing doesn't touch sample_buffers, so ptrs stay valid.
-          self.convert_samples(self.reducer_sampler, &ptrs, &counts, time, true);
+          self.convert_samples(pool, self.reducer_sampler, &ptrs, &counts, time, true);
         }
 
         for ((buffer, start), sample_time) in self.sample_buffers.iter_mut().zip(&starts).zip(self.sample_times.iter_mut()) {
@@ -1026,199 +878,148 @@ impl AudioConverter {
       }
     }
   }
+}
 
-  pub fn needs_conversion(&self) -> bool {
-    self.needs_conversion
-  }
-
-  pub fn reconfigure(&mut self, params: AudioConverterParams) {
-    self.params = params;
-    self.cleanup();
-  }
-
-  /// Queues `data`'s analog data for conversion, if it needs it.
-  pub fn push(&mut self, data: &dyn NodeData) {
-    let Some(input) = data.analog() else {
-      return;
-    };
-
-    if !self.decoder_configured {
-      let input_channels = self.get_input_range(input);
-      if input_channels.range.is_empty() || input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels) {
-        if !self.rejection_logged {
-          if input_channels.range.is_empty() {
-            println!(
-              "AudioConverter: Audio Index {} is outside the input's {} channels",
-              self.params.input_index, input.num_channels());
-          } else {
-            println!(
-              "AudioConverter can't convert {:?} ({:?}) input with a {:?} sample interval",
-              input_channels.format, input_channels.encoding, input_channels.sample_interval);
-          }
-        }
-        self.rejection_logged = true;
-        return;
-      }
-      self.configure_decoder(input_channels);
-    }
-
-    if let Some(_) = self.decoder {
-      let pts = self.pts;
-      self.pts_to_time.push_back((pts, data.time()));
-      self.pts += 1;
-
-      let plane = input.buffer();
-
-      let buffer_pos = self.in_buffer.len() - AV_INPUT_BUFFER_PADDING_SIZE as usize;
-      self.in_buffer.resize(self.in_buffer.len() + plane.len(), 0);
-
-      let end = buffer_pos+plane.len();
-      self.in_buffer[buffer_pos..end].copy_from_slice(plane);
-      self.slice_to_pts.push_back((end, pts));
-    } else {
-      let src_sample_format = analog_to_sample_format(self.input_channels.format);
-      let src_sample_rate = interval_to_rate(self.input_channels.sample_interval, self.params.samplerate);
-      self.configure_encoder(src_sample_format, src_sample_rate);
-      self.configure_resampler(src_sample_format, src_sample_rate);
-
-      let pointers: Vec<_> = self.input_channels.range.clone().map(|i| analog_data_ptr(input, i)).collect();
-      let counts: Vec<_> = self.input_channels.range.clone().map(|i| input.count(i) as i32).collect();
-      self.convert_samples(self.multi_sampler, pointers.as_slice(), counts.as_slice(), data.time(), false);
-    }
-  }
-
-  /// Drops the first `used` bytes of buffered input along with the pts slices
-  /// that end inside them.
-  fn consume_input(&mut self, used: usize) {
-    if used == 0 {
-      return;
-    }
-    self.in_buffer.drain(..used);
-    self.num_input_bytes += used as i64;
-    while self.slice_to_pts.front().is_some_and(|(end, _)| *end <= used) {
-      self.slice_to_pts.pop_front();
-    }
-    for (end, _) in self.slice_to_pts.iter_mut() {
-      *end -= used;
-    }
-  }
-
-  /// Parses buffered input until one packet is sent to the decoder. Returns
-  /// false when no complete packet is buffered. Only called after
-  /// avcodec_receive_frame returned EAGAIN, so the decoder accepts the packet.
-  fn send_next_packet(&mut self, decoder: *mut ffi::AVCodecContext) -> bool {
-    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
+impl Drop for InputState {
+  fn drop(&mut self) {
     unsafe {
-      loop {
-        let available = self.in_buffer.len().saturating_sub(padding);
-        if available == 0 {
-          return false;
-        }
-        let pts = self.slice_to_pts.front().map_or(ffi::AV_NOPTS_VALUE, |(_, pts)| *pts);
-
-        let used = ffi::av_parser_parse2(
-          self.parser, decoder,
-          &mut (*self.parser_packet).data,
-          &mut (*self.parser_packet).size,
-          self.in_buffer.as_ptr(),
-          available as i32,
-          pts, ffi::AV_NOPTS_VALUE,
-          self.num_input_bytes
-        );
-        assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
-
-        // The packet can point into in_buffer, so it has to be sent before
-        // consume_input shifts the buffer.
-        let sent = if (*self.parser_packet).size > 0 {
-          (*self.parser_packet).pts = (*self.parser).pts;
-          let ret = ffi::avcodec_send_packet(decoder, self.parser_packet);
-          if ret < 0 {
-            // A corrupt packet loses its audio but shouldn't stop the stream.
-            println!("AudioConverter: dropping undecodable packet: {}", av_error_string(ret));
-          }
-          ret >= 0
-        } else {
-          false
-        };
-        self.consume_input(used as usize);
-
-        if sent {
-          return true;
-        }
-        if used == 0 {
-          return false;
-        }
+      if !self.parser.is_null() {
+        ffi::av_parser_close(self.parser);
       }
+      if !self.parser_packet.is_null() {
+        ffi::av_packet_free(&mut self.parser_packet);
+      }
+      if !self.multi_sampler.is_null() {
+        ffi::swr_free(&mut self.multi_sampler);
+      }
+      if !self.reducer_sampler.is_null() {
+        ffi::swr_free(&mut self.reducer_sampler);
+      }
+      for sampler in self.single_samplers.iter_mut() {
+        ffi::swr_free(sampler);
+      }
+      ffi::av_channel_layout_uninit(&mut self.layout);
+      ffi::av_channel_layout_uninit(&mut self.single_layout);
+    }
+  }
+}
+
+/// What pull works on, under the codec lock, which push never takes: the
+/// decoder, the encoder and what feeds them. Rebuilt whenever the input
+/// side's generation changes.
+pub struct CodecState {
+  generation: u64,
+  /// Copied from the input side, for AudioOutput.
+  input: Option<InputChannels>,
+  output: Option<OutputConfig>,
+  layout: ffi::AVChannelLayout,
+
+  // Encoded input
+  decoder: Option<*mut ffi::AVCodecContext>,
+  decoder_frame: *mut ffi::AVFrame,
+  /// The next parsed packet, copied out of the parser's buffer so decoding
+  /// doesn't hold the input lock.
+  packet_in: *mut ffi::AVPacket,
+  decoded_sampler: *mut ffi::SwrContext,
+
+  // Encoded output
+  encoder: Option<*mut ffi::AVCodecContext>,
+  fifo: *mut ffi::AVAudioFifo,
+  fifo_frame: *mut ffi::AVFrame,
+  packet: *mut ffi::AVPacket,
+  encoder_pts: i64,
+  out_buffer: Vec<u8>,
+}
+
+// SAFETY: the FFmpeg contexts are only used under the codec mutex.
+unsafe impl Send for CodecState {}
+
+impl CodecState {
+  fn new(generation: u64) -> CodecState {
+    CodecState {
+      generation,
+      input: None,
+      output: None,
+      layout: unsafe { std::mem::zeroed() },
+      decoder: None,
+      decoder_frame: std::ptr::null_mut(),
+      packet_in: std::ptr::null_mut(),
+      decoded_sampler: std::ptr::null_mut(),
+      encoder: None,
+      fifo: std::ptr::null_mut(),
+      fifo_frame: std::ptr::null_mut(),
+      packet: std::ptr::null_mut(),
+      encoder_pts: 0,
+      out_buffer: vec![],
     }
   }
 
-  /// The next frame to output or encode: a decoded (and, if needed,
-  /// resampled) frame for encoded input, or a converted frame for raw input.
-  fn next_frame(&mut self) -> Option<*mut ffi::AVFrame> {
-    let Some(decoder) = self.decoder else {
-      return self.dst_frame_pool.get_pending();
-    };
+  fn open_decoder(&mut self) -> *mut ffi::AVCodecContext {
+    if let Some(decoder) = self.decoder {
+      return decoder;
+    }
+    let input = self.input.as_ref().expect("open_decoder without an input");
     unsafe {
-      loop {
-        let ret = ffi::avcodec_receive_frame(decoder, self.decoder_frame);
-        if ret == AVERROR_EAGAIN {
-          if !self.send_next_packet(decoder) {
-            return None;
-          }
-          continue;
-        }
-        if ret == AVERROR_EOF {
-          return None;
-        }
-        assert!(ret >= 0, "avcodec_receive_frame: {}", av_error_string(ret));
-        break;
+      let codec_id = encoding_codec(input.encoding);
+      let codec = ffi::avcodec_find_decoder(codec_id);
+      if codec.is_null() {
+        panic!("no {:?} decoder in this FFmpeg build", codec_id);
       }
-
-      let src_sample_format = std::mem::transmute::<i32, ffi::AVSampleFormat>((*self.decoder_frame).format);
-      let src_sample_rate = (*self.decoder_frame).sample_rate;
-      let nb_samples = (*self.decoder_frame).nb_samples;
-      self.configure_encoder(src_sample_format, src_sample_rate);
-      self.configure_resampler(src_sample_format, src_sample_rate);
-
-      // Already in the output format: hand out a new reference to the
-      // decoded buffers instead of converting. decoder_frame is reused by the
-      // next avcodec_receive_frame, so it can't be handed out itself.
-      let same_layout = ffi::av_channel_layout_compare(&(*self.decoder_frame).ch_layout, &self.layout) == 0;
-      if same_layout && src_sample_format == self.dst_sample_format && src_sample_rate == self.dst_sample_rate {
-        let frame = ffi::av_frame_clone(self.decoder_frame);
-        assert!(!frame.is_null(), "av_frame_clone failed");
-        ffi::av_frame_unref(self.decoder_frame);
-        return Some(frame);
+      let mut context = ffi::avcodec_alloc_context3(codec);
+      assert!(!context.is_null(), "avcodec_alloc_context3 failed");
+      (*context).pkt_timebase = encoder_time_base(input.sample_interval);
+      (*context).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+      let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
+      if ret < 0 {
+        ffi::avcodec_free_context(&mut context);
+        panic!("opening {:?} decoder failed: {}", codec_id, av_error_string(ret));
       }
-
-      let out_samples = ffi::swr_get_out_samples(self.multi_sampler, nb_samples);
-      assert!(out_samples >= 0, "swr_get_out_samples: {}", av_error_string(out_samples));
-      let frame = self.dst_frame_pool.get_writable(out_samples);
-      let converted = ffi::swr_convert(
-        self.multi_sampler,
-        (*frame).extended_data,
-        out_samples,
-        (*self.decoder_frame).extended_data as *const *const u8,
-        nb_samples);
-      assert!(converted >= 0, "swr_convert: {}", av_error_string(converted));
-      (*frame).nb_samples = converted;
-      (*frame).pts = (*self.decoder_frame).pts;
-      ffi::av_frame_unref(self.decoder_frame);
-      self.dst_frame_pool.push_pending(frame);
-      self.dst_frame_pool.get_pending()
+      self.decoder = Some(context);
+      self.decoder_frame = ffi::av_frame_alloc();
+      self.packet_in = ffi::av_packet_alloc();
+      assert!(!self.decoder_frame.is_null() && !self.packet_in.is_null(), "allocating decoder frame and packet failed");
+      context
     }
   }
 
-  /// The time of the input message that produced `pts`. Earlier entries
-  /// belong to messages that produced no frame of their own and are dropped.
-  fn take_time(&mut self, pts: i64) -> Duration {
-    match self.pts_to_time.iter().position(|(p, _)| *p == pts) {
-      Some(i) => {
-        let time = self.pts_to_time[i].1;
-        self.pts_to_time.drain(..=i);
-        time
+  fn open_encoder(&mut self, codec_id: ffi::AVCodecID, output: &OutputConfig) -> *mut ffi::AVCodecContext {
+    if let Some(encoder) = self.encoder {
+      return encoder;
+    }
+    let channels = self.input.as_ref().map_or(0, |input| input.range.len());
+    unsafe {
+      ffi::av_channel_layout_uninit(&mut self.layout);
+      self.layout = default_layout(channels);
+      let codec = ffi::avcodec_find_encoder(codec_id);
+      if codec.is_null() {
+        panic!("no {:?} encoder in this FFmpeg build", codec_id);
       }
-      None => self.api.time(),
+      let mut context = ffi::avcodec_alloc_context3(codec);
+      assert!(!context.is_null(), "avcodec_alloc_context3 failed");
+      (*context).sample_fmt = output.sample_format;
+      (*context).sample_rate = output.sample_rate;
+      (*context).time_base = ffi::AVRational { num: 1, den: output.sample_rate };
+      (*context).bit_rate = output.bitrate;
+      ffi::av_channel_layout_copy(&mut (*context).ch_layout, &self.layout);
+      let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
+      if ret < 0 {
+        ffi::avcodec_free_context(&mut context);
+        panic!("opening {:?} encoder failed: {}", codec_id, av_error_string(ret));
+      }
+
+      self.fifo = ffi::av_audio_fifo_alloc((*context).sample_fmt, (*context).ch_layout.nb_channels, (*context).frame_size.max(1));
+      self.fifo_frame = ffi::av_frame_alloc();
+      (*self.fifo_frame).format = (*context).sample_fmt as i32;
+      ffi::av_channel_layout_copy(&mut (*self.fifo_frame).ch_layout, &(*context).ch_layout);
+      (*self.fifo_frame).sample_rate = (*context).sample_rate;
+      (*self.fifo_frame).nb_samples = (*context).frame_size;
+      let ret = ffi::av_frame_get_buffer(self.fifo_frame, 0);
+      assert!(ret >= 0, "av_frame_get_buffer: {}", av_error_string(ret));
+      self.packet = ffi::av_packet_alloc();
+      assert!(!self.packet.is_null(), "av_packet_alloc");
+      self.encoder_pts = 0;
+      self.encoder = Some(context);
+      context
     }
   }
 
@@ -1270,27 +1071,317 @@ impl AudioConverter {
       }
     }
   }
-
-  /// One output per frame. Encoded outputs are emitted even when the encoder
-  /// produced no packets yet: the buffer is empty and encoded_count is the
-  /// number of samples pushed.
-  pub fn pull(&mut self) -> Option<AudioOutput<'_>> {
-    let frame = self.next_frame()?;
-    let time = self.take_time(unsafe { (*frame).pts });
-    let Some(encoder) = self.encoder else {
-      return Some(AudioOutput { converter: self, frame: Some(frame), time, encoded_count: 0 });
-    };
-    self.out_buffer.clear();
-    let encoded_count = self.encode_frame(encoder, frame);
-    Some(AudioOutput { converter: self, frame: None, time, encoded_count })
-  }
 }
 
-impl Drop for AudioConverter {
+impl Drop for CodecState {
   fn drop(&mut self) {
-    self.cleanup();
+    unsafe {
+      if let Some(mut decoder) = self.decoder.take() {
+        ffi::avcodec_free_context(&mut decoder);
+      }
+      if let Some(mut encoder) = self.encoder.take() {
+        ffi::avcodec_free_context(&mut encoder);
+      }
+      if !self.fifo.is_null() {
+        ffi::av_audio_fifo_free(self.fifo);
+      }
+      ffi::av_frame_free(&mut self.decoder_frame);
+      ffi::av_frame_free(&mut self.fifo_frame);
+      ffi::av_packet_free(&mut self.packet_in);
+      ffi::av_packet_free(&mut self.packet);
+      if !self.decoded_sampler.is_null() {
+        ffi::swr_free(&mut self.decoded_sampler);
+      }
+      ffi::av_channel_layout_uninit(&mut self.layout);
+    }
   }
 }
+
+/// Converts analog data to a target audio format. It's Sync: push and pull
+/// can run on different threads at once. push only takes the input lock (and
+/// the frame pool's, briefly); pull holds the codec lock for its decoding and
+/// encoding and takes the input and pool locks only to parse one packet or
+/// take one frame. Raw input is converted in push, encoded input decoded in
+/// pull.
+///
+/// Locks are always taken in the order codec, input, pool. A reset from the
+/// push side bumps the input generation; pull rebuilds its codec state when
+/// it sees the change.
+pub struct AudioConverter {
+  api: ThalamusAPIThreadSafe,
+  codec: Mutex<CodecState>,
+  input: Mutex<InputState>,
+  pool: Mutex<FramePool>,
+}
+
+impl AudioConverter {
+  pub fn new(api: ThalamusAPIThreadSafe, params: AudioConverterParams) -> AudioConverter {
+    AudioConverter {
+      api,
+      codec: Mutex::new(CodecState::new(0)),
+      input: Mutex::new(InputState::new(params, 0)),
+      pool: Mutex::new(FramePool::new(FramePoolParams::empty(), 0)),
+    }
+  }
+
+  /// Starts over with `params`; pull picks it up without push waiting for it.
+  pub fn reconfigure(&self, params: AudioConverterParams) {
+    let mut input = self.input.lock().unwrap();
+    let generation = input.generation + 1;
+    *input = InputState::new(params, generation);
+    *self.pool.lock().unwrap() = FramePool::new(FramePoolParams::empty(), generation);
+  }
+
+  /// Starts over with the current parameters, e.g. when the input's channels
+  /// change.
+  pub fn channels_changed(&self) {
+    let params = self.input.lock().unwrap().params;
+    self.reconfigure(params);
+  }
+
+  /// Queues `data`'s analog data for conversion. Raw input is converted here;
+  /// encoded input is queued for the parser.
+  pub fn push(&self, data: &dyn NodeData) {
+    let Some(analog) = data.analog() else {
+      return;
+    };
+    let mut guard = self.input.lock().unwrap();
+    let state = &mut *guard;
+
+    if state.input.is_none() {
+      let input_channels = get_input_range(&state.params, analog);
+      if input_channels.range.is_empty() || input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels) {
+        if !state.rejection_logged {
+          if input_channels.range.is_empty() {
+            println!(
+              "AudioConverter: Audio Index {} is outside the input's {} channels",
+              state.params.input_index, analog.num_channels());
+          } else {
+            println!(
+              "AudioConverter can't convert {:?} ({:?}) input with a {:?} sample interval",
+              input_channels.format, input_channels.encoding, input_channels.sample_interval);
+          }
+        }
+        state.rejection_logged = true;
+        return;
+      }
+      if input_channels.format == AnalogFormat::Encoded {
+        state.configure_parser(input_channels.encoding);
+      }
+      state.input = Some(input_channels);
+    }
+
+    let (encoded, range) = {
+      let input = state.input.as_ref().unwrap();
+      (input.format == AnalogFormat::Encoded, input.range.clone())
+    };
+    if encoded {
+      state.queue_encoded(data.time(), analog.buffer());
+      return;
+    }
+
+    if state.output.is_none() {
+      state.configure_raw(&self.pool);
+    }
+    let pointers: Vec<_> = range.clone().map(|i| analog_data_ptr(analog, i)).collect();
+    let counts: Vec<_> = range.map(|i| analog.count(i) as i32).collect();
+    let multi_sampler = state.multi_sampler;
+    state.convert_samples(&self.pool, multi_sampler, &pointers, &counts, data.time(), false);
+  }
+
+  /// Parses buffered input until one packet is ready and sends it to the
+  /// decoder. The input lock is only held to parse: the packet is copied out
+  /// first, and decoding (which avcodec_send_packet starts) runs without it.
+  /// Returns false when no complete packet is buffered or the input side was
+  /// reset. Only called after avcodec_receive_frame returned EAGAIN, so the
+  /// decoder accepts the packet.
+  fn send_next_packet(&self, codec: &mut CodecState, decoder: *mut ffi::AVCodecContext) -> bool {
+    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    unsafe {
+      {
+        let mut input = self.input.lock().unwrap();
+        if input.generation != codec.generation {
+          return false;
+        }
+        loop {
+          let available = input.in_buffer.len().saturating_sub(padding);
+          if available == 0 {
+            return false;
+          }
+          let pts = input.slice_to_pts.front().map_or(ffi::AV_NOPTS_VALUE, |(_, pts)| *pts);
+          let used = ffi::av_parser_parse2(
+            input.parser, decoder,
+            &mut (*input.parser_packet).data,
+            &mut (*input.parser_packet).size,
+            input.in_buffer.as_ptr(),
+            available as i32,
+            pts, ffi::AV_NOPTS_VALUE,
+            input.num_input_bytes
+          );
+          assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
+
+          // The parsed packet can point into in_buffer, so it's copied before
+          // consume_input shifts the buffer.
+          let got_packet = (*input.parser_packet).size > 0;
+          if got_packet {
+            (*input.parser_packet).pts = (*input.parser).pts;
+            let ret = ffi::av_packet_ref(codec.packet_in, input.parser_packet);
+            assert!(ret >= 0, "av_packet_ref: {}", av_error_string(ret));
+          }
+          input.consume_input(used as usize);
+
+          if got_packet {
+            break;
+          }
+          if used == 0 {
+            return false;
+          }
+        }
+      }
+
+      let ret = ffi::avcodec_send_packet(decoder, codec.packet_in);
+      ffi::av_packet_unref(codec.packet_in);
+      if ret < 0 {
+        // A corrupt packet loses its audio but shouldn't stop the stream.
+        println!("AudioConverter: dropping undecodable packet: {}", av_error_string(ret));
+      }
+      true
+    }
+  }
+
+  /// The next decoded frame in the output format, or None when more input is
+  /// needed.
+  fn next_decoded_frame(&self, codec: &mut CodecState) -> Option<*mut ffi::AVFrame> {
+    let decoder = codec.open_decoder();
+    unsafe {
+      loop {
+        let ret = ffi::avcodec_receive_frame(decoder, codec.decoder_frame);
+        if ret == AVERROR_EAGAIN {
+          if !self.send_next_packet(codec, decoder) {
+            return None;
+          }
+          continue;
+        }
+        if ret == AVERROR_EOF {
+          return None;
+        }
+        assert!(ret >= 0, "avcodec_receive_frame: {}", av_error_string(ret));
+        break;
+      }
+
+      let decoder_frame = codec.decoder_frame;
+      let src_sample_format = std::mem::transmute::<i32, ffi::AVSampleFormat>((*decoder_frame).format);
+      let src_sample_rate = (*decoder_frame).sample_rate;
+      let nb_samples = (*decoder_frame).nb_samples;
+
+      // The output format depends on what the decoder produces, so it's
+      // chosen here, from the first decoded frame.
+      if codec.output.is_none() {
+        let params = self.input.lock().unwrap().params;
+        let input = codec.input.clone().expect("decoding without an input");
+        let output = choose_output(&params, &input, src_sample_format, src_sample_rate);
+        ffi::av_channel_layout_uninit(&mut codec.layout);
+        codec.layout = default_layout(input.range.len());
+        let ret = ffi::swr_alloc_set_opts2(
+          &mut codec.decoded_sampler,
+          &codec.layout, output.sample_format, output.sample_rate,
+          &codec.layout, src_sample_format, src_sample_rate,
+          0, std::ptr::null_mut());
+        assert!(ret >= 0, "swr_alloc_set_opts2: {}", av_error_string(ret));
+        let ret = ffi::swr_init(codec.decoded_sampler);
+        assert!(ret >= 0, "swr_init: {}", av_error_string(ret));
+        {
+          let mut pool = self.pool.lock().unwrap();
+          if pool.generation != codec.generation {
+            ffi::av_frame_unref(decoder_frame);
+            return None;
+          }
+          *pool = FramePool::new(FramePoolParams::Audio {
+            layout: codec.layout,
+            format: output.sample_format,
+            samplerate: output.sample_rate,
+          }, codec.generation);
+        }
+        codec.output = Some(output);
+      }
+      let output = codec.output.unwrap();
+
+      // Already in the output format: hand out a new reference to the
+      // decoded buffers instead of converting. decoder_frame is reused by the
+      // next avcodec_receive_frame, so it can't be handed out itself.
+      let same_layout = ffi::av_channel_layout_compare(&(*decoder_frame).ch_layout, &codec.layout) == 0;
+      if same_layout && src_sample_format == output.sample_format && src_sample_rate == output.sample_rate {
+        let frame = ffi::av_frame_clone(decoder_frame);
+        assert!(!frame.is_null(), "av_frame_clone failed");
+        ffi::av_frame_unref(decoder_frame);
+        return Some(frame);
+      }
+
+      let out_samples = ffi::swr_get_out_samples(codec.decoded_sampler, nb_samples);
+      assert!(out_samples >= 0, "swr_get_out_samples: {}", av_error_string(out_samples));
+      let frame = self.pool.lock().unwrap().get_writable(out_samples);
+      let converted = ffi::swr_convert(
+        codec.decoded_sampler,
+        (*frame).extended_data,
+        out_samples,
+        (*decoder_frame).extended_data as *const *const u8,
+        nb_samples);
+      assert!(converted >= 0, "swr_convert: {}", av_error_string(converted));
+      (*frame).nb_samples = converted;
+      (*frame).pts = (*decoder_frame).pts;
+      ffi::av_frame_unref(decoder_frame);
+
+      let mut pool = self.pool.lock().unwrap();
+      if !pool.push_pending(frame, codec.generation) {
+        return None;
+      }
+      pool.get_pending(codec.generation)
+    }
+  }
+
+  /// The next converted message: one per frame. Encoded outputs are emitted
+  /// even when the encoder produced no packets yet: the buffer is empty and
+  /// encoded_count is the number of samples pushed.
+  pub fn pull(&self) -> Option<AudioOutput<'_>> {
+    let mut codec = self.codec.lock().unwrap();
+
+    // Catch up with the input side: a reset there starts the codec state
+    // over, and raw input's output format is chosen there.
+    let encoded = {
+      let input = self.input.lock().unwrap();
+      if codec.generation != input.generation {
+        *codec = CodecState::new(input.generation);
+      }
+      let input_channels = input.input.as_ref()?;
+      if codec.input.is_none() {
+        codec.input = Some(input_channels.clone());
+      }
+      let encoded = input_channels.format == AnalogFormat::Encoded;
+      if !encoded && codec.output.is_none() {
+        codec.output = input.output;
+      }
+      encoded
+    };
+
+    let frame = if encoded {
+      self.next_decoded_frame(&mut codec)?
+    } else {
+      self.pool.lock().unwrap().get_pending(codec.generation)?
+    };
+    let pts = unsafe { (*frame).pts };
+    let time = self.input.lock().unwrap().take_time(pts).unwrap_or_else(|| self.api.time());
+
+    let output = codec.output.expect("a converted frame without an output format");
+    let Some(codec_id) = output.codec_id else {
+      return Some(AudioOutput { codec, frame: Some(frame), time, encoded_count: 0 });
+    };
+    let encoder = codec.open_encoder(codec_id, &output);
+    codec.out_buffer.clear();
+    let encoded_count = codec.encode_frame(encoder, frame);
+    Some(AudioOutput { codec, frame: None, time, encoded_count })
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -1331,6 +1422,12 @@ mod tests {
     assert_eq!(samples_to_duration(1, 44100), Duration::from_nanos(22676));
     assert_eq!(duration_to_samples(Duration::from_secs(3600), 44100), 44_100 * 3600);
     assert_eq!(duration_to_samples(Duration::from_nanos(22675), 44100), 1);
+  }
+
+  #[test]
+  fn audio_converter_can_be_shared_between_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AudioConverter>();
   }
 
   #[test]
