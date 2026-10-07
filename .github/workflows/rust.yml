@@ -68,7 +68,7 @@ jobs:
         echo C:\msys64\ucrt64\bin >> $env:GITHUB_PATH
     - run: |
         pacman --noconfirm -Syu
-        pacman --noconfirm -S make
+        pacman --noconfirm -S make pkgconf
     #- run: winget install --accept-package-agreements --accept-source-agreements --disable-interactivity NASM.NASM
     - run: |
         make --version
@@ -76,6 +76,7 @@ jobs:
         Get-Command perl
         Get-Command cmake
         Get-Command nasm
+        Get-Command pkg-config
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
