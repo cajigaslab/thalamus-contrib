@@ -35,6 +35,11 @@ endif()
 message("System FFmpeg 7.x not found, building FFmpeg from source")
 file(WRITE "${CMAKE_BINARY_DIR}/ffmpeg_provider.txt" "source")
 
+# FFmpeg's libopenh264 H.264 encoder, built against a stub; the plugin loads
+# Cisco's OpenH264 binary at run time. Sets OPENH264_STUB_TARGET and
+# OPENH264_PKG_CONFIG_DIR.
+include(${CMAKE_CURRENT_LIST_DIR}/openh264.cmake)
+
 FetchContent_Declare(
   ffmpeg 
   GIT_REPOSITORY https://github.com/FFmpeg/FFmpeg.git
@@ -104,6 +109,16 @@ set_target_properties(ffmpeg_m PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>"
   OUTPUT_NAME m)
 
+# pkg-config search path for configure's library checks. Windows' native
+# pkg-config separates entries with ';', which has to be a generator
+# expression to survive as one argument of the command below.
+if(WIN32)
+  set(FFMPEG_PKG_CONFIG_SEP "$<SEMICOLON>")
+else()
+  set(FFMPEG_PKG_CONFIG_SEP ":")
+endif()
+set(FFMPEG_PKG_CONFIG_PATH "${OPENH264_PKG_CONFIG_DIR}${FFMPEG_PKG_CONFIG_SEP}${ZLIB_PKG_CONFIG_DIR}${FFMPEG_PKG_CONFIG_SEP}${SDL_PKG_CONFIG_DIR}")
+
 if(WIN32)
   set(FFMPEG_POST_CONFIG && sed -i s/LIBPREF=lib/LIBPREF=/ ffbuild/config.mak
                          && sed -i s/LIBSUF=.a/LIBSUF=.lib/ ffbuild/config.mak)
@@ -111,10 +126,12 @@ endif()
 
 add_custom_command(
   OUTPUT "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/Makefile"
-  DEPENDS ffmpeg_m
+  DEPENDS ffmpeg_m ${OPENH264_STUB_TARGET}
   COMMAND cmake -E env 
-  "PKG_CONFIG_PATH=${ZLIB_PKG_CONFIG_DIR}:${SDL_PKG_CONFIG_DIR}"
-  sh "${ffmpeg_SOURCE_DIR}/configure" ${FFMPEG_EXTRA_FLAGS} "--cc=${FFMPEG_COMPILER}" "--cxx=${FFMPEG_CXX_COMPILER}" "--extra-cflags=${FFMPEG_EXTRA_CFLAGS}" "--extra-cxxflags=${FFMPEG_EXTRA_CXXFLAGS}" "--extra-ldflags=${FFMPEG_EXTRA_LDFLAGS}" --enable-static --disable-shared --disable-sndio $<IF:$<CONFIG:Debug>,--enable-debug,> --prefix=${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install
+  "PKG_CONFIG_PATH=${FFMPEG_PKG_CONFIG_PATH}"
+  sh "${ffmpeg_SOURCE_DIR}/configure" ${FFMPEG_EXTRA_FLAGS}
+    # Only the encoder: FFmpeg's own h264 decoder decodes.
+    --enable-libopenh264 --disable-decoder=libopenh264 "--cc=${FFMPEG_COMPILER}" "--cxx=${FFMPEG_CXX_COMPILER}" "--extra-cflags=${FFMPEG_EXTRA_CFLAGS}" "--extra-cxxflags=${FFMPEG_EXTRA_CXXFLAGS}" "--extra-ldflags=${FFMPEG_EXTRA_LDFLAGS}" --enable-static --disable-shared --disable-sndio $<IF:$<CONFIG:Debug>,--enable-debug,> --prefix=${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install
   && cmake -E touch_nocreate "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/Makefile"
   ${FFMPEG_POST_CONFIG}
   WORKING_DIRECTORY "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>")

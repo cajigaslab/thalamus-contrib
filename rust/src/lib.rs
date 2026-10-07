@@ -23,6 +23,7 @@ mod imgui_window;
 mod media_converter;
 mod mic_node;
 mod node_copy;
+mod openh264;
 mod rtmps_node;
 mod rtmps_publisher;
 mod sleeve_node;

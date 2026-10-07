@@ -54,9 +54,12 @@ def widgets():
     'MEDIA_CONVERTER': Factory(None, [
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
       UserData(UserDataType.COMBO_BOX, 'Video Format', 'RGB', [
-        'Passthrough', 'Decoded', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4'
+        'Passthrough', 'Decoded', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4', 'H264'
       ]),
+      # MPEG4 quantizer scale, 1-31, lower is better.
       UserData(UserDataType.SPINBOX, 'Video Quality', 5, []),
+      # H264 quantization parameter (QP), 1-51, lower is better.
+      UserData(UserDataType.SPINBOX, 'Quantization', 23, []),
       UserData(UserDataType.SPINBOX, 'Video Width', 0, []),
       UserData(UserDataType.SPINBOX, 'Video Height', 0, []),
       UserData(UserDataType.CHECK_BOX, 'Complete Frames', False, []),

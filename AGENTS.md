@@ -37,8 +37,29 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   `.cargo/config.toml`. After one `hatch build`, `cd rust; cargo test` works.
 - `cmake/ffmpeg.cmake` uses a system FFmpeg 7.x if pkg-config finds one,
   otherwise builds FFmpeg from source (`build/<config>/ffmpeg_provider.txt`
-  says which). The source build enables every native FFmpeg codec but no
-  external libraries (no libx264, libopus, libfdk_aac, libmp3lame).
+  says which). The source build enables every native FFmpeg codec plus
+  FFmpeg's libopenh264 H.264 encoder (no libx264, libopus, libfdk_aac,
+  libmp3lame).
+- OpenH264 itself isn't built or linked: Cisco's binary is only covered by
+  Cisco's H.264 patent license when users download it separately and can
+  turn it off. Thalamus downloads it into `~/.thalamus` at startup
+  (`thalamus/openh264.py`, SHA-256 pinned) unless the user opted out in
+  Preferences > H264, which creates `~/.thalamus/.no_openh264`; the binary
+  is then deleted at the next startup.
+  - `cmake/openh264.cmake` builds FFmpeg's wrapper (`--enable-libopenh264
+    --disable-decoder=libopenh264`) against the vendored OpenH264 2.6.0 API
+    headers (`cmake/openh264/include`, BSD) and a stub library
+    (`cmake/openh264/stub.c`) that only FFmpeg's configure check and tools
+    link.
+  - The plugin defines the encoder functions FFmpeg calls,
+    `WelsCreateSVCEncoder`/`WelsDestroySVCEncoder` (`rust/src/openh264.rs`),
+    and forwards them to Cisco's binary loaded with libloading. It's used
+    whenever the file is present; creating an encoder fails when it's
+    missing or isn't 2.6.0 (its structs must match the headers), and opening
+    FFmpeg's encoder fails.
+  - Upgrading OpenH264 means updating the headers, `VERSION` in
+    `openh264.rs`, and the names and hashes in `thalamus/openh264.py`
+    together.
 - Windows uses the dynamic CRT everywhere (Rust and skia's prebuilt library
   do); new native dependencies must too.
 - If FFmpeg rebuilds unexpectedly, run `ninja -n -d explain`: two different
@@ -168,8 +189,17 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     outputs encoded input as the decoder produces it: the decoder's pixel
     format, or for AAC (decoded as floats) doubles, since Thalamus has no
     float format.
-  - `Video Quality`, `Video Width`, `Video Height`, and `Complete Frames`
-    (MPEG4 input arrives one whole frame per message; see below).
+  - `Video Quality` (MPEG4 quantizer scale, 1-31) and `Quantization` (H264
+    QP, 1-51; libopenh264 has no quantizer-scale mode, so it's set as
+    qmin = qmax); lower is better, 0 uses the codec default (5, 23).
+  - `Video Width`, `Video Height` and `Complete Frames` (encoded input
+    arrives one whole frame per message; see below).
+  - Encoded video formats: `MPEG4` (FFmpeg's encoder) and `H264` (FFmpeg's
+    libopenh264 encoder on Cisco's binary, see above; decoded by FFmpeg's
+    own h264 decoder). H264 is YUV420P only, frames up to 36864 macroblocks
+    (e.g. 4096x2304). While the OpenH264 binary isn't downloaded, H264
+    frames are dropped (logged once) and the encoder is opened as soon as
+    it appears.
   - `Audio Bit Rate` (kbit/s for the whole stream, 0 = 256) and `Audio Sample Rate` (0 = source
     rate).
   - `Audio Index`: the input channel to start at, forwards from 0, 1, ... or

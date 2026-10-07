@@ -523,6 +523,7 @@ impl<'a> ImageData for ExtNodeData<'a> {
         ThalamusImageFormat::ThalamusImageFormat_MJPEG => ImageFormat::MJPEG,
         ThalamusImageFormat::ThalamusImageFormat_MPEG1 => ImageFormat::MPEG1,
         ThalamusImageFormat::ThalamusImageFormat_MPEG4 => ImageFormat::MPEG4,
+        ThalamusImageFormat::ThalamusImageFormat_H264 => ImageFormat::H264,
         ThalamusImageFormat::ThalamusImageFormat_Gray16 => ImageFormat::Gray16,
         ThalamusImageFormat::ThalamusImageFormat_RGB16 => ImageFormat::RGB16,
         other => panic!("Unknown ThalamusImageFormat {}", other.0),
@@ -954,6 +955,16 @@ impl ThalamusAPIThreadSafe {
 }
 
 impl ThalamusAPI {
+  /// The root of Thalamus's state tree (the whole config), from the host's
+  /// state_root. None on a Thalamus without it; State::root finds the same
+  /// root from any state in the tree.
+  pub fn global_root(&self) -> Option<State> {
+    let state_root = unsafe { &*self.raw }.state_root?;
+    let state = unsafe { state_root() };
+    // state_root returns a new reference, like state_parent.
+    (!state.is_null()).then_some(State { api: *self, state })
+  }
+
   /// The number of fields after `name` in the ThalamusAnalogNodes Thalamus
   /// provides (2 once `buffer` and `encoding` exist, 4 once `format` and
   /// `encoded_count` do, 5 once `channels_changed` does), or 0 if the running
@@ -2626,6 +2637,17 @@ impl State {
     //State::new
   }
 
+  /// The root of the tree this state belongs to, found by walking parent()
+  /// until it returns null; this state itself if it has no parent. For a
+  /// node's state that's the whole config (see also ThalamusAPI::global_root).
+  pub fn root(&self) -> State {
+    let mut root = self.clone();
+    while let Some(parent) = root.parent() {
+      root = parent;
+    }
+    root
+  }
+
   pub fn key_of(&self, val: &State) -> Option<StateKey> {
     let key = unsafe { ((&*self.api.raw).state_key_of.unwrap())(self.state, val.state) };
 
@@ -3195,6 +3217,8 @@ pub enum ImageFormat {
   MJPEG,
   MPEG1,
   MPEG4,
+  /// Encoded H.264, Annex B (start code delimited), one frame per message.
+  H264,
   /// One 16-bit sample per pixel, in the platform's native byte order, using
   /// the full 0..65535 range.
   Gray16,

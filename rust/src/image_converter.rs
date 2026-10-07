@@ -34,7 +34,10 @@ pub struct ConverterParams {
   pub format: Option<VideoFormat>,
   pub width: Option<i32>,
   pub height: Option<i32>,
+  /// MPEG4 quantizer scale, 1-31, lower is better.
   pub quality: Option<i32>,
+  /// H264 quantization parameter (QP), 1-51, lower is better.
+  pub quantization: Option<i32>,
   /// Each encoded input message holds exactly one whole frame. The parser is
   /// told so and given one message at a time, which saves it from waiting for
   /// the next frame's start before returning a packet: one frame less latency.
@@ -42,12 +45,15 @@ pub struct ConverterParams {
 }
 
 fn is_compressed(format: ImageFormat) -> bool {
-  format == ImageFormat::MPEG4
+  matches!(format, ImageFormat::MPEG4 | ImageFormat::H264)
 }
 
 fn format_codec(format: ImageFormat) -> ffi::AVCodecID {
   match format {
     ImageFormat::MPEG4 => ffi::AVCodecID::AV_CODEC_ID_MPEG4,
+    // Encoded with FFmpeg's libopenh264 wrapper (FFmpeg has no H.264 encoder
+    // of its own), decoded with FFmpeg's h264 decoder.
+    ImageFormat::H264 => ffi::AVCodecID::AV_CODEC_ID_H264,
     _ => panic!("Unsupported format")
   }
 }
@@ -56,24 +62,51 @@ fn format_codec(format: ImageFormat) -> ffi::AVCodecID {
 struct CodecLimits {
   /// The largest width or height the bitstream can describe.
   max_dimension: i32,
-  /// The quantizer scales `quality` may select.
+  /// The largest frame, in pixels, the encoder accepts.
+  max_pixels: i64,
+  /// The quantizer values `quality` may select, in the codec's own scale
+  /// (lower is better), and the one used when no quality is set.
   qscale: (i32, i32),
+  default_quality: i32,
 }
 
 fn codec_limits(codec_id: ffi::AVCodecID) -> CodecLimits {
   match codec_id {
     // MPEG-4 Part 2 headers store the size in 13 bits.
-    ffi::AVCodecID::AV_CODEC_ID_MPEG4 => CodecLimits { max_dimension: 8191, qscale: (1, 31) },
+    ffi::AVCodecID::AV_CODEC_ID_MPEG4 => CodecLimits {
+      max_dimension: 8191,
+      max_pixels: i64::MAX,
+      qscale: (1, 31),
+      default_quality: 5,
+    },
+    // OpenH264 accepts frames up to 36864 macroblocks (H.264 level 5.1), e.g.
+    // 4096x2304; quality is the QP.
+    ffi::AVCodecID::AV_CODEC_ID_H264 => CodecLimits {
+      max_dimension: 8192,
+      max_pixels: 36864 * 256,
+      qscale: (1, 51),
+      default_quality: 23,
+    },
     _ => panic!("Unsupported codec {:?}", codec_id)
   }
 }
 
-fn find_encoder(codec_id: ffi::AVCodecID) -> *const ffi::AVCodec {
-  let codec = unsafe { ffi::avcodec_find_encoder(codec_id) };
-  if codec.is_null() {
-    panic!("no {:?} encoder in this FFmpeg build", codec_id);
+/// The AVFrame/AVCodecContext quality for `quality` in the codec's own scale:
+/// FFmpeg's lambda for quantizer-scale codecs (MPEG4), unused (0) for H264,
+/// whose QP is set through qmin/qmax instead.
+fn frame_quality(codec_id: ffi::AVCodecID, quality: i32) -> i32 {
+  match codec_id {
+    ffi::AVCodecID::AV_CODEC_ID_H264 => 0,
+    _ => ffi::FF_QP2LAMBDA * quality,
   }
-  codec
+}
+
+/// FFmpeg's encoder for `codec_id`, if this build has one. H264's is
+/// libopenh264, which only works while Cisco's OpenH264 binary is available
+/// (see crate::openh264).
+fn find_encoder(codec_id: ffi::AVCodecID) -> Option<*const ffi::AVCodec> {
+  let codec = unsafe { ffi::avcodec_find_encoder(codec_id) };
+  (!codec.is_null()).then_some(codec)
 }
 
 /// `src` if the encoder takes it, otherwise the supported format that loses
@@ -88,13 +121,21 @@ fn pix_format_for_codec(src: AVPixelFormat, codec: *const ffi::AVCodec) -> AVPix
   unsafe { ffi::avcodec_find_best_pix_fmt_of_list(list.as_ptr(), src, 0, std::ptr::null_mut()) }
 }
 
-/// `width` x `height` rounded down to whole chroma blocks of `pix` and capped
-/// at the codec's maximum size.
+/// `width` x `height` scaled down (keeping the aspect ratio) to the codec's
+/// largest frame, capped at its maximum dimension and rounded down to whole
+/// chroma blocks of `pix`.
 fn size_for_codec(codec_id: ffi::AVCodecID, pix: AVPixelFormat, width: i32, height: i32) -> (i32, i32) {
   let limits = codec_limits(codec_id);
   let desc = unsafe { ffi::av_pix_fmt_desc_get(pix) };
   assert!(!desc.is_null(), "no descriptor for {:?}", pix);
   let (align_w, align_h) = unsafe { (1 << (*desc).log2_chroma_w, 1 << (*desc).log2_chroma_h) };
+  let pixels = width as i64 * height as i64;
+  let (width, height) = if pixels > limits.max_pixels {
+    let scale = (limits.max_pixels as f64 / pixels as f64).sqrt();
+    ((width as f64 * scale) as i32, (height as f64 * scale) as i32)
+  } else {
+    (width, height)
+  };
   let fit = |size: i32, align: i32| (size.min(limits.max_dimension) / align * align).max(align);
   (fit(width, align_w), fit(height, align_h))
 }
@@ -182,6 +223,7 @@ fn image_to_pix(format: ImageFormat) -> AVPixelFormat {
     ImageFormat::BGR => AVPixelFormat::AV_PIX_FMT_BGR24,
     ImageFormat::MPEG1 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::MPEG4 => AVPixelFormat::AV_PIX_FMT_YUV420P,
+    ImageFormat::H264 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::MJPEG => panic!("No Pixel format"),
     ImageFormat::Gray16 => GRAY16_NATIVE,
     ImageFormat::RGB16 => RGB48_NATIVE,
@@ -204,7 +246,7 @@ fn pix_to_image(pix: AVPixelFormat) -> Option<ImageFormat> {
   }
 }
 
-/// An encoded (MPEG4) output. Its bytes are in the codec state's buffer, so
+/// An encoded (MPEG4 or H264) output. Its bytes are in the codec state's buffer, so
 /// it holds the codec lock while it's read, which only holds up other pulls.
 pub struct EncodedImage<'a> {
   codec: MutexGuard<'a, CodecState>,
@@ -344,7 +386,6 @@ fn choose_output(params: &ConverterParams, source: &ImageSource) -> OutputConfig
   };
   let width = params.width.unwrap_or(source.width);
   let height = params.height.unwrap_or(source.height);
-  let quality = params.quality.unwrap_or(5);
   if !is_compressed(format) {
     return OutputConfig {
       format,
@@ -352,21 +393,28 @@ fn choose_output(params: &ConverterParams, source: &ImageSource) -> OutputConfig
       width,
       height,
       codec_id: None,
-      quality: ffi::FF_QP2LAMBDA * quality,
+      quality: 0,
     };
   }
 
   let codec_id = format_codec(format);
-  let pix = pix_format_for_codec(source.pix, find_encoder(codec_id));
+  // Without an encoder nothing is encoded anyway (see open_encoder).
+  let pix = find_encoder(codec_id)
+    .map_or(AVPixelFormat::AV_PIX_FMT_YUV420P, |codec| pix_format_for_codec(source.pix, codec));
   let (width, height) = size_for_codec(codec_id, pix, width, height);
-  let (qmin, qmax) = codec_limits(codec_id).qscale;
+  let limits = codec_limits(codec_id);
+  let (qmin, qmax) = limits.qscale;
+  let quality = match codec_id {
+    ffi::AVCodecID::AV_CODEC_ID_H264 => params.quantization,
+    _ => params.quality,
+  }.unwrap_or(limits.default_quality);
   OutputConfig {
     format,
     pix,
     width,
     height,
     codec_id: Some(codec_id),
-    quality: ffi::FF_QP2LAMBDA * quality.clamp(qmin, qmax),
+    quality: quality.clamp(qmin, qmax),
   }
 }
 
@@ -567,6 +615,10 @@ pub struct CodecState {
 
   // Encoded output
   encoder: Option<*mut AVCodecContext>,
+  /// Opening the encoder failed; not retried until the next reset.
+  encoder_failed: bool,
+  /// That OpenH264 is missing has been logged.
+  openh264_missing_logged: bool,
   packet: *mut ffi::AVPacket,
   out_buffer: Vec<u8>,
 }
@@ -588,6 +640,8 @@ impl CodecState {
       encoder: None,
       packet: std::ptr::null_mut(),
       out_buffer: vec![],
+      encoder_failed: false,
+      openh264_missing_logged: false,
     }
   }
 
@@ -619,12 +673,32 @@ impl CodecState {
     }
   }
 
-  fn open_encoder(&mut self, codec_id: ffi::AVCodecID, output: &OutputConfig) -> *mut AVCodecContext {
+  /// The encoder for `output`, opened on first use. None if it can't be
+  /// opened, e.g. H264 while OpenH264 is disabled or not downloaded; that's
+  /// logged once and not retried until the converter is reset.
+  fn open_encoder(&mut self, codec_id: ffi::AVCodecID, output: &OutputConfig) -> Option<*mut AVCodecContext> {
     if let Some(encoder) = self.encoder {
-      return encoder;
+      return Some(encoder);
+    }
+    if self.encoder_failed {
+      return None;
+    }
+    // H264 needs Cisco's OpenH264 binary. Until it's downloaded frames are
+    // dropped, and it's checked again for every frame, so a download that
+    // finishes later is used without a reset.
+    if codec_id == ffi::AVCodecID::AV_CODEC_ID_H264 && !crate::openh264::library_present() {
+      if !self.openh264_missing_logged {
+        println!("ImageConverter: OpenH264 isn't downloaded, dropping H264 frames until it is");
+        self.openh264_missing_logged = true;
+      }
+      return None;
     }
     unsafe {
-      let codec = find_encoder(codec_id);
+      let Some(codec) = find_encoder(codec_id) else {
+        println!("ImageConverter: this FFmpeg build has no {:?} encoder", codec_id);
+        self.encoder_failed = true;
+        return None;
+      };
       let mut context = ffi::avcodec_alloc_context3(codec);
       assert!(!context.is_null(), "avcodec_alloc_context3 failed");
       let time_base = time_base_for_codec(self.frame_interval, codec);
@@ -634,18 +708,30 @@ impl CodecState {
       (*context).time_base = time_base;
       (*context).framerate = ffi::AVRational { num: time_base.den, den: time_base.num };
       (*context).gop_size = time_base.den/time_base.num;
-      (*context).flags |= ffi::AV_CODEC_FLAG_QSCALE as i32;
-      (*context).global_quality = output.quality;
+      match codec_id {
+        // A constant QP: libopenh264 has no quantizer-scale mode, but its
+        // quality rate control stays within qmin..qmax.
+        ffi::AVCodecID::AV_CODEC_ID_H264 => {
+          (*context).qmin = output.quality;
+          (*context).qmax = output.quality;
+        }
+        _ => {
+          (*context).flags |= ffi::AV_CODEC_FLAG_QSCALE as i32;
+          (*context).global_quality = frame_quality(codec_id, output.quality);
+        }
+      }
       (*context).max_b_frames = 0;
       let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
       if ret < 0 {
         ffi::avcodec_free_context(&mut context);
-        panic!("opening {:?} encoder failed: {}", codec_id, av_error_string(ret));
+        println!("ImageConverter: opening the {:?} encoder failed, dropping frames: {}", codec_id, av_error_string(ret));
+        self.encoder_failed = true;
+        return None;
       }
       self.packet = ffi::av_packet_alloc();
       assert!(!self.packet.is_null(), "av_packet_alloc");
       self.encoder = Some(context);
-      context
+      Some(context)
     }
   }
 
@@ -808,7 +894,8 @@ impl ImageConverter {
           // consume_input shifts the buffer.
           let mut got_packet = false;
           if (*input.parser_packet).size > 0 {
-            let key_frame = (*input.parser).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I as i32;
+            let key_frame = (*input.parser).key_frame == 1
+              || (*input.parser).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I as i32;
             if key_frame || !input.need_key_frame {
               input.need_key_frame = false;
               (*input.parser_packet).pts = (*input.parser).pts;
@@ -943,7 +1030,7 @@ impl ImageConverter {
       encoded
     };
 
-    let frame = if encoded {
+    let mut frame = if encoded {
       let _trace = self.api.trace_event(c"ImageConverter::decode");
       self.next_decoded_frame(&mut codec)?
     } else {
@@ -966,8 +1053,12 @@ impl ImageConverter {
     };
     {
       let _trace = self.api.trace_event(c"ImageConverter::encode");
-      let encoder = codec.open_encoder(codec_id, &output);
-      codec.encode_frame(encoder, frame, output.quality);
+      let Some(encoder) = codec.open_encoder(codec_id, &output) else {
+        // No encoder (logged when opening it): the frame is dropped.
+        unsafe { ffi::av_frame_free(&mut frame) };
+        return None;
+      };
+      codec.encode_frame(encoder, frame, frame_quality(codec_id, output.quality));
     }
     Some(Box::new(EncodedImage {
       codec,
@@ -998,6 +1089,7 @@ mod tests {
       height: Some(10000),
       quality: Some(100),
       complete_frames: false,
+      quantization: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,
@@ -1009,7 +1101,7 @@ mod tests {
     // The MPEG-4 encoder only takes YUV420P, whose chroma is half size.
     assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUV420P);
     assert_eq!((output.width, output.height), (640, 8190));
-    assert_eq!(output.quality, ffi::FF_QP2LAMBDA * 31);
+    assert_eq!(output.quality, 31);
     assert_eq!(output.codec_id, Some(ffi::AVCodecID::AV_CODEC_ID_MPEG4));
   }
 
@@ -1021,6 +1113,7 @@ mod tests {
       height: None,
       quality: None,
       complete_frames: false,
+      quantization: None,
     };
     // Encoded input: choose_output sees the decoded frames' format.
     let decoded = ImageSource {
@@ -1048,6 +1141,36 @@ mod tests {
   }
 
   #[test]
+  fn h264_output_is_limited_to_what_openh264_supports() {
+    let params = ConverterParams {
+      format: Some(VideoFormat::Image(ImageFormat::H264)),
+      width: Some(8000),
+      height: Some(4500),
+      // Only MPEG4 uses this.
+      quality: Some(3),
+      complete_frames: false,
+      quantization: Some(60),
+    };
+    let source = ImageSource {
+      format: ImageFormat::NV12,
+      pix: AVPixelFormat::AV_PIX_FMT_NV12,
+      width: 1920,
+      height: 1080,
+    };
+    let output = choose_output(&params, &source);
+    assert_eq!(output.codec_id, Some(ffi::AVCodecID::AV_CODEC_ID_H264));
+    // libopenh264 only takes YUV420P.
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUV420P);
+    // Scaled down to at most 36864 macroblocks, keeping 16:9, in whole chroma
+    // blocks.
+    assert!(output.width as i64 * output.height as i64 <= 36864 * 256);
+    assert_eq!((output.width % 2, output.height % 2), (0, 0));
+    assert!((output.width as f64 / output.height as f64 - 16.0 / 9.0).abs() < 0.01);
+    // Clamped to the QP range.
+    assert_eq!(output.quality, 51);
+  }
+
+  #[test]
   fn raw_output_is_not_limited() {
     let params = ConverterParams {
       format: Some(VideoFormat::Image(ImageFormat::Gray)),
@@ -1055,6 +1178,7 @@ mod tests {
       height: None,
       quality: None,
       complete_frames: false,
+      quantization: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,

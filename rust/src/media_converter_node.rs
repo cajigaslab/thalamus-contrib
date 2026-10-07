@@ -254,6 +254,7 @@ impl MediaConverterNode {
           "NV12" => Some(VideoFormat::Image(ImageFormat::NV12)),
           "BGR" => Some(VideoFormat::Image(ImageFormat::BGR)),
           "MPEG4" => Some(VideoFormat::Image(ImageFormat::MPEG4)),
+          "H264" => Some(VideoFormat::Image(ImageFormat::H264)),
           _ => None
         };
       },
@@ -316,6 +317,14 @@ impl MediaConverterNode {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
           lock.params.image.quality = if v > 0 { Some(v as i32) } else { None };
+        }
+      },
+      "Quantization" => {
+        // H264 QP, 1-51; 0 uses the default (23).
+        if let StateValue::Int(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.image.quantization = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "Complete Frames" => {
@@ -409,7 +418,7 @@ impl MediaConverterNode {
       last_layout = Some(layout);
       let _ = signaler.ready(&stats);
       if let Some(image) = output.image() {
-        // Encoded (MPEG4) output is dropped by the viewer.
+        // Encoded (MPEG4, H264) output is dropped by the viewer.
         viewer_sink.update(image);
       }
     };
@@ -444,6 +453,7 @@ impl Node for MediaConverterNode {
           height: None,
           quality: None,
           complete_frames: false,
+          quantization: None,
         },
         audio: AudioConverterParams::default(),
       },

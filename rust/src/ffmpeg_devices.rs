@@ -344,7 +344,7 @@ fn plane_layout(format: ImageFormat, width: u64, height: u64) -> Vec<(u64, u64)>
       let chroma_h = height.div_ceil(2);
       vec![(width, height), (chroma_w, chroma_h), (chroma_w, chroma_h)]
     }
-    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => {
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 | ImageFormat::H264 => {
       panic!("Unsupported Format: {:?}", format)
     }
   }

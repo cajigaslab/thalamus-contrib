@@ -57,7 +57,7 @@ fn av_pixel_format(format: ImageFormat) -> Result<ffi::AVPixelFormat, String> {
     } else {
       ffi::AVPixelFormat::AV_PIX_FMT_RGB48LE
     }),
-    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => Err(format!(
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 | ImageFormat::H264 => Err(format!(
       "{:?} frames can't be encoded, the source needs to produce raw frames",
       format
     )),
@@ -84,7 +84,7 @@ fn plane_layout(
       let (chroma_w, chroma_h) = (w.div_ceil(2), h.div_ceil(2));
       Ok(vec![(w, h), (chroma_w, chroma_h), (chroma_w, chroma_h)])
     }
-    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 => Err(format!(
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 | ImageFormat::H264 => Err(format!(
       "{:?} frames can't be encoded, the source needs to produce raw frames",
       format
     )),
