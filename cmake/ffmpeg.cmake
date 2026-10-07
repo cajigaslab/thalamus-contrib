@@ -109,15 +109,19 @@ set_target_properties(ffmpeg_m PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>"
   OUTPUT_NAME m)
 
-# pkg-config search path for configure's library checks. Windows' native
-# pkg-config separates entries with ';', which has to be a generator
-# expression to survive as one argument of the command below.
+# pkg-config search path for configure's library checks. On Windows,
+# configure may run MSYS2's pkg-config (as CI does), which separates entries
+# with ':' and so can't take drive letter paths, or a native one, which
+# separates them with ';'. A path relative to the directory configure runs in
+# (Debug and Release are at the same depth) works with both.
 if(WIN32)
-  set(FFMPEG_PKG_CONFIG_SEP "$<SEMICOLON>")
+  file(RELATIVE_PATH FFMPEG_PKG_CONFIG_PATH "${ffmpeg_BINARY_DIR}/Release" "${OPENH264_PKG_CONFIG_DIR}")
 else()
-  set(FFMPEG_PKG_CONFIG_SEP ":")
+  set(FFMPEG_PKG_CONFIG_PATH "${OPENH264_PKG_CONFIG_DIR}")
 endif()
-set(FFMPEG_PKG_CONFIG_PATH "${OPENH264_PKG_CONFIG_DIR}${FFMPEG_PKG_CONFIG_SEP}${ZLIB_PKG_CONFIG_DIR}${FFMPEG_PKG_CONFIG_SEP}${SDL_PKG_CONFIG_DIR}")
+foreach(dir ${ZLIB_PKG_CONFIG_DIR} ${SDL_PKG_CONFIG_DIR})
+  string(APPEND FFMPEG_PKG_CONFIG_PATH ":${dir}")
+endforeach()
 
 if(WIN32)
   set(FFMPEG_POST_CONFIG && sed -i s/LIBPREF=lib/LIBPREF=/ ffbuild/config.mak
