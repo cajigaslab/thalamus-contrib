@@ -186,10 +186,10 @@ fn load_fn<T: Copy>(library: &libloading::Library, name: &[u8]) -> Result<T, Str
 }
 
 fn load_uc480() -> Result<(Uc480Lib, Vec<CameraInfo>), String> {
-  let lib_name = if cfg!(target_pointer_width = "64") {
-    "uc480_64.dll"
+  let lib_name = if cfg!(windows) {
+      if cfg!(target_pointer_width = "64") { "uc480_64.dll" } else { "uc480.dll" }
   } else {
-    "uc480.dll"
+      "libueye_api.so"
   };
 
   let library = unsafe {
