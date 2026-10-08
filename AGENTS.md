@@ -37,9 +37,18 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   `.cargo/config.toml`. After one `hatch build`, `cd rust; cargo test` works.
 - `cmake/ffmpeg.cmake` uses a system FFmpeg 7.x if pkg-config finds one,
   otherwise builds FFmpeg from source (`build/<config>/ffmpeg_provider.txt`
-  says which). The source build enables every native FFmpeg codec plus
-  FFmpeg's libopenh264 H.264 encoder (no libx264, libopus, libfdk_aac,
-  libmp3lame).
+  says which). The source build enables every native FFmpeg codec plus three
+  external encoders: libopenh264 (H.264), libvpx-vp9 (VP9) and libopus
+  (Opus); no libx264, libfdk_aac, libmp3lame. Decoding uses FFmpeg's own
+  H.264, VP9 and Opus decoders.
+- libopus (`cmake/opus.cmake`, its own CMake build) and libvpx
+  (`cmake/vpx.cmake`, configure/make; on Windows its `x86_64-win64-gcc`
+  target built with clang and the dynamic CRT, `libvpx.a` copied to
+  `vpx.lib`; VP9 encoder only; nasm required on x86) are static release
+  builds installed into `build/<config>/codec-deps`, whose `pkgconfig` FFmpeg's
+  configure searches. Rust gets their link flags from libavcodec's
+  pkg-config, except on Windows, where `build.rs` links `vpx` and `opus` from
+  `CODEC_DEPS_LIB_DIR` (written by `hatch_build.py`).
 - OpenH264 itself isn't built or linked: Cisco's binary is only covered by
   Cisco's H.264 patent license when users download it separately and can
   turn it off. Thalamus downloads it into `~/.thalamus` at startup
@@ -60,6 +69,11 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   - Upgrading OpenH264 means updating the headers, `VERSION` in
     `openh264.rs`, and the names and hashes in `thalamus/openh264.py`
     together.
+- On Windows FFmpeg's configure runs under MSYS2 (`sh`, `make`) and needs
+  MSYS2's `pkgconf` (`pacman -S make pkgconf`), not another pkg-config on
+  `PATH` (pkg-config-lite, Strawberry Perl's). MSYS2's splits
+  `PKG_CONFIG_PATH` on `:`, so drive-letter paths don't work; `ffmpeg.cmake`
+  passes OpenH264's `.pc` directory relative to FFmpeg's build directory.
 - Windows uses the dynamic CRT everywhere (Rust and skia's prebuilt library
   do); new native dependencies must too.
 - If FFmpeg rebuilds unexpectedly, run `ninja -n -d explain`: two different
@@ -81,6 +95,13 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   - `ThalamusAPI` is copied with `copy_from_host`, which only copies the
     function slots the host reports in `version`; functions the running
     Thalamus lacks are `None`.
+  - `ExtNode::request(&request, callback)` sends a JSON request to a node
+    from `ThalamusAPI::get_node` (slot 143). Keep the ExtNode to send more
+    later. The request is a `serde_json::Value`, converted to a host `Json`
+    through its string form, and the response comes back the same way. The
+    callback gets `Result<serde_json::Value, NodeRequestError>` exactly once,
+    later on the main thread; on a Thalamus without the slot it gets
+    `Err(Unsupported)`, also posted.
   - Fields of structs Thalamus provides (e.g. `ThalamusAnalogNode` of a C++
     node) are gated on `ThalamusAPI::analog_node_version()`.
   - This plugin reports its own struct versions through the
@@ -189,9 +210,13 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     outputs encoded input as the decoder produces it: the decoder's pixel
     format, or for AAC (decoded as floats) doubles, since Thalamus has no
     float format.
-  - `Video Quality` (MPEG4 quantizer scale, 1-31) and `Quantization` (H264
+  - `MPEG4 Quality` (MPEG4 quantizer scale, 1-31) and `H264 Quality` (H264
     QP, 1-51; libopenh264 has no quantizer-scale mode, so it's set as
-    qmin = qmax); lower is better, 0 uses the codec default (5, 23).
+    qmin = qmax); lower is better, 0 uses the codec default (5, 18).
+  - `VP9 Quality`: VP9 CRF, 0-63, lower is better (default 24). VP9 is
+    encoded for live use: constant quality (no bit rate), `deadline`
+    realtime, `cpu-used` 8, `lag-in-frames` 0 (one packet per frame, no
+    superframes), `row-mt`.
   - `Video Width`, `Video Height` and `Complete Frames` (encoded input
     arrives one whole frame per message; see below).
   - Encoded video formats: `MPEG4` (FFmpeg's encoder) and `H264` (FFmpeg's
@@ -215,6 +240,12 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   extradata. Every frame pushed to the encoder gives one output, empty until
   the FIFO fills a 1024-sample frame, with `encoded_count` = samples pushed.
   FFmpeg's AAC encoder supports 1-6 and 8 channels with standard layouts.
+- Opus output (libopus, default 128 kbit/s) frames each packet with an
+  MPEG-TS Opus control header (`0x7FE0`, then the length in 255-byte steps),
+  which FFmpeg's Opus parser splits on, as ADTS does for AAC. It's mono or
+  stereo only: more channels need an Opus header (extradata) a packet
+  stream can't carry, so such inputs are rejected. The Opus decoder is
+  opened with the input's channel count at 48 kHz.
 - FFmpeg pitfalls hit here: call `swr_init` after `swr_alloc_set_opts2`;
   allocate buffers (`av_frame_get_buffer`) for frames you write into, and
   never call it on a frame that already has buffers (it leaks them); drain

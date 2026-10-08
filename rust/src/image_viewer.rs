@@ -3,7 +3,7 @@
 //! copied into a GPU buffer as-is, converted to RGBA by a compute shader
 //! (shaders/convert.comp) into a Vulkan texture, and displayed via `imgui`'s
 //! custom-texture support. Every uncompressed ImageFormat is supported;
-//! MJPEG, MPEG1, MPEG4 and H264 frames are dropped. imgui
+//! MJPEG, MPEG1, MPEG4, H264 and VP9 frames are dropped. imgui
 //! has no built-in way to rotate an image, so rotation is done by drawing a
 //! rotated quad (`DrawListMut::add_image_quad`) instead of the plain
 //! `ui.image()` widget -- the standard Dear ImGui trick for this.
@@ -61,7 +61,7 @@ impl ShaderInput<'_> {
 }
 
 /// Splits `image` into the planes the conversion shader reads, or `None` if
-/// it can't be displayed: compressed formats (MJPEG, MPEG1, MPEG4, H264), empty
+/// it can't be displayed: compressed formats (MJPEG, MPEG1, MPEG4, H264, VP9), empty
 /// images, and planes too short for the image's size.
 ///
 /// Row strides aren't part of ImageData, so each plane's stride is its length
@@ -92,7 +92,7 @@ fn shader_input(image: &dyn ImageData) -> Option<ShaderInput<'_>> {
       [(6 * w, h), (0, 0), (0, 0)],
       1,
     ),
-    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 | ImageFormat::H264 => return None,
+    ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 | ImageFormat::H264 | ImageFormat::VP9 => return None,
   };
 
   let mut planes: [(&[u8], u32); 3] = [(&[], 0); 3];

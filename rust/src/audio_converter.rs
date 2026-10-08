@@ -58,6 +58,9 @@ pub enum AudioFormat {
   Integer,
   Decimal,
   AAC,
+  /// Opus, mono or stereo, each packet preceded by an MPEG-TS Opus control
+  /// header.
+  Opus,
   /// Encoded input is output in the sample format its decoder produces (as
   /// doubles when Thalamus has no matching format); raw input passes
   /// through.
@@ -179,6 +182,7 @@ impl<'a> AnalogData for AudioOutput<'a> {
       unsafe {
         match (*encoder).codec_id {
           ffi::AVCodecID::AV_CODEC_ID_AAC => AnalogEncoding::AAC,
+          ffi::AVCodecID::AV_CODEC_ID_OPUS => AnalogEncoding::Opus,
           other => panic!("Unsupported codec {:?}", other)
         }
       }
@@ -212,7 +216,7 @@ struct InputChannels {
 }
 
 fn is_compressed_audio_format(encoding: AudioFormat) -> bool {
-  encoding == AudioFormat::AAC
+  matches!(encoding, AudioFormat::AAC | AudioFormat::Opus)
 }
 
 fn analog_to_audio_format(format: AnalogFormat, encoding: AnalogEncoding) -> AudioFormat {
@@ -221,6 +225,7 @@ fn analog_to_audio_format(format: AnalogFormat, encoding: AnalogEncoding) -> Aud
     AnalogFormat::Short | AnalogFormat::Int => AudioFormat::Integer,
     AnalogFormat::Encoded => match encoding {
       AnalogEncoding::AAC => AudioFormat::AAC,
+      AnalogEncoding::Opus => AudioFormat::Opus,
       _ => panic!("Unexpected input encoding, {:?}", encoding),
     }
     _ => panic!("Unsupported analog format {:?}", format)
@@ -239,6 +244,7 @@ fn analog_to_sample_format(format: AnalogFormat) -> ffi::AVSampleFormat {
 fn encoding_codec(encoding: AnalogEncoding) -> ffi::AVCodecID {
   match encoding {
     AnalogEncoding::AAC => ffi::AVCodecID::AV_CODEC_ID_AAC,
+    AnalogEncoding::Opus => ffi::AVCodecID::AV_CODEC_ID_OPUS,
     _ => panic!("Unexpected format {:?}", encoding)
   }
 }
@@ -248,6 +254,8 @@ fn audio_format_to_encoding(format: AudioFormat) -> Option<ffi::AVCodecID> {
     AudioFormat::Integer => None,
     AudioFormat::Decimal => None,
     AudioFormat::AAC => Some(ffi::AVCodecID::AV_CODEC_ID_AAC),
+    // libopus, through FFmpeg's libopus wrapper.
+    AudioFormat::Opus => Some(ffi::AVCodecID::AV_CODEC_ID_OPUS),
     AudioFormat::Decoded => None,
   }
 }
@@ -349,6 +357,16 @@ fn duration_to_samples(duration: Duration, rate: i32) -> u64 {
 /// ADTS sampling_frequency_index values.
 const AAC_SAMPLE_RATES: [i32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
+/// An MPEG-TS Opus control header (no trim or extension fields) for a packet
+/// of `payload_len` bytes: 0x7FE0, then the length in 255-byte steps. Like
+/// ADTS for AAC, it's what lets FFmpeg's Opus parser find packet boundaries.
+fn opus_ts_header(payload_len: usize) -> Vec<u8> {
+  let mut header = vec![0x7F, 0xE0];
+  header.extend(std::iter::repeat_n(0xFF, payload_len / 255));
+  header.push((payload_len % 255) as u8);
+  header
+}
+
 /// A 7-byte ADTS header (no CRC) for an AAC-LC frame of `payload_len` bytes.
 /// The encoder outputs raw AAC frames; the header is what lets the AAC parser
 /// split them and the decoder configure itself without extradata.
@@ -400,7 +418,7 @@ fn select_input_channels<K: PartialEq>(index: i32, num_channels: i32, kind: impl
 fn is_supported_input(channels: &InputChannels) -> bool {
   match channels.format {
     AnalogFormat::Double | AnalogFormat::Short | AnalogFormat::Int => true,
-    AnalogFormat::Encoded => channels.encoding == AnalogEncoding::AAC,
+    AnalogFormat::Encoded => matches!(channels.encoding, AnalogEncoding::AAC | AnalogEncoding::Opus),
     AnalogFormat::ULong => false,
   }
 }
@@ -469,8 +487,10 @@ fn choose_output(params: &AudioConverterParams, input: &InputChannels,
   } else {
     samples_to_duration(1, sample_rate)
   };
-  // Bit rate for the whole stream; 256 kbit/s is near transparent stereo AAC.
-  OutputConfig { sample_format, sample_rate, sample_interval, codec_id, bitrate: params.bitrate.unwrap_or(256_000) }
+  // Bit rate for the whole stream: about where stereo AAC (256 kbit/s) and
+  // Opus (128 kbit/s) become hard to tell from the original.
+  let default_bitrate = if codec_id == Some(ffi::AVCodecID::AV_CODEC_ID_OPUS) { 128_000 } else { 256_000 };
+  OutputConfig { sample_format, sample_rate, sample_interval, codec_id, bitrate: params.bitrate.unwrap_or(default_bitrate) }
 }
 
 fn default_layout(channels: usize) -> ffi::AVChannelLayout {
@@ -844,6 +864,13 @@ impl CodecState {
       let mut context = ffi::avcodec_alloc_context3(codec);
       assert!(!context.is_null(), "avcodec_alloc_context3 failed");
       (*context).pkt_timebase = encoder_time_base(input.sample_interval);
+      // Opus packets don't say how many channels there are, and Opus always
+      // decodes at 48 kHz. Without an Opus header (extradata) the decoder
+      // handles mono and stereo, which is all Opus output is.
+      if codec_id == ffi::AVCodecID::AV_CODEC_ID_OPUS {
+        (*context).ch_layout = default_layout(input.range.len());
+        (*context).sample_rate = 48000;
+      }
       (*context).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
       let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
       if ret < 0 {
@@ -940,8 +967,12 @@ impl CodecState {
         assert!(ret >= 0, "Error during encoding: {}", av_error_string(ret));
 
         let size = (*self.packet).size as usize;
-        let header = adts_header(size, (*encoder).sample_rate, (*encoder).ch_layout.nb_channels);
-        self.out_buffer.extend_from_slice(&header);
+        if (*encoder).codec_id == ffi::AVCodecID::AV_CODEC_ID_OPUS {
+          self.out_buffer.extend_from_slice(&opus_ts_header(size));
+        } else {
+          let header = adts_header(size, (*encoder).sample_rate, (*encoder).ch_layout.nb_channels);
+          self.out_buffer.extend_from_slice(&header);
+        }
         self.out_buffer.extend_from_slice(std::slice::from_raw_parts((*self.packet).data, size));
         ffi::av_packet_unref(self.packet);
       }
@@ -1031,12 +1062,20 @@ impl AudioConverter {
 
     if state.input.is_none() {
       let input_channels = get_input_range(&state.params, analog);
-      if input_channels.range.is_empty() || input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels) {
+      // Opus output is mono or stereo; more channels need an Opus header
+      // the output has no way to carry.
+      let too_many_for_opus = state.params.format == Some(AudioFormat::Opus) && input_channels.range.len() > 2;
+      if input_channels.range.is_empty() || input_channels.sample_interval.is_zero() || !is_supported_input(&input_channels)
+        || too_many_for_opus {
         if !state.rejection_logged {
           if input_channels.range.is_empty() {
             println!(
               "AudioConverter: Audio Index {} is outside the input's {} channels",
               state.params.input_index, analog.num_channels());
+          } else if too_many_for_opus {
+            println!(
+              "AudioConverter: Opus output is mono or stereo, the input has {} channels",
+              input_channels.range.len());
           } else {
             println!(
               "AudioConverter can't convert {:?} ({:?}) input with a {:?} sample interval",
@@ -1272,6 +1311,14 @@ impl AudioConverter {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn opus_ts_headers_code_the_length_in_255_byte_steps() {
+    assert_eq!(opus_ts_header(0), vec![0x7F, 0xE0, 0]);
+    assert_eq!(opus_ts_header(254), vec![0x7F, 0xE0, 254]);
+    assert_eq!(opus_ts_header(255), vec![0x7F, 0xE0, 0xFF, 0]);
+    assert_eq!(opus_ts_header(600), vec![0x7F, 0xE0, 0xFF, 0xFF, 90]);
+  }
 
   #[test]
   fn decoded_samples_keep_their_format_when_thalamus_has_it() {

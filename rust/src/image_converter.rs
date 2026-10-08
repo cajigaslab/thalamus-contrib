@@ -35,9 +35,11 @@ pub struct ConverterParams {
   pub width: Option<i32>,
   pub height: Option<i32>,
   /// MPEG4 quantizer scale, 1-31, lower is better.
-  pub quality: Option<i32>,
+  pub mpeg4_quality: Option<i32>,
   /// H264 quantization parameter (QP), 1-51, lower is better.
-  pub quantization: Option<i32>,
+  pub h264_quality: Option<i32>,
+  /// VP9 constant quality level (CRF), 0-63, lower is better.
+  pub vp9_quality: Option<i32>,
   /// Each encoded input message holds exactly one whole frame. The parser is
   /// told so and given one message at a time, which saves it from waiting for
   /// the next frame's start before returning a packet: one frame less latency.
@@ -45,7 +47,7 @@ pub struct ConverterParams {
 }
 
 fn is_compressed(format: ImageFormat) -> bool {
-  matches!(format, ImageFormat::MPEG4 | ImageFormat::H264)
+  matches!(format, ImageFormat::MPEG4 | ImageFormat::H264 | ImageFormat::VP9)
 }
 
 fn format_codec(format: ImageFormat) -> ffi::AVCodecID {
@@ -54,6 +56,9 @@ fn format_codec(format: ImageFormat) -> ffi::AVCodecID {
     // Encoded with FFmpeg's libopenh264 wrapper (FFmpeg has no H.264 encoder
     // of its own), decoded with FFmpeg's h264 decoder.
     ImageFormat::H264 => ffi::AVCodecID::AV_CODEC_ID_H264,
+    // Encoded with FFmpeg's libvpx-vp9 wrapper (FFmpeg has no software VP9
+    // encoder of its own), decoded with FFmpeg's vp9 decoder.
+    ImageFormat::VP9 => ffi::AVCodecID::AV_CODEC_ID_VP9,
     _ => panic!("Unsupported format")
   }
 }
@@ -85,7 +90,14 @@ fn codec_limits(codec_id: ffi::AVCodecID) -> CodecLimits {
       max_dimension: 8192,
       max_pixels: 36864 * 256,
       qscale: (1, 51),
-      default_quality: 23,
+      default_quality: 18,
+    },
+    // libvpx's maximum frame size; quality is the CRF.
+    ffi::AVCodecID::AV_CODEC_ID_VP9 => CodecLimits {
+      max_dimension: 16384,
+      max_pixels: i64::MAX,
+      qscale: (0, 63),
+      default_quality: 24,
     },
     _ => panic!("Unsupported codec {:?}", codec_id)
   }
@@ -96,9 +108,17 @@ fn codec_limits(codec_id: ffi::AVCodecID) -> CodecLimits {
 /// whose QP is set through qmin/qmax instead.
 fn frame_quality(codec_id: ffi::AVCodecID, quality: i32) -> i32 {
   match codec_id {
-    ffi::AVCodecID::AV_CODEC_ID_H264 => 0,
+    ffi::AVCodecID::AV_CODEC_ID_H264 | ffi::AVCodecID::AV_CODEC_ID_VP9 => 0,
     _ => ffi::FF_QP2LAMBDA * quality,
   }
+}
+
+/// Sets an encoder private option (e.g. libvpx-vp9's "crf") before it's
+/// opened.
+unsafe fn set_encoder_option(context: *mut AVCodecContext, name: &CStr, value: &str) {
+  let value = std::ffi::CString::new(value).expect("option value contains a NUL");
+  let ret = unsafe { ffi::av_opt_set((*context).priv_data, name.as_ptr(), value.as_ptr(), 0) };
+  assert!(ret >= 0, "setting {:?} to {:?}: {}", name, value, av_error_string(ret));
 }
 
 /// FFmpeg's encoder for `codec_id`, if this build has one. H264's is
@@ -224,6 +244,7 @@ fn image_to_pix(format: ImageFormat) -> AVPixelFormat {
     ImageFormat::MPEG1 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::MPEG4 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::H264 => AVPixelFormat::AV_PIX_FMT_YUV420P,
+    ImageFormat::VP9 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::MJPEG => panic!("No Pixel format"),
     ImageFormat::Gray16 => GRAY16_NATIVE,
     ImageFormat::RGB16 => RGB48_NATIVE,
@@ -246,7 +267,7 @@ fn pix_to_image(pix: AVPixelFormat) -> Option<ImageFormat> {
   }
 }
 
-/// An encoded (MPEG4 or H264) output. Its bytes are in the codec state's buffer, so
+/// An encoded (MPEG4, H264 or VP9) output. Its bytes are in the codec state's buffer, so
 /// it holds the codec lock while it's read, which only holds up other pulls.
 pub struct EncodedImage<'a> {
   codec: MutexGuard<'a, CodecState>,
@@ -405,8 +426,9 @@ fn choose_output(params: &ConverterParams, source: &ImageSource) -> OutputConfig
   let limits = codec_limits(codec_id);
   let (qmin, qmax) = limits.qscale;
   let quality = match codec_id {
-    ffi::AVCodecID::AV_CODEC_ID_H264 => params.quantization,
-    _ => params.quality,
+    ffi::AVCodecID::AV_CODEC_ID_H264 => params.h264_quality,
+    ffi::AVCodecID::AV_CODEC_ID_VP9 => params.vp9_quality,
+    _ => params.mpeg4_quality,
   }.unwrap_or(limits.default_quality);
   OutputConfig {
     format,
@@ -714,6 +736,17 @@ impl CodecState {
         ffi::AVCodecID::AV_CODEC_ID_H264 => {
           (*context).qmin = output.quality;
           (*context).qmax = output.quality;
+        }
+        // Constant quality (CRF with no bit rate target), tuned for live use:
+        // realtime speed, no frame lag (so one packet per frame, with no
+        // alt-ref superframes) and row-based multithreading.
+        ffi::AVCodecID::AV_CODEC_ID_VP9 => {
+          (*context).bit_rate = 0;
+          set_encoder_option(context, c"crf", &output.quality.to_string());
+          set_encoder_option(context, c"deadline", "realtime");
+          set_encoder_option(context, c"cpu-used", "8");
+          set_encoder_option(context, c"lag-in-frames", "0");
+          set_encoder_option(context, c"row-mt", "1");
         }
         _ => {
           (*context).flags |= ffi::AV_CODEC_FLAG_QSCALE as i32;
@@ -1087,9 +1120,10 @@ mod tests {
       format: Some(VideoFormat::Image(ImageFormat::MPEG4)),
       width: Some(641),
       height: Some(10000),
-      quality: Some(100),
+      mpeg4_quality: Some(100),
       complete_frames: false,
-      quantization: None,
+      h264_quality: None,
+      vp9_quality: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,
@@ -1111,9 +1145,10 @@ mod tests {
       format: Some(VideoFormat::Decoded),
       width: None,
       height: None,
-      quality: None,
+      mpeg4_quality: None,
       complete_frames: false,
-      quantization: None,
+      h264_quality: None,
+      vp9_quality: None,
     };
     // Encoded input: choose_output sees the decoded frames' format.
     let decoded = ImageSource {
@@ -1147,9 +1182,10 @@ mod tests {
       width: Some(8000),
       height: Some(4500),
       // Only MPEG4 uses this.
-      quality: Some(3),
+      mpeg4_quality: Some(3),
       complete_frames: false,
-      quantization: Some(60),
+      h264_quality: Some(60),
+      vp9_quality: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,
@@ -1171,14 +1207,41 @@ mod tests {
   }
 
   #[test]
+  fn vp9_output_uses_crf_in_its_own_range() {
+    let params = ConverterParams {
+      format: Some(VideoFormat::Image(ImageFormat::VP9)),
+      width: Some(641),
+      height: None,
+      mpeg4_quality: Some(3),
+      complete_frames: false,
+      h264_quality: Some(20),
+      vp9_quality: Some(70),
+    };
+    let source = ImageSource {
+      format: ImageFormat::NV12,
+      pix: AVPixelFormat::AV_PIX_FMT_NV12,
+      width: 1920,
+      height: 1080,
+    };
+    let output = choose_output(&params, &source);
+    assert_eq!(output.codec_id, Some(ffi::AVCodecID::AV_CODEC_ID_VP9));
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUV420P);
+    assert_eq!((output.width, output.height), (640, 1080));
+    // vp9_quality, clamped to the CRF range; quality and quantization are
+    // other codecs'.
+    assert_eq!(output.quality, 63);
+  }
+
+  #[test]
   fn raw_output_is_not_limited() {
     let params = ConverterParams {
       format: Some(VideoFormat::Image(ImageFormat::Gray)),
       width: Some(641),
       height: None,
-      quality: None,
+      mpeg4_quality: None,
       complete_frames: false,
-      quantization: None,
+      h264_quality: None,
+      vp9_quality: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,

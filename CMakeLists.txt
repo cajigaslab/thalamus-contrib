@@ -12,6 +12,12 @@ set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
 project(thalamus)
 
+# The codec libraries FFmpeg links are built and installed under
+# ${CMAKE_BUILD_TYPE} (cmake/vpx.cmake, cmake/opus.cmake), so it can't be empty.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 option(CODE_COVERAGE "Enable Code Coverage" OFF)
 option(STRIP "Strip native execute when copied to thalamus dir" OFF)
 

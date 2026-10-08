@@ -135,6 +135,27 @@ impl ExtNode {
     unsafe { ((*api.raw).node_inc_ref.unwrap())(node) };
     ExtNode { api, node }
   }
+  /// Sends request to this node, like the node_request gRPC call, and
+  /// passes its response to callback. callback runs exactly once, later on
+  /// the main thread, never before this returns.
+  pub fn request<T: FnOnce(Result<serde_json::Value, NodeRequestError>) + 'static>(
+    &self,
+    request: &serde_json::Value,
+    callback: T,
+  ) {
+    let api = unsafe { &*self.api.raw };
+    let request = Json::from_string(self.api, &request.to_string());
+    let args = Box::into_raw(Box::new(NodeRequestArgs { api: self.api, callback }));
+    let data = args as *mut std::os::raw::c_void;
+    match api.node_request {
+      // Thalamus copies the request before returning.
+      Some(node_request) => unsafe {
+        node_request(self.node, request.handle, Some(node_request_callback::<T>), data)
+      },
+      None => unsafe { (api.io_context_post.unwrap())(Some(node_request_unsupported::<T>), data) },
+    }
+  }
+
   pub fn subscribe<T: FnMut(ExtNode) + 'static>(&self, callback: T) -> OnDrop {
     let call_ptr = Box::into_raw(Box::new(NodeReadyArgs {
       api: self.api,
@@ -366,6 +387,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       };
       match encoding(self.node.node) {
         ThalamusAnalogEncoding::ThalamusAnalogEncoding_AAC => AnalogEncoding::AAC,
+        ThalamusAnalogEncoding::ThalamusAnalogEncoding_Opus => AnalogEncoding::Opus,
         // Includes encodings from newer Thalamus builds this one doesn't know.
         _ => AnalogEncoding::None,
       }
@@ -524,6 +546,7 @@ impl<'a> ImageData for ExtNodeData<'a> {
         ThalamusImageFormat::ThalamusImageFormat_MPEG1 => ImageFormat::MPEG1,
         ThalamusImageFormat::ThalamusImageFormat_MPEG4 => ImageFormat::MPEG4,
         ThalamusImageFormat::ThalamusImageFormat_H264 => ImageFormat::H264,
+        ThalamusImageFormat::ThalamusImageFormat_VP9 => ImageFormat::VP9,
         ThalamusImageFormat::ThalamusImageFormat_Gray16 => ImageFormat::Gray16,
         ThalamusImageFormat::ThalamusImageFormat_RGB16 => ImageFormat::RGB16,
         other => panic!("Unknown ThalamusImageFormat {}", other.0),
@@ -621,6 +644,51 @@ unsafe extern "C" fn get_node_callback<T: FnMut(ExtNode)>(
 
   let ext_node = ExtNode::new(args.api, node);
   (args.callback)(ext_node);
+}
+
+/// Why ExtNode::request has no response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeRequestError {
+  /// The node was destroyed before the request was sent.
+  Destroyed,
+  /// The node discarded the request without responding, e.g. because it
+  /// was destroyed.
+  Dropped,
+  /// The running Thalamus predates node_request.
+  Unsupported,
+  /// The node's response isn't JSON serde_json can represent, e.g. a
+  /// non-finite number.
+  InvalidResponse,
+}
+
+struct NodeRequestArgs<T> {
+  api: ThalamusAPI,
+  callback: T,
+}
+
+unsafe extern "C" fn node_request_callback<T: FnOnce(Result<serde_json::Value, NodeRequestError>)>(
+  status: ThalamusNodeRequestStatus,
+  response: *const ThalamusJson,
+  data: *mut ::std::os::raw::c_void,
+) {
+  let NodeRequestArgs { api, callback } = *unsafe { Box::from_raw(data as *mut NodeRequestArgs<T>) };
+  let result = match status {
+    // Json::new takes its own reference; response only lives for this call.
+    ThalamusNodeRequestStatus::ThalamusNodeRequestStatus_Ok => {
+      let response = Json::new(api, response as *mut ThalamusJson);
+      serde_json::from_str(&response.to_string()).map_err(|_| NodeRequestError::InvalidResponse)
+    }
+    ThalamusNodeRequestStatus::ThalamusNodeRequestStatus_Destroyed => Err(NodeRequestError::Destroyed),
+    _ => Err(NodeRequestError::Dropped),
+  };
+  callback(result);
+}
+
+unsafe extern "C" fn node_request_unsupported<T: FnOnce(Result<serde_json::Value, NodeRequestError>)>(
+  data: *mut ::std::os::raw::c_void,
+) {
+  let NodeRequestArgs { callback, .. } = *unsafe { Box::from_raw(data as *mut NodeRequestArgs<T>) };
+  callback(Err(NodeRequestError::Unsupported));
 }
 
 /// Error returned when a ThalamusAPI/ThalamusAPIThreadSafe call is made
@@ -3203,6 +3271,8 @@ pub enum AnalogEncoding {
   #[default]
   None,
   AAC,
+  /// Opus packets, each preceded by an MPEG-TS Opus control header.
+  Opus,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -3219,6 +3289,8 @@ pub enum ImageFormat {
   MPEG4,
   /// Encoded H.264, Annex B (start code delimited), one frame per message.
   H264,
+  /// Encoded VP9, one frame per message.
+  VP9,
   /// One 16-bit sample per pixel, in the platform's native byte order, using
   /// the full 0..65535 range.
   Gray16,

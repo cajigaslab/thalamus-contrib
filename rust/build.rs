@@ -105,6 +105,16 @@ fn main() {
       ] {
         println!("cargo:rustc-link-lib=dylib={}", lib);
       }
+      // libvpx and libopus, which the source-built FFmpeg's VP9 and Opus
+      // encoders call (see hatch_build.py). libavcodec's link flags aren't
+      // read from pkg-config here, so they're linked explicitly.
+      for (var, lib) in [("VPX_LIB_DIR", "vpx"), ("OPUS_LIB_DIR", "opus")] {
+        println!("cargo:rerun-if-env-changed={}", var);
+        if let Ok(dir) = std::env::var(var) {
+          println!("cargo:rustc-link-search=native={}", dir);
+          println!("cargo:rustc-link-lib=static={}", lib);
+        }
+      }
     }
     _ => {
       if target_os == "macos" {

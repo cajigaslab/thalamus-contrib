@@ -40,6 +40,12 @@ file(WRITE "${CMAKE_BINARY_DIR}/ffmpeg_provider.txt" "source")
 # OPENH264_PKG_CONFIG_DIR.
 include(${CMAKE_CURRENT_LIST_DIR}/openh264.cmake)
 
+# Encoder libraries FFmpeg links, each built and installed under
+# ${CMAKE_BUILD_TYPE} in its own binary dir: libopus (Opus) and libvpx (VP9).
+# Set OPUS_LIBRARY, OPUS_PKG_CONFIG_DIR, VPX_LIBRARY and VPX_PKG_CONFIG_DIR.
+include(${CMAKE_CURRENT_LIST_DIR}/opus.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/vpx.cmake)
+
 FetchContent_Declare(
   ffmpeg 
   GIT_REPOSITORY https://github.com/FFmpeg/FFmpeg.git
@@ -115,9 +121,12 @@ set_target_properties(ffmpeg_m PROPERTIES
 # separates them with ';'. A path relative to the directory configure runs in
 # (Debug and Release are at the same depth) works with both.
 if(WIN32)
-  file(RELATIVE_PATH FFMPEG_PKG_CONFIG_PATH "${ffmpeg_BINARY_DIR}/Release" "${OPENH264_PKG_CONFIG_DIR}")
+  file(RELATIVE_PATH OPENH264_PKG_CONFIG_REL "${ffmpeg_BINARY_DIR}/Release" "${OPENH264_PKG_CONFIG_DIR}")
+  file(RELATIVE_PATH OPUS_PKG_CONFIG_REL "${ffmpeg_BINARY_DIR}/Release" "${OPUS_PKG_CONFIG_DIR}")
+  file(RELATIVE_PATH VPX_PKG_CONFIG_REL "${ffmpeg_BINARY_DIR}/Release" "${VPX_PKG_CONFIG_DIR}")
+  set(FFMPEG_PKG_CONFIG_PATH "${OPENH264_PKG_CONFIG_REL}:${OPUS_PKG_CONFIG_REL}:${VPX_PKG_CONFIG_REL}")
 else()
-  set(FFMPEG_PKG_CONFIG_PATH "${OPENH264_PKG_CONFIG_DIR}")
+  set(FFMPEG_PKG_CONFIG_PATH "${OPENH264_PKG_CONFIG_DIR}:${OPUS_PKG_CONFIG_DIR}:${VPX_PKG_CONFIG_DIR}")
 endif()
 foreach(dir ${ZLIB_PKG_CONFIG_DIR} ${SDL_PKG_CONFIG_DIR})
   string(APPEND FFMPEG_PKG_CONFIG_PATH ":${dir}")
@@ -130,12 +139,15 @@ endif()
 
 add_custom_command(
   OUTPUT "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/Makefile"
-  DEPENDS ffmpeg_m ${OPENH264_STUB_TARGET}
+  DEPENDS ffmpeg_m ${OPENH264_STUB_TARGET} "${OPUS_LIBRARY}" "${VPX_LIBRARY}"
   COMMAND cmake -E env 
   "PKG_CONFIG_PATH=${FFMPEG_PKG_CONFIG_PATH}"
   sh "${ffmpeg_SOURCE_DIR}/configure" ${FFMPEG_EXTRA_FLAGS}
-    # Only the encoder: FFmpeg's own h264 decoder decodes.
-    --enable-libopenh264 --disable-decoder=libopenh264 "--cc=${FFMPEG_COMPILER}" "--cxx=${FFMPEG_CXX_COMPILER}" "--extra-cflags=${FFMPEG_EXTRA_CFLAGS}" "--extra-cxxflags=${FFMPEG_EXTRA_CXXFLAGS}" "--extra-ldflags=${FFMPEG_EXTRA_LDFLAGS}" --enable-static --disable-shared --disable-sndio $<IF:$<CONFIG:Debug>,--enable-debug,> --prefix=${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install
+    # Only the encoders: FFmpeg's own H.264, VP9 and Opus decoders decode,
+    # and libvpx is built without VP8.
+    --enable-libopenh264 --enable-libvpx --enable-libopus
+    --disable-decoder=libopenh264,libvpx_vp8,libvpx_vp9,libopus
+    --disable-encoder=libvpx_vp8 "--cc=${FFMPEG_COMPILER}" "--cxx=${FFMPEG_CXX_COMPILER}" "--extra-cflags=${FFMPEG_EXTRA_CFLAGS}" "--extra-cxxflags=${FFMPEG_EXTRA_CXXFLAGS}" "--extra-ldflags=${FFMPEG_EXTRA_LDFLAGS}" --enable-static --disable-shared --disable-sndio $<IF:$<CONFIG:Debug>,--enable-debug,> --prefix=${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install
   && cmake -E touch_nocreate "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/Makefile"
   ${FFMPEG_POST_CONFIG}
   WORKING_DIRECTORY "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>")
@@ -149,7 +161,7 @@ if(WIN32)
     "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install/lib/avutil.lib"
     "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install/lib/swresample.lib"
     "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install/lib/swscale.lib")
-  set(FFMPEG_LIBRARIES "${FFMPEG_OUTPUT_LIBRARIES}"
+  set(FFMPEG_LIBRARIES "${FFMPEG_OUTPUT_LIBRARIES}" "${VPX_LIBRARY}" "${OPUS_LIBRARY}"
     Ws2_32.lib Secur32.lib Bcrypt.lib Mfplat.lib Ole32.lib User32.lib dxguid.lib uuid.lib Mfuuid.lib strmiids.lib Kernel32.lib Psapi.lib)
 else()
   set(FFMPEG_OUTPUT_LIBRARIES
@@ -160,7 +172,7 @@ else()
     "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install/lib/libavutil.a"
     "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install/lib/libswresample.a"
     "${ffmpeg_BINARY_DIR}/$<IF:$<CONFIG:Debug>,Debug,Release>/install/lib/libswscale.a")
-  set(FFMPEG_LIBRARIES "${FFMPEG_OUTPUT_LIBRARIES}")
+  set(FFMPEG_LIBRARIES "${FFMPEG_OUTPUT_LIBRARIES}" "${VPX_LIBRARY}" "${OPUS_LIBRARY}")
 endif()
 
 list(GET FFMPEG_LIBRARIES 0 FIRST_FFMPEG_LIB)

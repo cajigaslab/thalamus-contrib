@@ -105,6 +105,13 @@ class CustomBuildHook(BuildHookInterface):
     if ffmpeg_provider == 'source':
       ffmpeg_install = build_path / '_deps' / 'ffmpeg-build' / ("Debug" if debug else "Release") / 'install'
       cargo_env['FFMPEG_DIR'] = ffmpeg_install.as_posix()
+      # libvpx and libopus (cmake/vpx.cmake, cmake/opus.cmake), which FFmpeg's
+      # VP9 and Opus encoders call. build.rs links them on Windows; elsewhere
+      # they come with libavcodec's pkg-config link flags.
+      # Each is installed under the build type in its own FetchContent binary dir.
+      build_type = "Debug" if debug else "Release"
+      cargo_env['VPX_LIB_DIR'] = (build_path / '_deps' / 'libvpx-build' / build_type / 'install' / 'lib').as_posix()
+      cargo_env['OPUS_LIB_DIR'] = (build_path / '_deps' / 'opus-build' / build_type / 'install' / 'lib').as_posix()
       cargo_env['PKG_CONFIG_PATH'] = (ffmpeg_install / 'lib' / 'pkgconfig').as_posix()
     if platform.system() == 'Darwin':
       # Match the deployment target the ffmpeg/CMake deps were built against so

@@ -281,6 +281,7 @@ pub extern "C" fn c_node_analog_encoding(raw_node: *mut ThalamusNode) -> Thalamu
   match analog.encoding() {
     crate::api::AnalogEncoding::None => ThalamusAnalogEncoding::ThalamusAnalogEncoding_None,
     crate::api::AnalogEncoding::AAC => ThalamusAnalogEncoding::ThalamusAnalogEncoding_AAC,
+    crate::api::AnalogEncoding::Opus => ThalamusAnalogEncoding::ThalamusAnalogEncoding_Opus,
   }
 }
 #[allow(non_snake_case)]
@@ -355,6 +356,7 @@ pub extern "C" fn c_node_image_format(raw_node: *mut ThalamusNode) -> ThalamusIm
     ImageFormat::MPEG1 => ThalamusImageFormat::ThalamusImageFormat_MPEG1,
     ImageFormat::MPEG4 => ThalamusImageFormat::ThalamusImageFormat_MPEG4,
     ImageFormat::H264 => ThalamusImageFormat::ThalamusImageFormat_H264,
+    ImageFormat::VP9 => ThalamusImageFormat::ThalamusImageFormat_VP9,
     ImageFormat::Gray16 => ThalamusImageFormat::ThalamusImageFormat_Gray16,
     ImageFormat::RGB16 => ThalamusImageFormat::ThalamusImageFormat_RGB16,
   }
