@@ -30,6 +30,7 @@ mod sleeve_node;
 mod thorcam_node;
 mod wakers;
 mod webcam_node;
+mod storage3_node;
 
 use angular_scaling_node::AngularScalingNode;
 use media_converter_node::MediaConverterNode;
@@ -38,6 +39,7 @@ use rtmps_node::RtmpsNode;
 use sleeve_node::SleeveNode;
 use thorcam_node::ThorcamNode;
 use webcam_node::WebcamNode;
+use storage3_node::Storage3Node;
 
 export_nodes!(
   ("THORCAM", ThorcamNode),
@@ -46,5 +48,6 @@ export_nodes!(
   ("ANGULAR_SCALING", AngularScalingNode),
   ("WEBCAM", WebcamNode),
   ("MEDIA_CONVERTER", MediaConverterNode),
-  ("MIC", MicNode)
+  ("MIC", MicNode),
+  ("STORAGE3", Storage3Node)
 );
