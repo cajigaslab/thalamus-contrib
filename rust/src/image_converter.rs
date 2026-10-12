@@ -267,8 +267,10 @@ fn pix_to_image(pix: AVPixelFormat) -> Option<ImageFormat> {
   }
 }
 
-/// An encoded (MPEG4, H264 or VP9) output. Its bytes are in the codec state's buffer, so
-/// it holds the codec lock while it's read, which only holds up other pulls.
+/// An encoded (MPEG4, H264 or VP9) output: one packet, so one coded picture,
+/// timed by when that picture was captured. Its bytes are in the codec state's
+/// buffer, so it holds the codec lock while it's read, which only holds up
+/// other pulls.
 pub struct EncodedImage<'a> {
   codec: MutexGuard<'a, CodecState>,
   frame_interval: Duration,
@@ -444,6 +446,10 @@ fn frame_interval_or_default(interval: Duration) -> Duration {
   if interval.is_zero() { Duration::from_millis(16) } else { interval }
 }
 
+/// How many frames a decoder can output before an earlier message's frame:
+/// H.264 reorders at most 16.
+const MAX_REORDER: i64 = 16;
+
 /// What push works on, under the input lock: the input's format, the message
 /// times, the MPEG4 parser's input and the raw input's scaling. Resetting
 /// replaces it with a fresh state of the next generation.
@@ -573,6 +579,65 @@ impl InputState {
     pool.lock().unwrap().push_pending(frame, self.generation);
   }
 
+  /// Parses buffered input until a packet is ready, skipping packets before
+  /// the first keyframe, and references it in `packet` with the pts of the
+  /// message its frame starts in. Returns false when no complete packet is
+  /// buffered.
+  ///
+  /// The parser is given one message at a time: it only takes a new pts for
+  /// a new range of input, so frames from a second buffered message would
+  /// come out with none. Without complete_frames it finishes a frame when the
+  /// next one starts, so the frame it returns while one message is parsed
+  /// usually started in the previous one; its pts says which.
+  fn parse_packet(&mut self, decoder: *mut AVCodecContext, packet: *mut ffi::AVPacket) -> bool {
+    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    unsafe {
+      loop {
+        let buffered = self.in_buffer.len().saturating_sub(padding);
+        let Some(&(end, pts)) = self.slice_to_pts.front() else {
+          return false;
+        };
+        let available = end.min(buffered);
+        if available == 0 {
+          return false;
+        }
+        let used = ffi::av_parser_parse2(
+          self.parser, decoder,
+          &mut (*self.parser_packet).data,
+          &mut (*self.parser_packet).size,
+          self.in_buffer.as_ptr(),
+          available as i32,
+          pts, ffi::AV_NOPTS_VALUE,
+          self.num_input_bytes
+        );
+        assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
+
+        // The parsed packet can point into in_buffer, so it's copied before
+        // consume_input shifts the buffer.
+        let mut got_packet = false;
+        if (*self.parser_packet).size > 0 {
+          let key_frame = (*self.parser).key_frame == 1
+            || (*self.parser).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I as i32;
+          if key_frame || !self.need_key_frame {
+            self.need_key_frame = false;
+            (*self.parser_packet).pts = (*self.parser).pts;
+            let ret = ffi::av_packet_ref(packet, self.parser_packet);
+            assert!(ret >= 0, "av_packet_ref: {}", av_error_string(ret));
+            got_packet = true;
+          }
+        }
+        self.consume_input(used as usize);
+
+        if got_packet {
+          return true;
+        }
+        if used == 0 {
+          return false;
+        }
+      }
+    }
+  }
+
   /// Drops the first `used` bytes of buffered input along with the pts slices
   /// that end inside them.
   fn consume_input(&mut self, used: usize) {
@@ -590,12 +655,18 @@ impl InputState {
   }
 
   /// The time and frame interval of the input message that produced `pts`.
-  /// Earlier entries belong to messages that produced no frame of their own
-  /// and are dropped.
+  /// Decoders output frames in presentation order, which with B-frames isn't
+  /// the order their messages arrived in (a P frame arrives before the B
+  /// frames shown before it), so earlier messages may still produce frames:
+  /// only entries more than MAX_REORDER behind are dropped, as messages that
+  /// produced no frame of their own (e.g. a packet the decoder rejected).
   fn take_time(&mut self, pts: i64) -> Option<(Duration, Duration)> {
     let i = self.pts_to_time.iter().position(|(p, _, _)| *p == pts)?;
-    let (_, time, interval) = self.pts_to_time[i];
-    self.pts_to_time.drain(..=i);
+    let (_, time, interval) = self.pts_to_time.remove(i)?;
+    // Entries are in arrival order, so the stale ones are at the front.
+    while self.pts_to_time.front().is_some_and(|(p, _, _)| *p < pts - MAX_REORDER) {
+      self.pts_to_time.pop_front();
+    }
     Some((time, interval))
   }
 }
@@ -642,6 +713,16 @@ pub struct CodecState {
   /// That OpenH264 is missing has been logged.
   openh264_missing_logged: bool,
   packet: *mut ffi::AVPacket,
+  /// Sequence number of the next frame sent to the encoder, which it gets as
+  /// pts: frames arrive in presentation order, which for re-encoded input
+  /// with B-frames isn't their messages' order, and encoders need increasing
+  /// pts. encoder_times keeps each frame's time and frame interval under it,
+  /// and its packets carry it back.
+  encoder_seq: i64,
+  encoder_times: VecDeque<(i64, Duration, Duration)>,
+  /// Packets waiting to be output, one per message, with their frame's time
+  /// and frame interval.
+  packets: VecDeque<(Vec<u8>, Duration, Duration)>,
   out_buffer: Vec<u8>,
 }
 
@@ -661,6 +742,9 @@ impl CodecState {
       decoded_scaler: std::ptr::null_mut(),
       encoder: None,
       packet: std::ptr::null_mut(),
+      encoder_seq: 0,
+      encoder_times: VecDeque::new(),
+      packets: VecDeque::new(),
       out_buffer: vec![],
       encoder_failed: false,
       openh264_missing_logged: false,
@@ -681,7 +765,11 @@ impl CodecState {
       let mut context = ffi::avcodec_alloc_context3(codec);
       assert!(!context.is_null(), "avcodec_alloc_context3 failed");
       (*context).pkt_timebase = encoder_time_base(self.frame_interval);
-      (*context).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
+      // Frames come out in presentation order, FFmpeg's default. Not
+      // AV_CODEC_FLAG_LOW_DELAY: the MPEG4 decoder honors it by outputting
+      // frames in decode order, so B-frames would be shown out of order.
+      // Streams without B-frames aren't delayed without it: decoders only
+      // hold frames back for streams that reorder.
       let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
       if ret < 0 {
         ffi::avcodec_free_context(&mut context);
@@ -763,28 +851,45 @@ impl CodecState {
       }
       self.packet = ffi::av_packet_alloc();
       assert!(!self.packet.is_null(), "av_packet_alloc");
+      self.encoder_seq = 0;
+      self.encoder_times.clear();
       self.encoder = Some(context);
       Some(context)
     }
   }
 
-  /// Encodes `frame` and replaces out_buffer with the packets the encoder
-  /// produces. Frees `frame`.
-  fn encode_frame(&mut self, encoder: *mut AVCodecContext, mut frame: *mut ffi::AVFrame, quality: i32) {
+  /// Encodes `frame`, acquired at `time`, and queues each packet the encoder
+  /// produces in `packets` with the time and frame interval of the frame it
+  /// encodes. Frees `frame`.
+  fn encode_frame(&mut self, encoder: *mut AVCodecContext, mut frame: *mut ffi::AVFrame, quality: i32, time: Duration, frame_interval: Duration) {
     unsafe {
+      let seq = self.encoder_seq;
+      self.encoder_seq += 1;
+      self.encoder_times.push_back((seq, time, frame_interval));
       (*frame).quality = quality;
+      (*frame).pts = seq;
       let ret = ffi::avcodec_send_frame(encoder, frame);
       assert!(ret >= 0, "avcodec_send_frame: {}", av_error_string(ret));
       ffi::av_frame_free(&mut frame);
-      self.out_buffer.clear();
       loop {
         let ret = ffi::avcodec_receive_packet(encoder, self.packet);
         if ret == AVERROR_EAGAIN || ret == AVERROR_EOF {
           break;
         }
         assert!(ret >= 0, "Error during encoding: {}", av_error_string(ret));
-        let slice = std::slice::from_raw_parts((*self.packet).data, (*self.packet).size as usize);
-        self.out_buffer.extend_from_slice(slice);
+        // The encoders make no B-frames, so packets come in pts order and
+        // earlier entries belong to frames the encoder dropped.
+        let pts = (*self.packet).pts;
+        let (time, frame_interval) = match self.encoder_times.iter().position(|(s, _, _)| *s == pts) {
+          Some(i) => {
+            let (_, time, frame_interval) = self.encoder_times[i];
+            self.encoder_times.drain(..=i);
+            (time, frame_interval)
+          }
+          None => (time, frame_interval),
+        };
+        let data = std::slice::from_raw_parts((*self.packet).data, (*self.packet).size as usize).to_vec();
+        self.packets.push_back((data, time, frame_interval));
         ffi::av_packet_unref(self.packet);
       }
     }
@@ -895,56 +1000,14 @@ impl ImageConverter {
   /// after avcodec_receive_frame returned EAGAIN, so the decoder accepts the
   /// packet.
   fn send_next_packet(&self, codec: &mut CodecState, decoder: *mut AVCodecContext) -> bool {
-    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
     unsafe {
       {
         let mut input = self.input.lock().unwrap();
         if input.generation != codec.generation {
           return false;
         }
-        loop {
-          let mut available = input.in_buffer.len().saturating_sub(padding);
-          if input.params.complete_frames {
-            // One message, i.e. one frame, per parse.
-            available = input.slice_to_pts.front().map_or(available, |(end, _)| (*end).min(available));
-          }
-          if available == 0 {
-            return false;
-          }
-          let pts = input.slice_to_pts.front().map_or(ffi::AV_NOPTS_VALUE, |(_, pts)| *pts);
-          let used = ffi::av_parser_parse2(
-            input.parser, decoder,
-            &mut (*input.parser_packet).data,
-            &mut (*input.parser_packet).size,
-            input.in_buffer.as_ptr(),
-            available as i32,
-            pts, ffi::AV_NOPTS_VALUE,
-            input.num_input_bytes
-          );
-          assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
-
-          // The parsed packet can point into in_buffer, so it's copied before
-          // consume_input shifts the buffer.
-          let mut got_packet = false;
-          if (*input.parser_packet).size > 0 {
-            let key_frame = (*input.parser).key_frame == 1
-              || (*input.parser).pict_type == ffi::AVPictureType::AV_PICTURE_TYPE_I as i32;
-            if key_frame || !input.need_key_frame {
-              input.need_key_frame = false;
-              (*input.parser_packet).pts = (*input.parser).pts;
-              let ret = ffi::av_packet_ref(codec.packet_in, input.parser_packet);
-              assert!(ret >= 0, "av_packet_ref: {}", av_error_string(ret));
-              got_packet = true;
-            }
-          }
-          input.consume_input(used as usize);
-
-          if got_packet {
-            break;
-          }
-          if used == 0 {
-            return false;
-          }
+        if !input.parse_packet(decoder, codec.packet_in) {
+          return false;
         }
       }
 
@@ -1040,7 +1103,9 @@ impl ImageConverter {
     }
   }
 
-  /// The next converted image: one per frame.
+  /// The next converted image: one per frame, or for encoded output, one per
+  /// packet the encoder produces, so one per coded picture. Either is timed
+  /// by when its picture was acquired.
   pub fn pull(&self) -> Option<Box<dyn NodeData + '_>> {
     // Ends when pull returns, so it includes waiting for the codec lock.
     let _trace = self.api.trace_event(c"ImageConverter::pull");
@@ -1063,50 +1128,258 @@ impl ImageConverter {
       encoded
     };
 
-    let mut frame = if encoded {
-      let _trace = self.api.trace_event(c"ImageConverter::decode");
-      self.next_decoded_frame(&mut codec)?
-    } else {
-      self.pool.lock().unwrap().get_pending(codec.generation)?
-    };
-    let pts = unsafe { (*frame).pts };
-    let (time, frame_interval) = self.input.lock().unwrap().take_time(pts)
-      .unwrap_or_else(|| (self.api.time(), codec.frame_interval));
+    loop {
+      if let Some((data, time, frame_interval)) = codec.packets.pop_front() {
+        let output = codec.output.expect("an encoded packet without an output format");
+        codec.out_buffer = data;
+        return Some(Box::new(EncodedImage {
+          codec,
+          frame_interval,
+          time,
+          format: output.format,
+          width: output.width,
+          height: output.height,
+        }));
+      }
 
-    let output = codec.output.expect("a converted frame without an output format");
-    let Some(codec_id) = output.codec_id else {
-      return Some(Box::new(RawImage {
-        frame,
-        num_planes: pix_to_num_planes(output.pix),
-        plane_heights: pix_to_height(output.height, output.pix),
-        frame_interval,
-        format: output.format,
-        time,
-      }));
-    };
-    {
+      let mut frame = if encoded {
+        let _trace = self.api.trace_event(c"ImageConverter::decode");
+        self.next_decoded_frame(&mut codec)?
+      } else {
+        self.pool.lock().unwrap().get_pending(codec.generation)?
+      };
+      let pts = unsafe { (*frame).pts };
+      let (time, frame_interval) = self.input.lock().unwrap().take_time(pts)
+        .unwrap_or_else(|| (self.api.time(), codec.frame_interval));
+
+      let output = codec.output.expect("a converted frame without an output format");
+      let Some(codec_id) = output.codec_id else {
+        return Some(Box::new(RawImage {
+          frame,
+          num_planes: pix_to_num_planes(output.pix),
+          plane_heights: pix_to_height(output.height, output.pix),
+          frame_interval,
+          format: output.format,
+          time,
+        }));
+      };
       let _trace = self.api.trace_event(c"ImageConverter::encode");
       let Some(encoder) = codec.open_encoder(codec_id, &output) else {
         // No encoder (logged when opening it): the frame is dropped.
         unsafe { ffi::av_frame_free(&mut frame) };
         return None;
       };
-      codec.encode_frame(encoder, frame, frame_quality(codec_id, output.quality));
+      // Encoders may hold frames back (and then output several packets at
+      // once), so the packets, if any, are output on the next iterations.
+      codec.encode_frame(encoder, frame, frame_quality(codec_id, output.quality), time, frame_interval);
     }
-    Some(Box::new(EncodedImage {
-      codec,
-      frame_interval,
-      time,
-      format: output.format,
-      width: output.width,
-      height: output.height,
-    }))
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  fn default_params() -> ConverterParams {
+    ConverterParams {
+      format: None,
+      width: None,
+      height: None,
+      mpeg4_quality: None,
+      complete_frames: false,
+      h264_quality: None,
+      vp9_quality: None,
+    }
+  }
+
+  #[test]
+  fn message_times_are_kept_for_frames_that_come_out_of_order() {
+    let ms = |n: i64| Duration::from_millis(n as u64);
+    let mut input = InputState::new(default_params(), 0);
+    for pts in 0..25 {
+      input.pts_to_time.push_back((pts, ms(pts), ms(33)));
+    }
+    // Decode order 0 (I), 1 (P), 2 (B), 3 (B) comes out as 0, 2, 3, 1.
+    for pts in [0, 2, 3, 1] {
+      assert_eq!(input.take_time(pts), Some((ms(pts), ms(33))), "pts {}", pts);
+    }
+    assert_eq!(input.take_time(2), None);
+    // Message 4 produced no frame: it's dropped once a frame more than 16
+    // messages later comes out.
+    assert_eq!(input.take_time(20), Some((ms(20), ms(33))));
+    assert!(input.pts_to_time.iter().any(|(p, _, _)| *p == 4));
+    assert_eq!(input.take_time(21), Some((ms(21), ms(33))));
+    assert_eq!(input.take_time(4), None);
+  }
+
+  const TEST_SIZE: i32 = 64;
+
+  /// MPEG4 from FFmpeg's encoder, frame k a flat TEST_SIZE square of
+  /// brightness 20 k: (packet data, the frame it shows) in decode order.
+  fn encode_mpeg4_test_stream(frames: i64, max_b_frames: i32) -> Vec<(Vec<u8>, i64)> {
+    const SIZE: i32 = TEST_SIZE;
+    unsafe {
+      let encoder_codec = ffi::avcodec_find_encoder(ffi::AVCodecID::AV_CODEC_ID_MPEG4);
+      let mut encoder = ffi::avcodec_alloc_context3(encoder_codec);
+      (*encoder).width = SIZE;
+      (*encoder).height = SIZE;
+      (*encoder).pix_fmt = AVPixelFormat::AV_PIX_FMT_YUV420P;
+      (*encoder).time_base = ffi::AVRational { num: 1, den: 30 };
+      (*encoder).framerate = ffi::AVRational { num: 30, den: 1 };
+      (*encoder).max_b_frames = max_b_frames;
+      assert!(ffi::avcodec_open2(encoder, encoder_codec, std::ptr::null_mut()) >= 0);
+      let mut frame = ffi::av_frame_alloc();
+      (*frame).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+      (*frame).width = SIZE;
+      (*frame).height = SIZE;
+      assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+      let mut packets: Vec<(Vec<u8>, i64)> = vec![];
+      let mut packet = ffi::av_packet_alloc();
+      let drain = |packets: &mut Vec<(Vec<u8>, i64)>| {
+        while ffi::avcodec_receive_packet(encoder, packet) >= 0 {
+          let data = std::slice::from_raw_parts((*packet).data, (*packet).size as usize).to_vec();
+          packets.push((data, (*packet).pts));
+          ffi::av_packet_unref(packet);
+        }
+      };
+      for k in 0..frames {
+        assert!(ffi::av_frame_make_writable(frame) >= 0);
+        for (plane, value, height) in [(0, (20 * k) as u8, SIZE), (1, 128, SIZE / 2), (2, 128, SIZE / 2)] {
+          for row in 0..height {
+            let start = (*frame).data[plane].offset((row * (*frame).linesize[plane]) as isize);
+            std::ptr::write_bytes(start, value, (SIZE / if plane == 0 { 1 } else { 2 }) as usize);
+          }
+        }
+        (*frame).pts = k;
+        assert!(ffi::avcodec_send_frame(encoder, frame) >= 0);
+        drain(&mut packets);
+      }
+      assert!(ffi::avcodec_send_frame(encoder, std::ptr::null()) >= 0);
+      drain(&mut packets);
+      ffi::av_packet_free(&mut packet);
+      ffi::av_frame_free(&mut frame);
+      ffi::avcodec_free_context(&mut encoder);
+      packets
+    }
+  }
+
+  #[test]
+  fn parsed_frames_carry_their_messages_pts_when_several_are_buffered() {
+    let packets = encode_mpeg4_test_stream(8, 0);
+    for complete_frames in [false, true] {
+      let mut codec = CodecState::new(0);
+      let source = ImageSource { format: ImageFormat::MPEG4, pix: AVPixelFormat::AV_PIX_FMT_YUV420P, width: TEST_SIZE, height: TEST_SIZE };
+      codec.source = Some(source);
+      codec.frame_interval = Duration::from_millis(33);
+      let decoder = codec.open_decoder();
+      let mut input = InputState::new(ConverterParams { complete_frames, ..default_params() }, 0);
+      input.configure(source, &Mutex::new(FramePool::new(FramePoolParams::empty(), 0)));
+      // Every message is buffered before any is parsed.
+      for (pts, (data, _)) in packets.iter().enumerate() {
+        input.queue_encoded(pts as i64, data);
+      }
+      let mut parsed = vec![];
+      while input.parse_packet(decoder, codec.packet_in) {
+        unsafe {
+          parsed.push((*codec.packet_in).pts);
+          ffi::av_packet_unref(codec.packet_in);
+        }
+      }
+      // Without complete_frames, the last frame waits for the next one's start.
+      let parsed_frames = if complete_frames { packets.len() } else { packets.len() - 1 };
+      assert_eq!(parsed, (0..parsed_frames as i64).collect::<Vec<_>>(), "complete_frames {}", complete_frames);
+    }
+  }
+
+  #[test]
+  fn decoded_b_frames_come_out_in_presentation_order_with_their_messages_times() {
+    const SIZE: i32 = TEST_SIZE;
+    const FRAMES: i64 = 12;
+    unsafe {
+      let packets = encode_mpeg4_test_stream(FRAMES, 2);
+      assert_ne!(packets.iter().map(|(_, k)| *k).collect::<Vec<_>>(), (0..FRAMES).collect::<Vec<_>>(),
+        "the encoder made no B-frames");
+
+      // Decoded as the converter does: messages in decode order, the time of
+      // message n is n ms, and each packet carries its message's pts.
+      let mut codec = CodecState::new(0);
+      codec.source = Some(ImageSource { format: ImageFormat::MPEG4, pix: AVPixelFormat::AV_PIX_FMT_YUV420P, width: SIZE, height: SIZE });
+      codec.frame_interval = Duration::from_millis(33);
+      let decoder = codec.open_decoder();
+      let mut input = InputState::new(default_params(), 0);
+      // (frame shown, its time)
+      let mut shown: Vec<(i64, Option<Duration>)> = vec![];
+      let receive = |input: &mut InputState, shown: &mut Vec<(i64, Option<Duration>)>| {
+        while ffi::avcodec_receive_frame(decoder, codec.decoder_frame) >= 0 {
+          let decoded = codec.decoder_frame;
+          let brightness = i64::from(*(*decoded).data[0]);
+          shown.push(((brightness + 10) / 20, input.take_time((*decoded).pts).map(|(time, _)| time)));
+          ffi::av_frame_unref(decoded);
+        }
+      };
+      let mut packet = ffi::av_packet_alloc();
+      for (pts, (data, _)) in packets.iter().enumerate() {
+        let pts = pts as i64;
+        input.pts_to_time.push_back((pts, Duration::from_millis(pts as u64), Duration::from_millis(33)));
+        assert!(ffi::av_new_packet(packet, data.len() as i32) >= 0);
+        std::ptr::copy_nonoverlapping(data.as_ptr(), (*packet).data, data.len());
+        (*packet).pts = pts;
+        assert!(ffi::avcodec_send_packet(decoder, packet) >= 0);
+        ffi::av_packet_unref(packet);
+        receive(&mut input, &mut shown);
+      }
+      assert!(ffi::avcodec_send_packet(decoder, std::ptr::null()) >= 0);
+      receive(&mut input, &mut shown);
+      ffi::av_packet_free(&mut packet);
+
+      let expected: Vec<(i64, Option<Duration>)> = (0..FRAMES).map(|k| {
+        let message = packets.iter().position(|(_, shows)| *shows == k).unwrap();
+        (k, Some(Duration::from_millis(message as u64)))
+      }).collect();
+      assert_eq!(shown, expected);
+    }
+  }
+
+  #[test]
+  fn each_encoded_packet_is_queued_with_its_frames_time() {
+    const SIZE: i32 = 64;
+    let ms = |n: u64| Duration::from_millis(n);
+    let mut codec = CodecState::new(0);
+    codec.frame_interval = ms(33);
+    let output = OutputConfig {
+      format: ImageFormat::MPEG4,
+      pix: AVPixelFormat::AV_PIX_FMT_YUV420P,
+      width: SIZE,
+      height: SIZE,
+      codec_id: Some(ffi::AVCodecID::AV_CODEC_ID_MPEG4),
+      quality: 5,
+    };
+    let encoder = codec.open_encoder(ffi::AVCodecID::AV_CODEC_ID_MPEG4, &output).expect("no MPEG4 encoder");
+    // Frames in presentation order of re-encoded input with B-frames: their
+    // times aren't in the order the frames are sent.
+    let times = [0, 2, 3, 1, 5, 6, 4];
+    unsafe {
+      for (k, t) in times.iter().enumerate() {
+        let frame = ffi::av_frame_alloc();
+        (*frame).format = AVPixelFormat::AV_PIX_FMT_YUV420P as i32;
+        (*frame).width = SIZE;
+        (*frame).height = SIZE;
+        assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+        for plane in 0..3 {
+          let rows = if plane == 0 { SIZE } else { SIZE / 2 };
+          std::ptr::write_bytes((*frame).data[plane], (20 * k) as u8, (rows * (*frame).linesize[plane]) as usize);
+        }
+        codec.encode_frame(encoder, frame, frame_quality(ffi::AVCodecID::AV_CODEC_ID_MPEG4, 5), ms(*t), ms(30 + k as u64));
+      }
+    }
+    let queued: Vec<(Duration, Duration)> = codec.packets.iter().map(|(data, time, interval)| {
+      assert!(!data.is_empty());
+      (*time, *interval)
+    }).collect();
+    let expected: Vec<(Duration, Duration)> = times.iter().enumerate().map(|(k, t)| (ms(*t), ms(30 + k as u64))).collect();
+    assert_eq!(queued, expected);
+    assert!(codec.encoder_times.is_empty());
+  }
 
   #[test]
   fn image_converter_can_be_shared_between_threads() {

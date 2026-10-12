@@ -2,6 +2,7 @@
 //! analog data with an AudioConverter.
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use crate::api::{NodeData, ThalamusAPIThreadSafe};
 use crate::audio_converter::{AudioConverter, AudioConverterParams};
@@ -50,12 +51,19 @@ impl MediaConverter {
     self.audio.push(data);
   }
 
-  /// The next converted message: audio if there is any, otherwise an image.
-  /// Neither converter's pull holds up pushes.
-  pub fn pull(&self) -> Option<Box<dyn NodeData + '_>> {
+  /// The next converted message, audio if there is any, otherwise an image,
+  /// and the time of the input message that produced it. Outputs are timed
+  /// by when their data was acquired, which for encoded audio is earlier
+  /// than that input. Neither converter's pull holds up pushes.
+  pub fn pull(&self) -> Option<(Box<dyn NodeData + '_>, Duration)> {
     if let Some(output) = self.audio.pull() {
-      return Some(Box::new(output));
+      let input_time = output.input_time();
+      return Some((Box::new(output), input_time));
     }
-    self.image.pull()
+    // Images keep their input's time.
+    self.image.pull().map(|output| {
+      let input_time = output.time();
+      (output, input_time)
+    })
   }
 }

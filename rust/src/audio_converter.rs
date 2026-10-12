@@ -1,7 +1,14 @@
 //! The audio half of the converter: turns analog data into a target audio
-//! format. Raw formats are converted sample by sample; AAC is encoded with
-//! FFmpeg (swresample -> audio FIFO -> aac encoder, framed as ADTS) and
-//! decoded with FFmpeg (aac parser -> aac decoder).
+//! format. Raw formats are converted sample by sample; AAC and Opus are
+//! encoded with FFmpeg (swresample -> audio FIFO -> encoder, framed as ADTS or
+//! with MPEG-TS Opus control headers) and decoded with FFmpeg (parser ->
+//! decoder).
+//!
+//! Every output's time is when its last sample was acquired, through any
+//! encoding or decoding: an encoded message's packets hold audio from before
+//! the input that completed them, so it gets the time of the last sample in
+//! its packets, and encoded_count is the number of samples they hold. Readers
+//! can place the audio from those two alone, without knowing the encoder.
 //!
 //! Integer and float samples are related the way audio code usually relates
 //! them: an i16 of 32767 is just under 1.0, an i32 of 2^31 - 1 is just under
@@ -73,7 +80,13 @@ pub enum AudioFormat {
 pub struct AudioOutput<'a> {
   codec: MutexGuard<'a, CodecState>,
   frame: Option<*mut ffi::AVFrame>,
+  /// When its last sample was acquired, whatever encoding or decoding it
+  /// went through.
   time: Duration,
+  /// The time of the input message whose push produced it, which is when
+  /// it became available (for latency stats). Encoded output's packets hold
+  /// earlier audio, so this is later than `time`.
+  input_time: Duration,
   encoded_count: i32
 }
 
@@ -99,6 +112,10 @@ impl<'a> NodeData for AudioOutput<'a> {
 }
 
 impl<'a> AudioOutput<'a> {
+  pub fn input_time(&self) -> Duration {
+    self.input_time
+  }
+
   fn av_format(&self) -> ffi::AVSampleFormat {
     unsafe {
       self.frame.map(|f| {
@@ -521,6 +538,16 @@ fn get_input_range(params: &AudioConverterParams, input: &dyn AnalogData) -> Inp
   InputChannels { range, format, sample_interval, names, encoding }
 }
 
+/// An input message's time (that of its last sample) under its seq.
+/// Encoded messages also keep how many samples their packets hold and how many
+/// of those have been decoded, to time each decoded frame.
+struct MessageTime {
+  seq: i64,
+  time: Duration,
+  encoded_count: u64,
+  decoded: u64,
+}
+
 /// What push works on, under the input lock: the input's channels, the
 /// message times, the AAC parser's input and the raw input's conversion.
 /// Resetting replaces it with a fresh state of the next generation.
@@ -531,14 +558,18 @@ struct InputState {
   input: Option<InputChannels>,
   rejection_logged: bool,
 
-  pts: i64,
-  pts_to_time: VecDeque<(i64, Duration)>,
+  /// Sequence number of the next encoded message, or for raw input, of the
+  /// next converted frame. It's an ID, not a time: it travels in the pts
+  /// field of the parser's packets, the decoder's frames and raw input's
+  /// converted frames, and finds their message's time in seq_to_time.
+  seq: i64,
+  seq_to_time: VecDeque<MessageTime>,
 
   // Encoded input: bytes waiting for the parser, which pull runs.
   parser: *mut ffi::AVCodecParserContext,
   parser_packet: *mut ffi::AVPacket,
   in_buffer: Vec<u8>,
-  slice_to_pts: VecDeque<(usize, i64)>,
+  slice_to_seq: VecDeque<(usize, i64)>,
   num_input_bytes: i64,
 
   // Raw input, converted here.
@@ -562,12 +593,12 @@ impl InputState {
       generation,
       input: None,
       rejection_logged: false,
-      pts: 0,
-      pts_to_time: VecDeque::new(),
+      seq: 0,
+      seq_to_time: VecDeque::new(),
       parser: std::ptr::null_mut(),
       parser_packet: std::ptr::null_mut(),
       in_buffer: vec![],
-      slice_to_pts: VecDeque::new(),
+      slice_to_seq: VecDeque::new(),
       num_input_bytes: 0,
       output: None,
       layout: unsafe { std::mem::zeroed() },
@@ -591,42 +622,112 @@ impl InputState {
     }
   }
 
-  /// Appends an encoded message's bytes for the parser.
-  fn queue_encoded(&mut self, time: Duration, bytes: &[u8]) {
-    let pts = self.pts;
-    self.pts_to_time.push_back((pts, time));
-    self.pts += 1;
+  /// Appends an encoded message's bytes, which hold `encoded_count` samples
+  /// per channel, for the parser.
+  fn queue_encoded(&mut self, time: Duration, bytes: &[u8], encoded_count: u64) {
+    let seq = self.seq;
+    self.seq_to_time.push_back(MessageTime { seq, time, encoded_count, decoded: 0 });
+    self.seq += 1;
 
     let buffer_pos = self.in_buffer.len() - AV_INPUT_BUFFER_PADDING_SIZE as usize;
     self.in_buffer.resize(self.in_buffer.len() + bytes.len(), 0);
     let end = buffer_pos + bytes.len();
     self.in_buffer[buffer_pos..end].copy_from_slice(bytes);
-    self.slice_to_pts.push_back((end, pts));
+    self.slice_to_seq.push_back((end, seq));
   }
 
-  /// Drops the first `used` bytes of buffered input along with the pts slices
-  /// that end inside them.
+  /// Parses buffered input until one packet is ready and references it in
+  /// `packet` with the seq of its message as pts. Returns false when no
+  /// complete packet is buffered.
+  ///
+  /// The parser is given one message at a time: it only takes a new pts for
+  /// a new range of input, and gives it to the first packet that starts in
+  /// it, so packets from a second buffered message, or the second packet of
+  /// a message, would come out with none. A packet that completes while a
+  /// message is parsed ends in it, so one the parser gives no pts gets that
+  /// message's seq.
+  fn parse_packet(&mut self, decoder: *mut ffi::AVCodecContext, packet: *mut ffi::AVPacket) -> bool {
+    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
+    unsafe {
+      loop {
+        let buffered = self.in_buffer.len().saturating_sub(padding);
+        let Some(&(end, seq)) = self.slice_to_seq.front() else {
+          return false;
+        };
+        let available = end.min(buffered);
+        if available == 0 {
+          return false;
+        }
+        let used = ffi::av_parser_parse2(
+          self.parser, decoder,
+          &mut (*self.parser_packet).data,
+          &mut (*self.parser_packet).size,
+          self.in_buffer.as_ptr(),
+          available as i32,
+          seq, ffi::AV_NOPTS_VALUE,
+          self.num_input_bytes
+        );
+        assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
+
+        // The parsed packet can point into in_buffer, so it's copied before
+        // consume_input shifts the buffer.
+        let got_packet = (*self.parser_packet).size > 0;
+        if got_packet {
+          let parsed = (*self.parser).pts;
+          (*self.parser_packet).pts = if parsed == ffi::AV_NOPTS_VALUE { seq } else { parsed };
+          let ret = ffi::av_packet_ref(packet, self.parser_packet);
+          assert!(ret >= 0, "av_packet_ref: {}", av_error_string(ret));
+        }
+        self.consume_input(used as usize);
+
+        if got_packet {
+          return true;
+        }
+        if used == 0 {
+          return false;
+        }
+      }
+    }
+  }
+
+  /// Drops the first `used` bytes of buffered input along with the slices
+  /// (and their seqs) that end inside them.
   fn consume_input(&mut self, used: usize) {
     if used == 0 {
       return;
     }
     self.in_buffer.drain(..used);
     self.num_input_bytes += used as i64;
-    while self.slice_to_pts.front().is_some_and(|(end, _)| *end <= used) {
-      self.slice_to_pts.pop_front();
+    while self.slice_to_seq.front().is_some_and(|(end, _)| *end <= used) {
+      self.slice_to_seq.pop_front();
     }
-    for (end, _) in self.slice_to_pts.iter_mut() {
+    for (end, _) in self.slice_to_seq.iter_mut() {
       *end -= used;
     }
   }
 
-  /// The time of the input message that produced `pts`. Earlier entries
+  /// The time of the input message that produced `seq`. Earlier entries
   /// belong to messages that produced no frame of their own and are dropped.
-  fn take_time(&mut self, pts: i64) -> Option<Duration> {
-    let i = self.pts_to_time.iter().position(|(p, _)| *p == pts)?;
-    let time = self.pts_to_time[i].1;
-    self.pts_to_time.drain(..=i);
+  fn take_time(&mut self, seq: i64) -> Option<Duration> {
+    let i = self.seq_to_time.iter().position(|m| m.seq == seq)?;
+    let time = self.seq_to_time[i].time;
+    self.seq_to_time.drain(..=i);
     Some(time)
+  }
+
+  /// For a frame of `samples` samples (at `rate`) decoded from the message
+  /// with `seq`: when its last sample was acquired, and the message's time.
+  /// A message's time is that of the last sample its packets decode to, so
+  /// each frame is that time less the message's samples decoded after it.
+  /// The message is kept for its later frames; earlier ones are dropped.
+  fn decoded_time(&mut self, seq: i64, samples: u64, rate: i32) -> Option<(Duration, Duration)> {
+    let i = self.seq_to_time.iter().position(|m| m.seq == seq)?;
+    self.seq_to_time.drain(..i);
+    let message = &mut self.seq_to_time[0];
+    message.decoded += samples;
+    let after = message.encoded_count.saturating_sub(message.decoded);
+    let time = message.time.saturating_sub(samples_to_duration(after, rate));
+    Some((time, message.time))
   }
 
   /// Chooses the raw input's output format and sets up its resamplers and
@@ -700,16 +801,16 @@ impl InputState {
         in_counts.iter().all(|c| *c == first_count) && self.sample_buffers.iter().all(|b| b.is_empty()));
 
       if use_multi {
-        let pts = self.pts;
-        self.pts_to_time.push_back((pts, time));
-        self.pts += 1;
+        let seq = self.seq;
+        self.seq_to_time.push_back(MessageTime { seq, time, encoded_count: 0, decoded: 0 });
+        self.seq += 1;
 
         let out_samples = ffi::swr_get_out_samples(multi_sampler, first_count);
         let frame = pool.lock().unwrap().get_writable(out_samples);
         let converted = ffi::swr_convert(multi_sampler, (*frame).extended_data, out_samples, in_ptrs.as_ptr(), first_count);
         assert!(converted >= 0, "swr_convert: {}", av_error_string(converted));
         (*frame).nb_samples = converted;
-        (*frame).pts = pts;
+        (*frame).pts = seq;
         pool.lock().unwrap().push_pending(frame, self.generation);
       } else {
         // Buffers hold output-rate samples in the destination format; all
@@ -817,6 +918,12 @@ pub struct CodecState {
   /// doesn't hold the input lock.
   packet_in: *mut ffi::AVPacket,
   decoded_sampler: *mut ffi::SwrContext,
+  /// Sequence number of the next decoded frame, which replaces its
+  /// message's seq in the frame's pts field: several frames can come from one
+  /// message. decoded_times keeps each frame's time and its message's time
+  /// under it.
+  decoded_seq: i64,
+  decoded_times: VecDeque<(i64, Duration, Duration)>,
 
   // Encoded output
   encoder: Option<*mut ffi::AVCodecContext>,
@@ -824,6 +931,16 @@ pub struct CodecState {
   fifo_frame: *mut ffi::AVFrame,
   packet: *mut ffi::AVPacket,
   encoder_pts: i64,
+  /// Samples written to the FIFO, so the encoder's input sample index past
+  /// the last one.
+  fifo_written: i64,
+  /// (encoder input sample index, its acquisition time) for the last sample
+  /// of each frame written to the FIFO and not yet fully output.
+  sample_times: VecDeque<(i64, Duration)>,
+  /// Samples in the packets out_buffer holds, and the encoder input index of
+  /// the last one.
+  out_samples: i64,
+  out_last_sample: Option<i64>,
   out_buffer: Vec<u8>,
 }
 
@@ -841,11 +958,17 @@ impl CodecState {
       decoder_frame: std::ptr::null_mut(),
       packet_in: std::ptr::null_mut(),
       decoded_sampler: std::ptr::null_mut(),
+      decoded_seq: 0,
+      decoded_times: VecDeque::new(),
       encoder: None,
       fifo: std::ptr::null_mut(),
       fifo_frame: std::ptr::null_mut(),
       packet: std::ptr::null_mut(),
       encoder_pts: 0,
+      fifo_written: 0,
+      sample_times: VecDeque::new(),
+      out_samples: 0,
+      out_last_sample: None,
       out_buffer: vec![],
     }
   }
@@ -871,7 +994,6 @@ impl CodecState {
         (*context).ch_layout = default_layout(input.range.len());
         (*context).sample_rate = 48000;
       }
-      (*context).flags |= ffi::AV_CODEC_FLAG_LOW_DELAY as i32;
       let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
       if ret < 0 {
         ffi::avcodec_free_context(&mut context);
@@ -921,21 +1043,31 @@ impl CodecState {
       self.packet = ffi::av_packet_alloc();
       assert!(!self.packet.is_null(), "av_packet_alloc");
       self.encoder_pts = 0;
+      self.fifo_written = 0;
+      self.sample_times.clear();
       self.encoder = Some(context);
       context
     }
   }
 
-  /// Sends `frame`'s samples through the FIFO into the encoder and appends
-  /// every packet it produces, ADTS framed, to out_buffer. Frees `frame`.
-  /// Returns the number of samples pushed, which the encoder will eventually
-  /// output even if it holds them in the FIFO or its own delay for now.
-  fn encode_frame(&mut self, encoder: *mut ffi::AVCodecContext, mut frame: *mut ffi::AVFrame) -> i32 {
+  /// Sends `frame`'s samples, the last acquired at `time`, through the FIFO
+  /// into the encoder and appends every packet it produces, framed (ADTS or
+  /// Opus control headers), to out_buffer. Frees `frame`. Returns when the
+  /// last sample in the packets was acquired and how many samples they hold,
+  /// or None when the encoder holds everything in the FIFO or its own delay
+  /// for now.
+  fn encode_frame(&mut self, encoder: *mut ffi::AVCodecContext, mut frame: *mut ffi::AVFrame, time: Duration) -> Option<(Duration, i32)> {
     unsafe {
       let nb_samples = (*frame).nb_samples;
       let ret = ffi::av_audio_fifo_write(self.fifo, (*frame).extended_data as *const *mut c_void, nb_samples);
       assert!(ret == nb_samples, "av_audio_fifo_write {}", av_error_string(ret));
       ffi::av_frame_free(&mut frame);
+      if nb_samples > 0 {
+        self.fifo_written += i64::from(nb_samples);
+        self.sample_times.push_back((self.fifo_written - 1, time));
+      }
+      self.out_samples = 0;
+      self.out_last_sample = None;
 
       let frame_size = (*encoder).frame_size;
       while ffi::av_audio_fifo_size(self.fifo) >= frame_size {
@@ -953,7 +1085,14 @@ impl CodecState {
         // Drain after every send, or the next send can return EAGAIN.
         self.receive_packets(encoder);
       }
-      nb_samples
+
+      let last = self.out_last_sample?;
+      let time = time_of_sample(&self.sample_times, last, (*encoder).sample_rate);
+      // Later packets only hold later samples.
+      while self.sample_times.len() > 1 && self.sample_times[0].0 < last {
+        self.sample_times.pop_front();
+      }
+      Some((time, self.out_samples as i32))
     }
   }
 
@@ -965,6 +1104,13 @@ impl CodecState {
           break;
         }
         assert!(ret >= 0, "Error during encoding: {}", av_error_string(ret));
+
+        // The packet decodes to the encoder's input samples [pts, pts +
+        // duration): its pts is in samples (the encoder's time base) and
+        // already accounts for the encoder's delay.
+        let duration = if (*self.packet).duration > 0 { (*self.packet).duration } else { i64::from((*encoder).frame_size) };
+        self.out_samples += duration;
+        self.out_last_sample = Some((*self.packet).pts + duration - 1);
 
         let size = (*self.packet).size as usize;
         if (*encoder).codec_id == ffi::AVCodecID::AV_CODEC_ID_OPUS {
@@ -1001,6 +1147,21 @@ impl Drop for CodecState {
       }
       ffi::av_channel_layout_uninit(&mut self.layout);
     }
+  }
+}
+
+/// When the encoder input sample `index` was acquired, from (index, time)
+/// pairs in increasing order of the samples written to the encoder. Samples
+/// between pairs are timed back from the next one at `rate`; samples past the
+/// last one (or before the first one, like an encoder's priming) are timed
+/// from the nearest one.
+fn time_of_sample(times: &VecDeque<(i64, Duration)>, index: i64, rate: i32) -> Duration {
+  match times.iter().find(|(i, _)| *i >= index) {
+    Some((i, time)) => time.saturating_sub(samples_to_duration((i - index) as u64, rate)),
+    None => match times.back() {
+      Some((i, time)) => *time + samples_to_duration((index - i) as u64, rate),
+      None => Duration::ZERO,
+    },
   }
 }
 
@@ -1096,7 +1257,7 @@ impl AudioConverter {
       (input.format == AnalogFormat::Encoded, input.range.clone())
     };
     if encoded {
-      state.queue_encoded(data.time(), analog.buffer());
+      state.queue_encoded(data.time(), analog.buffer(), analog.encoded_count());
       return;
     }
 
@@ -1116,46 +1277,14 @@ impl AudioConverter {
   /// reset. Only called after avcodec_receive_frame returned EAGAIN, so the
   /// decoder accepts the packet.
   fn send_next_packet(&self, codec: &mut CodecState, decoder: *mut ffi::AVCodecContext) -> bool {
-    let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
     unsafe {
       {
         let mut input = self.input.lock().unwrap();
         if input.generation != codec.generation {
           return false;
         }
-        loop {
-          let available = input.in_buffer.len().saturating_sub(padding);
-          if available == 0 {
-            return false;
-          }
-          let pts = input.slice_to_pts.front().map_or(ffi::AV_NOPTS_VALUE, |(_, pts)| *pts);
-          let used = ffi::av_parser_parse2(
-            input.parser, decoder,
-            &mut (*input.parser_packet).data,
-            &mut (*input.parser_packet).size,
-            input.in_buffer.as_ptr(),
-            available as i32,
-            pts, ffi::AV_NOPTS_VALUE,
-            input.num_input_bytes
-          );
-          assert!(used >= 0, "av_parser_parse2: {}", av_error_string(used));
-
-          // The parsed packet can point into in_buffer, so it's copied before
-          // consume_input shifts the buffer.
-          let got_packet = (*input.parser_packet).size > 0;
-          if got_packet {
-            (*input.parser_packet).pts = (*input.parser).pts;
-            let ret = ffi::av_packet_ref(codec.packet_in, input.parser_packet);
-            assert!(ret >= 0, "av_packet_ref: {}", av_error_string(ret));
-          }
-          input.consume_input(used as usize);
-
-          if got_packet {
-            break;
-          }
-          if used == 0 {
-            return false;
-          }
+        if !input.parse_packet(decoder, codec.packet_in) {
+          return false;
         }
       }
 
@@ -1193,6 +1322,16 @@ impl AudioConverter {
       let src_sample_format = std::mem::transmute::<i32, ffi::AVSampleFormat>((*decoder_frame).format);
       let src_sample_rate = (*decoder_frame).sample_rate;
       let nb_samples = (*decoder_frame).nb_samples;
+
+      // Several frames can come from one message's packets, so frames are
+      // timed here and get their own seq. The decoder passed the message's
+      // seq through in pts.
+      let times = self.input.lock().unwrap()
+        .decoded_time((*decoder_frame).pts, nb_samples as u64, src_sample_rate)
+        .unwrap_or_else(|| { let now = self.api.time(); (now, now) });
+      let frame_seq = codec.decoded_seq;
+      codec.decoded_seq += 1;
+      codec.decoded_times.push_back((frame_seq, times.0, times.1));
 
       // The output format depends on what the decoder produces, so it's
       // chosen here, from the first decoded frame.
@@ -1234,6 +1373,7 @@ impl AudioConverter {
         let frame = ffi::av_frame_clone(decoder_frame);
         assert!(!frame.is_null(), "av_frame_clone failed");
         ffi::av_frame_unref(decoder_frame);
+        (*frame).pts = frame_seq;
         return Some(frame);
       }
 
@@ -1248,7 +1388,7 @@ impl AudioConverter {
         nb_samples);
       assert!(converted >= 0, "swr_convert: {}", av_error_string(converted));
       (*frame).nb_samples = converted;
-      (*frame).pts = (*decoder_frame).pts;
+      (*frame).pts = frame_seq;
       ffi::av_frame_unref(decoder_frame);
 
       let mut pool = self.pool.lock().unwrap();
@@ -1259,9 +1399,10 @@ impl AudioConverter {
     }
   }
 
-  /// The next converted message: one per frame. Encoded outputs are emitted
-  /// even when the encoder produced no packets yet: the buffer is empty and
-  /// encoded_count is the number of samples pushed.
+  /// The next converted message: one per frame, or for encoded output, one
+  /// per frame whose encoding produced packets. Its time is when its last
+  /// sample was acquired (for encoded output, the last sample in its
+  /// packets, whose samples encoded_count gives), not when it was converted.
   pub fn pull(&self) -> Option<AudioOutput<'_>> {
     // Ends when pull returns, so it includes waiting for the codec lock.
     let _trace = self.api.trace_event(c"AudioConverter::pull");
@@ -1285,32 +1426,77 @@ impl AudioConverter {
       encoded
     };
 
-    let frame = if encoded {
-      let _trace = self.api.trace_event(c"AudioConverter::decode");
-      self.next_decoded_frame(&mut codec)?
-    } else {
-      self.pool.lock().unwrap().get_pending(codec.generation)?
-    };
-    let pts = unsafe { (*frame).pts };
-    let time = self.input.lock().unwrap().take_time(pts).unwrap_or_else(|| self.api.time());
+    loop {
+      let frame = if encoded {
+        let _trace = self.api.trace_event(c"AudioConverter::decode");
+        self.next_decoded_frame(&mut codec)?
+      } else {
+        self.pool.lock().unwrap().get_pending(codec.generation)?
+      };
+      let seq = unsafe { (*frame).pts };
+      let (time, input_time) = if encoded {
+        let i = codec.decoded_times.iter().position(|(p, _, _)| *p == seq);
+        i.map(|i| {
+          let (_, time, input_time) = codec.decoded_times[i];
+          codec.decoded_times.drain(..=i);
+          (time, input_time)
+        })
+      } else {
+        self.input.lock().unwrap().take_time(seq).map(|time| (time, time))
+      }.unwrap_or_else(|| { let now = self.api.time(); (now, now) });
 
-    let output = codec.output.expect("a converted frame without an output format");
-    let Some(codec_id) = output.codec_id else {
-      return Some(AudioOutput { codec, frame: Some(frame), time, encoded_count: 0 });
-    };
-    let encoded_count = {
-      let _trace = self.api.trace_event(c"AudioConverter::encode");
-      let encoder = codec.open_encoder(codec_id, &output);
-      codec.out_buffer.clear();
-      codec.encode_frame(encoder, frame)
-    };
-    Some(AudioOutput { codec, frame: None, time, encoded_count })
+      let output = codec.output.expect("a converted frame without an output format");
+      let Some(codec_id) = output.codec_id else {
+        return Some(AudioOutput { codec, frame: Some(frame), time, input_time, encoded_count: 0 });
+      };
+      let packets = {
+        let _trace = self.api.trace_event(c"AudioConverter::encode");
+        let encoder = codec.open_encoder(codec_id, &output);
+        codec.out_buffer.clear();
+        codec.encode_frame(encoder, frame, time)
+      };
+      if let Some((time, encoded_count)) = packets {
+        return Some(AudioOutput { codec, frame: None, time, input_time, encoded_count });
+      }
+    }
   }
 }
 
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn samples_are_timed_from_the_frame_that_ends_at_or_after_them() {
+    let ms = Duration::from_millis;
+    // Frames of 10 samples at 1 kHz whose last samples (9, 19) were acquired
+    // at 100 ms and 110 ms.
+    let times = VecDeque::from([(9, ms(100)), (19, ms(110))]);
+    assert_eq!(time_of_sample(&times, 9, 1000), ms(100));
+    assert_eq!(time_of_sample(&times, 5, 1000), ms(96));
+    assert_eq!(time_of_sample(&times, 12, 1000), ms(103));
+    // Priming (negative indices) and samples past the last frame.
+    assert_eq!(time_of_sample(&times, -10, 1000), ms(81));
+    assert_eq!(time_of_sample(&times, 21, 1000), ms(112));
+    assert_eq!(time_of_sample(&VecDeque::new(), 5, 1000), Duration::ZERO);
+  }
+
+  #[test]
+  fn decoded_frames_are_timed_back_from_their_messages_last_sample() {
+    let ms = Duration::from_millis;
+    let mut state = InputState::new(AudioConverterParams::default(), 0);
+    // Two messages: 20 samples (two 10-sample packets) ending at 100 ms, and
+    // 10 samples ending at 110 ms, at 1 kHz.
+    state.seq_to_time.push_back(MessageTime { seq: 0, time: ms(100), encoded_count: 20, decoded: 0 });
+    state.seq_to_time.push_back(MessageTime { seq: 1, time: ms(110), encoded_count: 10, decoded: 0 });
+    assert_eq!(state.decoded_time(0, 10, 1000), Some((ms(90), ms(100))));
+    assert_eq!(state.decoded_time(0, 10, 1000), Some((ms(100), ms(100))));
+    assert_eq!(state.decoded_time(1, 10, 1000), Some((ms(110), ms(110))));
+    // A message that undercounts its samples times them all at its own time.
+    state.seq_to_time.push_back(MessageTime { seq: 2, time: ms(120), encoded_count: 5, decoded: 0 });
+    assert_eq!(state.decoded_time(2, 10, 1000), Some((ms(120), ms(120))));
+    assert_eq!(state.decoded_time(7, 10, 1000), None);
+  }
 
   #[test]
   fn opus_ts_headers_code_the_length_in_255_byte_steps() {
@@ -1372,6 +1558,133 @@ mod tests {
   fn audio_converter_can_be_shared_between_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<AudioConverter>();
+  }
+
+  /// Encodes 48 kHz stereo silence in 480-sample frames whose sample i was
+  /// acquired at 1 s + i / 48 kHz, and returns each output's time and
+  /// encoded_count.
+  fn encode_silence(codec_id: ffi::AVCodecID, frames: usize) -> Vec<(Duration, i32)> {
+    const RATE: i32 = 48000;
+    const FRAME: i32 = 480;
+    let base = Duration::from_secs(1);
+    let mut codec = CodecState::new(0);
+    codec.input = Some(InputChannels {
+      range: 0..2,
+      format: AnalogFormat::Short,
+      encoding: AnalogEncoding::None,
+      sample_interval: samples_to_duration(1, RATE),
+      names: vec!["Left".into(), "Right".into()],
+    });
+    let params = AudioConverterParams { format: Some(if codec_id == ffi::AVCodecID::AV_CODEC_ID_OPUS { AudioFormat::Opus } else { AudioFormat::AAC }), ..Default::default() };
+    let output = choose_output(&params, codec.input.as_ref().unwrap(), ffi::AVSampleFormat::AV_SAMPLE_FMT_S16, RATE);
+    let encoder = codec.open_encoder(codec_id, &output);
+    let mut outputs = vec![];
+    unsafe {
+      for k in 0..frames {
+        let frame = ffi::av_frame_alloc();
+        (*frame).format = output.sample_format as i32;
+        (*frame).sample_rate = RATE;
+        (*frame).nb_samples = FRAME;
+        ffi::av_channel_layout_copy(&mut (*frame).ch_layout, &codec.layout);
+        assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+        ffi::av_samples_set_silence((*frame).extended_data, 0, FRAME, 2, output.sample_format);
+        let last_sample = (FRAME as u64) * (k as u64 + 1) - 1;
+        let time = base + samples_to_duration(last_sample, RATE);
+        outputs.extend(codec.encode_frame(encoder, frame, time));
+      }
+    }
+    outputs
+  }
+
+  /// The time of input sample `index` (negative for priming) in encode_silence.
+  fn silence_sample_time(index: i64) -> Duration {
+    let base = Duration::from_secs(1);
+    if index >= 0 {
+      base + samples_to_duration(index as u64, 48000)
+    } else {
+      base - samples_to_duration((-index) as u64, 48000)
+    }
+  }
+
+  /// Times computed back from a frame's last sample and forward from the
+  /// first round to the nanosecond differently.
+  fn assert_close(time: Duration, expected: Duration, packet: usize) {
+    let difference = if time > expected { time - expected } else { expected - time };
+    assert!(difference < Duration::from_micros(1), "packet {}: {:?}, expected {:?}", packet, time, expected);
+  }
+
+  #[test]
+  fn parsed_packets_carry_their_messages_seq() {
+    // Messages of two AAC packets each, from the encoder.
+    let mut codec = CodecState::new(0);
+    codec.input = Some(InputChannels {
+      range: 0..2,
+      format: AnalogFormat::Short,
+      encoding: AnalogEncoding::None,
+      sample_interval: samples_to_duration(1, 48000),
+      names: vec!["Left".into(), "Right".into()],
+    });
+    let params = AudioConverterParams { format: Some(AudioFormat::AAC), ..Default::default() };
+    let output = choose_output(&params, codec.input.as_ref().unwrap(), ffi::AVSampleFormat::AV_SAMPLE_FMT_S16, 48000);
+    let encoder = codec.open_encoder(ffi::AVCodecID::AV_CODEC_ID_AAC, &output);
+    let mut packets = vec![];
+    unsafe {
+      for k in 0..20 {
+        let frame = ffi::av_frame_alloc();
+        (*frame).format = output.sample_format as i32;
+        (*frame).sample_rate = 48000;
+        (*frame).nb_samples = 1024;
+        ffi::av_channel_layout_copy(&mut (*frame).ch_layout, &codec.layout);
+        assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+        ffi::av_samples_set_silence((*frame).extended_data, 0, 1024, 2, output.sample_format);
+        codec.out_buffer.clear();
+        if codec.encode_frame(encoder, frame, Duration::from_millis(k)).is_some() {
+          packets.push(codec.out_buffer.clone());
+        }
+      }
+    }
+    let mut decoding = CodecState::new(0);
+    decoding.input = Some(InputChannels { encoding: AnalogEncoding::AAC, format: AnalogFormat::Encoded, ..codec.input.clone().unwrap() });
+    let decoder = decoding.open_decoder();
+    let mut input = InputState::new(params, 0);
+    input.configure_parser(AnalogEncoding::AAC);
+    for (m, pair) in packets.chunks(2).enumerate() {
+      input.queue_encoded(Duration::from_millis(m as u64), &pair.concat(), 2048);
+    }
+    let mut seqs = vec![];
+    while input.parse_packet(decoder, decoding.packet_in) {
+      unsafe {
+        seqs.push((*decoding.packet_in).pts);
+        ffi::av_packet_unref(decoding.packet_in);
+      }
+    }
+    let expected: Vec<i64> = (0..packets.len() as i64).map(|p| p / 2).collect();
+    assert_eq!(seqs, expected);
+  }
+
+  #[test]
+  fn aac_outputs_are_timed_by_the_last_sample_in_their_packets() {
+    // FFmpeg's AAC encoder emits packet j when it gets frame j + 1, and
+    // packet j decodes to input samples [1024 (j - 1), 1024 j), so packet 0
+    // is priming.
+    let outputs = encode_silence(ffi::AVCodecID::AV_CODEC_ID_AAC, 40);
+    assert_eq!(outputs.len(), 40 * 480 / 1024 - 1);
+    for (j, (time, count)) in outputs.iter().enumerate() {
+      assert_eq!(*count, 1024);
+      assert_close(*time, silence_sample_time(1024 * j as i64 - 1), j);
+    }
+  }
+
+  #[test]
+  fn opus_outputs_are_timed_by_the_last_sample_in_their_packets() {
+    // libopus emits packet j when it gets frame j, and packet j decodes to
+    // input samples [960 j - 312, 960 (j + 1) - 312): 312 is its pre-skip.
+    let outputs = encode_silence(ffi::AVCodecID::AV_CODEC_ID_OPUS, 40);
+    assert_eq!(outputs.len(), 40 * 480 / 960);
+    for (j, (time, count)) in outputs.iter().enumerate() {
+      assert_eq!(*count, 960);
+      assert_close(*time, silence_sample_time(960 * (j as i64 + 1) - 313), j);
+    }
   }
 
   #[test]

@@ -43,6 +43,12 @@ if(WIN32)
     --extra-cflags=-fms-runtime-lib=dll --extra-cxxflags=-fms-runtime-lib=dll)
   set(VPX_INSTALLED "${VPX_INSTALL_DIR}/lib/libvpx.a")
   set(VPX_LIBRARY "${VPX_INSTALL_DIR}/lib/vpx.lib")
+  if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # --enable-debug gives Windows targets yasm's "-g cv8", which nasm reads
+    # as -g plus a second input file; nasm selects the format with -F.
+    set(VPX_POST_CONFIGURE
+      COMMAND sed -i "s/-g cv8/-g -F cv8/" libs-x86_64-win64-gcc.mk)
+  endif()
   set(VPX_POST_INSTALL
     # clang defines _MSC_VER, so libvpx's headers call the MSVC-only x87
     # control word helpers, which only its Visual Studio builds assemble.
@@ -67,6 +73,7 @@ add_custom_command(
   OUTPUT "${VPX_LIBRARY}"
   COMMAND "${CMAKE_COMMAND}" -E env ${VPX_ENV}
     sh "${libvpx_SOURCE_DIR}/configure" ${VPX_CONFIGURE_FLAGS}
+  ${VPX_POST_CONFIGURE}
   COMMAND make -j ${CPU_COUNT}
   COMMAND make install
   ${VPX_POST_INSTALL}

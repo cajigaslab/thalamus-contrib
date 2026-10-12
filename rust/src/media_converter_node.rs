@@ -415,11 +415,12 @@ impl MediaConverterNode {
     viewer_sink: ImageSink,
   ) {
     let mut last_layout: Option<ChannelLayout> = None;
-    let mut emit = |output: &dyn NodeData| {
-      // Outputs keep their input's time, which is the key. Each output is
-      // either an image or audio.
+    let mut emit = |output: &dyn NodeData, input_time: Duration| {
+      // Arrivals are keyed by the time of the input that produced the
+      // output, which encoded audio doesn't share. Each output is either an
+      // image or audio.
       let arrivals = if output.image().is_some() { &arrivals.image } else { &arrivals.analog };
-      let latency_ms = take_latency_ms(arrivals, output.time(), api.time());
+      let latency_ms = take_latency_ms(arrivals, input_time, api.time());
       let mut stats = WithStats::new(output, latency_ms);
       // Format, sample rate, Audio Index and image vs audio outputs all show
       // up as a different layout.
@@ -441,10 +442,10 @@ impl MediaConverterNode {
           let _trace = api.trace_event(c"MediaConverter::pull");
           converter.pull()
         };
-        let Some(output) = output else {
+        let Some((output, input_time)) = output else {
           break;
         };
-        emit(&*output);
+        emit(&*output, input_time);
       }
       notify.notified().await;
     }
