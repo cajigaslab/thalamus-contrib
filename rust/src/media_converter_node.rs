@@ -337,13 +337,6 @@ impl MediaConverterNode {
           lock.params.image.h264_quality = if v > 0 { Some(v as i32) } else { None };
         }
       },
-      "Complete Frames" => {
-        if let StateValue::Bool(v) = value {
-          let mut lock = this.params.lock().unwrap();
-          lock.dirty = true;
-          lock.params.image.complete_frames = v;
-        }
-      },
       "View" => {
         if value != StateValue::Bool(true) {
           this.viewer = None;
@@ -463,7 +456,6 @@ impl Node for MediaConverterNode {
           width: None,
           height: None,
           mpeg4_quality: None,
-          complete_frames: false,
           h264_quality: None,
           vp9_quality: None,
         },

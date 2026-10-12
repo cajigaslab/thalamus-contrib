@@ -40,10 +40,6 @@ pub struct ConverterParams {
   pub h264_quality: Option<i32>,
   /// VP9 constant quality level (CRF), 0-63, lower is better.
   pub vp9_quality: Option<i32>,
-  /// Each encoded input message holds exactly one whole frame. The parser is
-  /// told so and given one message at a time, which saves it from waiting for
-  /// the next frame's start before returning a packet: one frame less latency.
-  pub complete_frames: bool,
 }
 
 fn is_compressed(format: ImageFormat) -> bool {
@@ -513,9 +509,9 @@ impl InputState {
         let codec_id = format_codec(source.format);
         self.parser = ffi::av_parser_init(codec_id as i32);
         assert!(!self.parser.is_null(), "Failed to create parser");
-        if self.params.complete_frames {
-          (*self.parser).flags |= ffi::PARSER_FLAG_COMPLETE_FRAMES as i32;
-        }
+        // Each encoded input message holds exactly one whole frame, so the
+        // parser needn't wait for the next frame's start before returning one.
+        (*self.parser).flags |= ffi::PARSER_FLAG_COMPLETE_FRAMES as i32;
         self.parser_packet = ffi::av_packet_alloc();
         assert!(!self.parser_packet.is_null(), "Failed to create parser_packet");
         self.in_buffer.resize(AV_INPUT_BUFFER_PADDING_SIZE as usize, 0);
@@ -584,11 +580,9 @@ impl InputState {
   /// message its frame starts in. Returns false when no complete packet is
   /// buffered.
   ///
-  /// The parser is given one message at a time: it only takes a new pts for
-  /// a new range of input, so frames from a second buffered message would
-  /// come out with none. Without complete_frames it finishes a frame when the
-  /// next one starts, so the frame it returns while one message is parsed
-  /// usually started in the previous one; its pts says which.
+  /// The parser is given one message at a time: each message is one whole
+  /// frame, and the parser only takes a new pts for a new range of input, so
+  /// frames from a second buffered message would come out with none.
   fn parse_packet(&mut self, decoder: *mut AVCodecContext, packet: *mut ffi::AVPacket) -> bool {
     let padding = AV_INPUT_BUFFER_PADDING_SIZE as usize;
     unsafe {
@@ -1186,7 +1180,6 @@ mod tests {
       width: None,
       height: None,
       mpeg4_quality: None,
-      complete_frames: false,
       h264_quality: None,
       vp9_quality: None,
     }
@@ -1266,29 +1259,25 @@ mod tests {
   #[test]
   fn parsed_frames_carry_their_messages_pts_when_several_are_buffered() {
     let packets = encode_mpeg4_test_stream(8, 0);
-    for complete_frames in [false, true] {
-      let mut codec = CodecState::new(0);
-      let source = ImageSource { format: ImageFormat::MPEG4, pix: AVPixelFormat::AV_PIX_FMT_YUV420P, width: TEST_SIZE, height: TEST_SIZE };
-      codec.source = Some(source);
-      codec.frame_interval = Duration::from_millis(33);
-      let decoder = codec.open_decoder();
-      let mut input = InputState::new(ConverterParams { complete_frames, ..default_params() }, 0);
-      input.configure(source, &Mutex::new(FramePool::new(FramePoolParams::empty(), 0)));
-      // Every message is buffered before any is parsed.
-      for (pts, (data, _)) in packets.iter().enumerate() {
-        input.queue_encoded(pts as i64, data);
-      }
-      let mut parsed = vec![];
-      while input.parse_packet(decoder, codec.packet_in) {
-        unsafe {
-          parsed.push((*codec.packet_in).pts);
-          ffi::av_packet_unref(codec.packet_in);
-        }
-      }
-      // Without complete_frames, the last frame waits for the next one's start.
-      let parsed_frames = if complete_frames { packets.len() } else { packets.len() - 1 };
-      assert_eq!(parsed, (0..parsed_frames as i64).collect::<Vec<_>>(), "complete_frames {}", complete_frames);
+    let mut codec = CodecState::new(0);
+    let source = ImageSource { format: ImageFormat::MPEG4, pix: AVPixelFormat::AV_PIX_FMT_YUV420P, width: TEST_SIZE, height: TEST_SIZE };
+    codec.source = Some(source);
+    codec.frame_interval = Duration::from_millis(33);
+    let decoder = codec.open_decoder();
+    let mut input = InputState::new(default_params(), 0);
+    input.configure(source, &Mutex::new(FramePool::new(FramePoolParams::empty(), 0)));
+    // Every message is buffered before any is parsed.
+    for (pts, (data, _)) in packets.iter().enumerate() {
+      input.queue_encoded(pts as i64, data);
     }
+    let mut parsed = vec![];
+    while input.parse_packet(decoder, codec.packet_in) {
+      unsafe {
+        parsed.push((*codec.packet_in).pts);
+        ffi::av_packet_unref(codec.packet_in);
+      }
+    }
+    assert_eq!(parsed, (0..packets.len() as i64).collect::<Vec<_>>());
   }
 
   #[test]
@@ -1394,7 +1383,6 @@ mod tests {
       width: Some(641),
       height: Some(10000),
       mpeg4_quality: Some(100),
-      complete_frames: false,
       h264_quality: None,
       vp9_quality: None,
     };
@@ -1419,7 +1407,6 @@ mod tests {
       width: None,
       height: None,
       mpeg4_quality: None,
-      complete_frames: false,
       h264_quality: None,
       vp9_quality: None,
     };
@@ -1456,7 +1443,6 @@ mod tests {
       height: Some(4500),
       // Only MPEG4 uses this.
       mpeg4_quality: Some(3),
-      complete_frames: false,
       h264_quality: Some(60),
       vp9_quality: None,
     };
@@ -1486,7 +1472,6 @@ mod tests {
       width: Some(641),
       height: None,
       mpeg4_quality: Some(3),
-      complete_frames: false,
       h264_quality: Some(20),
       vp9_quality: Some(70),
     };
@@ -1512,7 +1497,6 @@ mod tests {
       width: Some(641),
       height: None,
       mpeg4_quality: None,
-      complete_frames: false,
       h264_quality: None,
       vp9_quality: None,
     };

@@ -217,8 +217,9 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     encoded for live use: constant quality (no bit rate), `deadline`
     realtime, `cpu-used` 8, `lag-in-frames` 0 (one packet per frame, no
     superframes), `row-mt`.
-  - `Video Width`, `Video Height` and `Complete Frames` (encoded input
-    arrives one whole frame per message; see below).
+  - `Video Width` and `Video Height`.
+  - Encoded input is assumed to arrive one whole frame per message (see
+    below).
   - Encoded video formats: `MPEG4` (FFmpeg's encoder) and `H264` (FFmpeg's
     libopenh264 encoder on Cisco's binary, see above; decoded by FFmpeg's
     own h264 decoder). H264 is YUV420P only, frames up to 36864 macroblocks
@@ -259,9 +260,9 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   before the first VOL header.
 - The MPEG4 parser only ends a frame when it sees the next frame's start
   code, which delays decoding by one frame (~33 ms at 30 fps).
-  `PARSER_FLAG_COMPLETE_FRAMES` (the `Complete Frames` option) removes the
-  lag, but then each parse call must be exactly one frame, so the converter
-  parses one queued message at a time.
+  The converter always sets `PARSER_FLAG_COMPLETE_FRAMES` to remove the lag,
+  so each parse call must be exactly one frame and the converter parses one
+  queued message at a time.
 - Encoded image streams carry their nominal frame rate (the encoder's time
   base, from the source's frame interval), which webcams don't keep; use
   message times, not the stream's rate, for timing.
