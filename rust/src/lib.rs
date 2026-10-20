@@ -22,6 +22,8 @@ mod imgui_platform;
 mod imgui_window;
 mod media_converter;
 mod mic_node;
+mod netcom;
+mod neuralynx_node;
 mod node_copy;
 mod openh264;
 mod rtmps_node;
@@ -34,6 +36,7 @@ mod webcam_node;
 use angular_scaling_node::AngularScalingNode;
 use media_converter_node::MediaConverterNode;
 use mic_node::MicNode;
+use neuralynx_node::NeuralynxNode;
 use rtmps_node::RtmpsNode;
 use sleeve_node::SleeveNode;
 use thorcam_node::ThorcamNode;
@@ -46,5 +49,6 @@ export_nodes!(
   ("ANGULAR_SCALING", AngularScalingNode),
   ("WEBCAM", WebcamNode),
   ("MEDIA_CONVERTER", MediaConverterNode),
-  ("MIC", MicNode)
+  ("MIC", MicNode),
+  ("NEURALYNX", NeuralynxNode)
 );

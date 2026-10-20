@@ -41,6 +41,11 @@ def widgets():
     'MIC': Factory(lambda c, s: MicWidget(c, s), [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
     ]),
+    'NEURALYNX': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      # Cheetah PC name or IP address
+      UserData(UserDataType.DEFAULT, 'Server', 'localhost', []),
+    ]),
     'RTMPS': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
