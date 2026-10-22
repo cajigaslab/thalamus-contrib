@@ -3,7 +3,8 @@
 //! copied into a GPU buffer as-is, converted to RGBA by a compute shader
 //! (shaders/convert.comp) into a Vulkan texture, and displayed via `imgui`'s
 //! custom-texture support. Every uncompressed ImageFormat is supported;
-//! MJPEG, MPEG1, MPEG4, H264 and VP9 frames are dropped. imgui
+//! MJPEG, MPEG1, MPEG4, H264 and VP9 frames are first decoded by an
+//! ImageConverter on the thread that sends them. imgui
 //! has no built-in way to rotate an image, so rotation is done by drawing a
 //! rotated quad (`DrawListMut::add_image_quad`) instead of the plain
 //! `ui.image()` widget -- the standard Dear ImGui trick for this.
@@ -16,9 +17,10 @@ use std::time::{Duration, Instant};
 use ash::vk;
 
 use crate::api::{
-  ImageData, ImageFormat, MainThreadOnly, MainThreadToken, State, StateKey, StateValue,
+  ImageData, ImageFormat, MainThreadOnly, MainThreadToken, NodeData, State, StateKey, StateValue,
   OnDrop, TaskScope, ThalamusAPI, run_task,
 };
+use crate::image_converter::{ConverterParams, ImageConverter, VideoFormat, is_compressed};
 use crate::imgui_window::{ImguiWindow, MAX_FRAMES_IN_FLIGHT};
 
 /// Format codes understood by the conversion shader; must match the
@@ -61,8 +63,9 @@ impl ShaderInput<'_> {
 }
 
 /// Splits `image` into the planes the conversion shader reads, or `None` if
-/// it can't be displayed: compressed formats (MJPEG, MPEG1, MPEG4, H264, VP9), empty
-/// images, and planes too short for the image's size.
+/// it can't be displayed: compressed formats (MJPEG, MPEG1, MPEG4, H264, VP9,
+/// which ImageSink::update decodes first), empty images, and planes too short
+/// for the image's size.
 ///
 /// Row strides aren't part of ImageData, so each plane's stride is its length
 /// divided by its row count. Planar formats delivered as a single plane are
@@ -951,6 +954,23 @@ impl Drop for TexturePool {
 #[derive(Clone, Default)]
 pub struct ImageSink {
   pool: Arc<Mutex<Option<TexturePool>>>,
+  /// Decodes encoded frames into ones the shader reads, while a viewer is
+  /// open. Its own lock, so decoding never holds up the render loop.
+  decoder: Arc<Mutex<Option<ImageConverter>>>,
+}
+
+/// An image to push into the decoder, which only uses message times to time
+/// its output; the viewer shows frames as they come.
+struct Untimed<'a>(&'a dyn ImageData);
+
+impl NodeData for Untimed<'_> {
+  fn time(&self) -> Duration {
+    Duration::ZERO
+  }
+
+  fn image(&self) -> Option<&dyn ImageData> {
+    Some(self.0)
+  }
 }
 
 impl ImageSink {
@@ -964,11 +984,34 @@ impl ImageSink {
   /// next render). Frames that would be replaced before then are skipped
   /// without being copied. Unsupported formats are ignored.
   ///
+  /// Encoded frames (MJPEG, MPEG1, MPEG4, H264, VP9) are decoded here first, on the
+  /// calling thread, and the frames that produces are written the same way.
+  /// None are skipped before decoding: later frames of inter-frame codecs
+  /// need them. That also means waiting for a decode another thread has in
+  /// progress.
+  ///
   /// Never waits on the GPU or the render loop: the frame is dropped instead
   /// if the render loop is using the textures right now or none is free. The
-  /// only lock it can wait on is Thalamus's Vulkan queue lock, held briefly
-  /// around the submit.
+  /// only other lock it can wait on is Thalamus's Vulkan queue lock, held
+  /// briefly around the submit.
   pub fn update(&self, image: &dyn ImageData) {
+    if !is_compressed(image.format()) {
+      self.upload(image);
+      return;
+    }
+    let guard = self.decoder.lock().unwrap();
+    let Some(decoder) = guard.as_ref() else {
+      return;
+    };
+    decoder.push(&Untimed(image));
+    while let Some(decoded) = decoder.pull() {
+      if let Some(decoded) = decoded.image() {
+        self.upload(decoded);
+      }
+    }
+  }
+
+  fn upload(&self, image: &dyn ImageData) {
     let Ok(mut guard) = self.pool.try_lock() else {
       return;
     };
@@ -1010,6 +1053,18 @@ impl ViewerWindow {
     let mut window = ImguiWindow::new(api, title, x, y, width, height)?;
     let pool = TexturePool::new(api, &mut window)?;
     *sink.pool.lock().unwrap() = Some(pool);
+    // Decoded frames come out in the decoder's pixel format, or YUV420P
+    // when Thalamus has none for it; the shader reads either.
+    *sink.decoder.lock().unwrap() = Some(ImageConverter::new(api.thread_safe(), ConverterParams {
+      format: Some(VideoFormat::Decoded),
+      width: None,
+      height: None,
+      mpeg4_quality: None,
+      h264_quality: None,
+      vp9_quality: None,
+      mjpeg_quality: None,
+      mpeg1_quality: None,
+    }));
     Ok(ViewerWindow {
       window,
       sink: sink.clone(),
@@ -1298,6 +1353,9 @@ impl Drop for ImageViewer {
     // destroy the window -- which waits for the GPU -- before the textures its
     // last frames may still reference.
     self.task = None;
+    // Waits for a decode in progress, which may still upload; uploads after
+    // the pool is detached below are ignored.
+    drop(self.sink.decoder.lock().unwrap().take());
     let pool = self.sink.pool.lock().unwrap().take();
     self.window = None;
     drop(pool);

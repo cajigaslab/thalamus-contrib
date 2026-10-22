@@ -124,6 +124,24 @@ set_target_properties(ffmpeg_m PROPERTIES
 # separates them with ';'. A path relative to the directory configure runs in
 # (Debug and Release are at the same depth) works with both.
 if(WIN32)
+  # configure runs whichever pkg-config sh finds first. Others on PATH
+  # (pkg-config-lite, Strawberry Perl's) are found through a drive mount
+  # (/c/...) rather than MSYS2's own /usr/bin or /mingw64/bin, and don't
+  # take the ':' separated PKG_CONFIG_PATH below.
+  find_program(FFMPEG_SH sh)
+  if(FFMPEG_SH)
+    execute_process(COMMAND "${FFMPEG_SH}" -c "command -v pkg-config"
+      OUTPUT_VARIABLE FFMPEG_SH_PKG_CONFIG OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT FFMPEG_SH_PKG_CONFIG)
+      message(WARNING "FFmpeg's configure (${FFMPEG_SH}) finds no pkg-config, so it won't find "
+        "libopus, libvpx or OpenH264. Install MSYS2's pkgconf: pacman -S pkgconf")
+    elseif(FFMPEG_SH_PKG_CONFIG MATCHES "^/[a-zA-Z]/")
+      message(WARNING "FFmpeg's configure will use ${FFMPEG_SH_PKG_CONFIG}, which isn't MSYS2's "
+        "pkg-config and may not find libopus, libvpx or OpenH264. Install MSYS2's pkgconf "
+        "(pacman -S pkgconf) or put MSYS2's usr/bin ahead of it on PATH.")
+    endif()
+  endif()
+
   file(RELATIVE_PATH OPENH264_PKG_CONFIG_REL "${ffmpeg_BINARY_DIR}/Release" "${OPENH264_PKG_CONFIG_DIR}")
   file(RELATIVE_PATH OPUS_PKG_CONFIG_REL "${ffmpeg_BINARY_DIR}/Release" "${OPUS_PKG_CONFIG_DIR}")
   file(RELATIVE_PATH VPX_PKG_CONFIG_REL "${ffmpeg_BINARY_DIR}/Release" "${VPX_PKG_CONFIG_DIR}")

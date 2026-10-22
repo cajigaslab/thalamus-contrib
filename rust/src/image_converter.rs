@@ -40,14 +40,20 @@ pub struct ConverterParams {
   pub h264_quality: Option<i32>,
   /// VP9 constant quality level (CRF), 0-63, lower is better.
   pub vp9_quality: Option<i32>,
+  /// MJPEG quantizer scale, 1-31, lower is better.
+  pub mjpeg_quality: Option<i32>,
+  /// MPEG1 quantizer scale, 1-31, lower is better.
+  pub mpeg1_quality: Option<i32>,
 }
 
-fn is_compressed(format: ImageFormat) -> bool {
-  matches!(format, ImageFormat::MPEG4 | ImageFormat::H264 | ImageFormat::VP9)
+/// Whether the converter decodes `format` (MJPEG, MPEG1, MPEG4, H264, VP9).
+pub(crate) fn is_compressed(format: ImageFormat) -> bool {
+  matches!(format, ImageFormat::MJPEG | ImageFormat::MPEG1 | ImageFormat::MPEG4 | ImageFormat::H264 | ImageFormat::VP9)
 }
 
 fn format_codec(format: ImageFormat) -> ffi::AVCodecID {
   match format {
+    ImageFormat::MPEG1 => ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO,
     ImageFormat::MPEG4 => ffi::AVCodecID::AV_CODEC_ID_MPEG4,
     // Encoded with FFmpeg's libopenh264 wrapper (FFmpeg has no H.264 encoder
     // of its own), decoded with FFmpeg's h264 decoder.
@@ -55,6 +61,8 @@ fn format_codec(format: ImageFormat) -> ffi::AVCodecID {
     // Encoded with FFmpeg's libvpx-vp9 wrapper (FFmpeg has no software VP9
     // encoder of its own), decoded with FFmpeg's vp9 decoder.
     ImageFormat::VP9 => ffi::AVCodecID::AV_CODEC_ID_VP9,
+    // Each message is one JPEG image.
+    ImageFormat::MJPEG => ffi::AVCodecID::AV_CODEC_ID_MJPEG,
     _ => panic!("Unsupported format")
   }
 }
@@ -80,6 +88,13 @@ fn codec_limits(codec_id: ffi::AVCodecID) -> CodecLimits {
       qscale: (1, 31),
       default_quality: 5,
     },
+    // MPEG-1 sequence headers store the size in 12 bits.
+    ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO => CodecLimits {
+      max_dimension: 4095,
+      max_pixels: i64::MAX,
+      qscale: (1, 31),
+      default_quality: 5,
+    },
     // OpenH264 accepts frames up to 36864 macroblocks (H.264 level 5.1), e.g.
     // 4096x2304; quality is the QP.
     ffi::AVCodecID::AV_CODEC_ID_H264 => CodecLimits {
@@ -95,12 +110,19 @@ fn codec_limits(codec_id: ffi::AVCodecID) -> CodecLimits {
       qscale: (0, 63),
       default_quality: 24,
     },
+    // JPEG headers store the size in 16 bits; quality is the quantizer scale.
+    ffi::AVCodecID::AV_CODEC_ID_MJPEG => CodecLimits {
+      max_dimension: 65535,
+      max_pixels: i64::MAX,
+      qscale: (1, 31),
+      default_quality: 3,
+    },
     _ => panic!("Unsupported codec {:?}", codec_id)
   }
 }
 
 /// The AVFrame/AVCodecContext quality for `quality` in the codec's own scale:
-/// FFmpeg's lambda for quantizer-scale codecs (MPEG4), unused (0) for H264,
+/// FFmpeg's lambda for quantizer-scale codecs (MPEG1, MPEG4, MJPEG), unused (0) for H264,
 /// whose QP is set through qmin/qmax instead.
 fn frame_quality(codec_id: ffi::AVCodecID, quality: i32) -> i32 {
   match codec_id {
@@ -129,10 +151,19 @@ fn find_encoder(codec_id: ffi::AVCodecID) -> Option<*const ffi::AVCodec> {
 /// the least converting from `src`.
 fn pix_format_for_codec(src: AVPixelFormat, codec: *const ffi::AVCodec) -> AVPixelFormat {
   let formats: &[AVPixelFormat] = get_codec_config(codec, ffi::AVCodecConfig::AV_CODEC_CONFIG_PIX_FORMAT);
+  let formats: Vec<AVPixelFormat> = if unsafe { (*codec).id } == ffi::AVCodecID::AV_CODEC_ID_MJPEG {
+    // The MJPEG encoder also lists limited range YUV, but refuses to open
+    // with it unless allowed non-standard JPEG; the full range (J) formats
+    // are standard, and swscale converts the range.
+    formats.iter().copied().filter(|f| matches!(f,
+      AVPixelFormat::AV_PIX_FMT_YUVJ420P | AVPixelFormat::AV_PIX_FMT_YUVJ422P | AVPixelFormat::AV_PIX_FMT_YUVJ444P)).collect()
+  } else {
+    formats.to_vec()
+  };
   if formats.is_empty() || formats.contains(&src) {
     return src;
   }
-  let mut list = formats.to_vec();
+  let mut list = formats;
   list.push(AVPixelFormat::AV_PIX_FMT_NONE);
   unsafe { ffi::avcodec_find_best_pix_fmt_of_list(list.as_ptr(), src, 0, std::ptr::null_mut()) }
 }
@@ -241,7 +272,9 @@ fn image_to_pix(format: ImageFormat) -> AVPixelFormat {
     ImageFormat::MPEG4 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::H264 => AVPixelFormat::AV_PIX_FMT_YUV420P,
     ImageFormat::VP9 => AVPixelFormat::AV_PIX_FMT_YUV420P,
-    ImageFormat::MJPEG => panic!("No Pixel format"),
+    // What webcams' JPEGs usually are. Only nominal: like the other encoded
+    // formats', the decoder's output decides the real one.
+    ImageFormat::MJPEG => AVPixelFormat::AV_PIX_FMT_YUVJ420P,
     ImageFormat::Gray16 => GRAY16_NATIVE,
     ImageFormat::RGB16 => RGB48_NATIVE,
   }
@@ -263,7 +296,7 @@ fn pix_to_image(pix: AVPixelFormat) -> Option<ImageFormat> {
   }
 }
 
-/// An encoded (MPEG4, H264 or VP9) output: one packet, so one coded picture,
+/// An encoded (MJPEG, MPEG1, MPEG4, H264 or VP9) output: one packet, so one coded picture,
 /// timed by when that picture was captured. Its bytes are in the codec state's
 /// buffer, so it holds the codec lock while it's read, which only holds up
 /// other pulls.
@@ -426,6 +459,8 @@ fn choose_output(params: &ConverterParams, source: &ImageSource) -> OutputConfig
   let quality = match codec_id {
     ffi::AVCodecID::AV_CODEC_ID_H264 => params.h264_quality,
     ffi::AVCodecID::AV_CODEC_ID_VP9 => params.vp9_quality,
+    ffi::AVCodecID::AV_CODEC_ID_MJPEG => params.mjpeg_quality,
+    ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO => params.mpeg1_quality,
     _ => params.mpeg4_quality,
   }.unwrap_or(limits.default_quality);
   OutputConfig {
@@ -763,7 +798,9 @@ impl CodecState {
       // AV_CODEC_FLAG_LOW_DELAY: the MPEG4 decoder honors it by outputting
       // frames in decode order, so B-frames would be shown out of order.
       // Streams without B-frames aren't delayed without it: decoders only
-      // hold frames back for streams that reorder.
+      // hold frames back for streams that reorder. MPEG-1 streams don't say
+      // whether they do, so its decoder always holds I and P frames back by
+      // one frame.
       let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
       if ret < 0 {
         ffi::avcodec_free_context(&mut context);
@@ -1182,6 +1219,8 @@ mod tests {
       mpeg4_quality: None,
       h264_quality: None,
       vp9_quality: None,
+      mjpeg_quality: None,
+      mpeg1_quality: None,
     }
   }
 
@@ -1210,9 +1249,15 @@ mod tests {
   /// MPEG4 from FFmpeg's encoder, frame k a flat TEST_SIZE square of
   /// brightness 20 k: (packet data, the frame it shows) in decode order.
   fn encode_mpeg4_test_stream(frames: i64, max_b_frames: i32) -> Vec<(Vec<u8>, i64)> {
+    encode_test_stream(ffi::AVCodecID::AV_CODEC_ID_MPEG4, frames, max_b_frames, 20)
+  }
+
+  /// Like encode_mpeg4_test_stream, with FFmpeg's `codec_id` encoder and
+  /// frame k of brightness `step` k.
+  fn encode_test_stream(codec_id: ffi::AVCodecID, frames: i64, max_b_frames: i32, step: i64) -> Vec<(Vec<u8>, i64)> {
     const SIZE: i32 = TEST_SIZE;
     unsafe {
-      let encoder_codec = ffi::avcodec_find_encoder(ffi::AVCodecID::AV_CODEC_ID_MPEG4);
+      let encoder_codec = ffi::avcodec_find_encoder(codec_id);
       let mut encoder = ffi::avcodec_alloc_context3(encoder_codec);
       (*encoder).width = SIZE;
       (*encoder).height = SIZE;
@@ -1237,7 +1282,7 @@ mod tests {
       };
       for k in 0..frames {
         assert!(ffi::av_frame_make_writable(frame) >= 0);
-        for (plane, value, height) in [(0, (20 * k) as u8, SIZE), (1, 128, SIZE / 2), (2, 128, SIZE / 2)] {
+        for (plane, value, height) in [(0, (step * k) as u8, SIZE), (1, 128, SIZE / 2), (2, 128, SIZE / 2)] {
           for row in 0..height {
             let start = (*frame).data[plane].offset((row * (*frame).linesize[plane]) as isize);
             std::ptr::write_bytes(start, value, (SIZE / if plane == 0 { 1 } else { 2 }) as usize);
@@ -1370,6 +1415,130 @@ mod tests {
     assert!(codec.encoder_times.is_empty());
   }
 
+  extern "C" fn test_time_ns() -> u64 {
+    0
+  }
+
+  /// A host API with nothing but a clock, for running an ImageConverter
+  /// without Thalamus: its tracing is skipped when the host has none.
+  fn test_api() -> ThalamusAPIThreadSafe {
+    let mut raw: crate::ffi::ThalamusAPIRaw = unsafe { std::mem::zeroed() };
+    raw.time_ns = Some(test_time_ns);
+    ThalamusAPIThreadSafe { raw: Box::leak(Box::new(raw)) }
+  }
+
+  /// One encoded message.
+  struct EncodedMessage<'a> {
+    format: ImageFormat,
+    data: &'a [u8],
+    time: Duration,
+  }
+
+  impl NodeData for EncodedMessage<'_> {
+    fn time(&self) -> Duration {
+      self.time
+    }
+
+    fn image(&self) -> Option<&dyn ImageData> {
+      Some(self)
+    }
+  }
+
+  impl ImageData for EncodedMessage<'_> {
+    fn plane(&self, _channel: i32) -> &[u8] {
+      self.data
+    }
+
+    fn num_planes(&self) -> u64 {
+      1
+    }
+
+    fn format(&self) -> ImageFormat {
+      self.format
+    }
+
+    fn width(&self) -> u64 {
+      TEST_SIZE as u64
+    }
+
+    fn height(&self) -> u64 {
+      TEST_SIZE as u64
+    }
+
+    fn frame_interval(&self) -> Duration {
+      Duration::from_millis(33)
+    }
+  }
+
+  /// Pushes `packets` (from encode_test_stream with brightness `step`)
+  /// through a converter that decodes them, message n at n ms, pulling after
+  /// every push. Returns, per push, the frames that came out: (the frame
+  /// shown, its time).
+  fn decode_through_converter(format: ImageFormat, packets: &[(Vec<u8>, i64)], step: i64) -> Vec<Vec<(i64, Duration)>> {
+    let converter = ImageConverter::new(test_api(), ConverterParams { format: Some(VideoFormat::Decoded), ..default_params() });
+    packets.iter().enumerate().map(|(n, (data, _))| {
+      converter.push(&EncodedMessage { format, data, time: Duration::from_millis(n as u64) });
+      let mut shown = vec![];
+      while let Some(output) = converter.pull() {
+        let image = output.image().unwrap();
+        assert_eq!(image.format(), ImageFormat::YUV420P);
+        let brightness = i64::from(image.plane(0)[0]);
+        shown.push(((brightness + step / 2) / step, output.time()));
+      }
+      shown
+    }).collect()
+  }
+
+  #[test]
+  fn mpeg1_frames_come_out_one_message_late() {
+    let packets = encode_test_stream(ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO, 8, 0, 20);
+    assert_eq!(packets.len(), 8);
+    let shown = decode_through_converter(ImageFormat::MPEG1, &packets, 20);
+    // The decoder holds each I and P frame until the next one arrives, in
+    // case B-frames shown before it follow; the last one stays held.
+    let mut expected: Vec<Vec<(i64, Duration)>> = vec![vec![]];
+    expected.extend((0..7).map(|k| vec![(k, Duration::from_millis(k as u64))]));
+    assert_eq!(shown, expected);
+  }
+
+  #[test]
+  fn mpeg1_b_frames_come_out_in_presentation_order() {
+    const FRAMES: i64 = 30;
+    // Brightness 8 k stays below 256 for 30 frames.
+    let packets = encode_test_stream(ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO, FRAMES, 2, 8);
+    assert_ne!(packets.iter().map(|(_, k)| *k).collect::<Vec<_>>(), (0..FRAMES).collect::<Vec<_>>(),
+      "the encoder made no B-frames");
+    let shown: Vec<(i64, Duration)> = decode_through_converter(ImageFormat::MPEG1, &packets, 8).concat();
+    // Every frame but the last, which the decoder still holds, in
+    // presentation order, each timed by the message it arrived in.
+    let expected: Vec<(i64, Duration)> = (0..FRAMES - 1).map(|k| {
+      let message = packets.iter().position(|(_, shows)| *shows == k).unwrap();
+      (k, Duration::from_millis(message as u64))
+    }).collect();
+    assert_eq!(shown, expected);
+  }
+
+  #[test]
+  fn mpeg1_output_is_limited_to_what_the_encoder_supports() {
+    let params = ConverterParams {
+      format: Some(VideoFormat::Image(ImageFormat::MPEG1)),
+      width: Some(5001),
+      height: Some(1081),
+      mpeg1_quality: Some(0),
+      ..default_params()
+    };
+    let source = ImageSource { format: ImageFormat::RGB, pix: AVPixelFormat::AV_PIX_FMT_RGB24, width: 640, height: 480 };
+    let output = choose_output(&params, &source);
+    assert_eq!(output.codec_id, Some(ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO));
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUV420P);
+    assert_eq!((output.width, output.height), (4094, 1080));
+    assert_eq!(output.quality, 1);
+    // MPEG-1 only has a few frame rates; 1000/33 fps is nearest 30.
+    let codec = find_encoder(ffi::AVCodecID::AV_CODEC_ID_MPEG1VIDEO).unwrap();
+    let time_base = time_base_for_codec(Duration::from_millis(33), codec);
+    assert_eq!((time_base.num, time_base.den), (1, 30));
+  }
+
   #[test]
   fn image_converter_can_be_shared_between_threads() {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1385,6 +1554,8 @@ mod tests {
       mpeg4_quality: Some(100),
       h264_quality: None,
       vp9_quality: None,
+      mjpeg_quality: None,
+      mpeg1_quality: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,
@@ -1409,6 +1580,8 @@ mod tests {
       mpeg4_quality: None,
       h264_quality: None,
       vp9_quality: None,
+      mjpeg_quality: None,
+      mpeg1_quality: None,
     };
     // Encoded input: choose_output sees the decoded frames' format.
     let decoded = ImageSource {
@@ -1445,6 +1618,8 @@ mod tests {
       mpeg4_quality: Some(3),
       h264_quality: Some(60),
       vp9_quality: None,
+      mjpeg_quality: None,
+      mpeg1_quality: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,
@@ -1474,6 +1649,8 @@ mod tests {
       mpeg4_quality: Some(3),
       h264_quality: Some(20),
       vp9_quality: Some(70),
+      mjpeg_quality: Some(4),
+      mpeg1_quality: Some(4),
     };
     let source = ImageSource {
       format: ImageFormat::NV12,
@@ -1491,6 +1668,90 @@ mod tests {
   }
 
   #[test]
+  fn mjpeg_output_is_full_range_yuv() {
+    let params = ConverterParams {
+      format: Some(VideoFormat::Image(ImageFormat::MJPEG)),
+      mjpeg_quality: Some(40),
+      ..default_params()
+    };
+    let source = |format, pix| ImageSource { format, pix, width: 1921, height: 1081 };
+    // Limited range input is converted to the full range format JPEG uses.
+    let output = choose_output(&params, &source(ImageFormat::YUV420P, AVPixelFormat::AV_PIX_FMT_YUV420P));
+    assert_eq!(output.codec_id, Some(ffi::AVCodecID::AV_CODEC_ID_MJPEG));
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUVJ420P);
+    assert_eq!((output.width, output.height), (1920, 1080));
+    assert_eq!(output.quality, 31);
+    let output = choose_output(&params, &source(ImageFormat::NV12, AVPixelFormat::AV_PIX_FMT_NV12));
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUVJ420P);
+    // A webcam's 4:2:2 JPEGs, decoded, keep their chroma.
+    let output = choose_output(&params, &source(ImageFormat::MJPEG, AVPixelFormat::AV_PIX_FMT_YUVJ422P));
+    assert_eq!(output.pix, AVPixelFormat::AV_PIX_FMT_YUVJ422P);
+    assert_eq!((output.width, output.height), (1920, 1081));
+    let output = choose_output(&ConverterParams { mjpeg_quality: None, ..params }, &source(ImageFormat::RGB, AVPixelFormat::AV_PIX_FMT_RGB24));
+    assert_eq!(output.quality, 3);
+  }
+
+  #[test]
+  fn mjpeg_round_trips_through_the_parser_and_decoder() {
+    const SIZE: i32 = TEST_SIZE;
+    let ms = |n: u64| Duration::from_millis(n);
+    let params = ConverterParams { format: Some(VideoFormat::Image(ImageFormat::MJPEG)), ..default_params() };
+    let output = choose_output(&params, &ImageSource {
+      format: ImageFormat::YUVJ420P, pix: AVPixelFormat::AV_PIX_FMT_YUVJ420P, width: SIZE, height: SIZE,
+    });
+    let mut codec = CodecState::new(0);
+    codec.frame_interval = ms(33);
+    let encoder = codec.open_encoder(ffi::AVCodecID::AV_CODEC_ID_MJPEG, &output).expect("no MJPEG encoder");
+    // Frame k is a flat square of brightness 40 (k + 1).
+    unsafe {
+      for k in 0..4u64 {
+        let frame = ffi::av_frame_alloc();
+        (*frame).format = output.pix as i32;
+        (*frame).width = SIZE;
+        (*frame).height = SIZE;
+        assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+        for (plane, value, rows) in [(0, (40 * (k + 1)) as u8, SIZE), (1, 128, SIZE / 2), (2, 128, SIZE / 2)] {
+          std::ptr::write_bytes((*frame).data[plane], value, (rows * (*frame).linesize[plane]) as usize);
+        }
+        codec.encode_frame(encoder, frame, frame_quality(ffi::AVCodecID::AV_CODEC_ID_MJPEG, output.quality), ms(10 * k), ms(33));
+      }
+    }
+    // One JPEG per frame, with no delay.
+    let jpegs: Vec<Vec<u8>> = codec.packets.iter().map(|(data, _, _)| data.clone()).collect();
+    assert_eq!(codec.packets.iter().map(|(_, time, _)| *time).collect::<Vec<_>>(), (0..4).map(|k| ms(10 * k)).collect::<Vec<_>>());
+    assert!(jpegs.iter().all(|jpeg| jpeg.starts_with(&[0xFF, 0xD8])), "not JPEG images");
+
+    let source = ImageSource { format: ImageFormat::MJPEG, pix: image_to_pix(ImageFormat::MJPEG), width: SIZE, height: SIZE };
+    let mut decoding = CodecState::new(0);
+    decoding.source = Some(source);
+    let decoder = decoding.open_decoder();
+    let mut input = InputState::new(params, 0);
+    input.configure(source, &Mutex::new(FramePool::new(FramePoolParams::empty(), 0)));
+    // Every message is buffered before any is parsed.
+    for (pts, jpeg) in jpegs.iter().enumerate() {
+      input.queue_encoded(pts as i64, jpeg);
+    }
+    let mut decoded = vec![];
+    unsafe {
+      while input.parse_packet(decoder, decoding.packet_in) {
+        assert!(ffi::avcodec_send_packet(decoder, decoding.packet_in) >= 0);
+        ffi::av_packet_unref(decoding.packet_in);
+        while ffi::avcodec_receive_frame(decoder, decoding.decoder_frame) >= 0 {
+          let frame = decoding.decoder_frame;
+          assert_eq!(((*frame).width, (*frame).height), (SIZE, SIZE));
+          decoded.push(((*frame).pts, *(*frame).data[0]));
+          ffi::av_frame_unref(frame);
+        }
+      }
+    }
+    assert_eq!(decoded.len(), jpegs.len());
+    for (k, (pts, brightness)) in decoded.iter().enumerate() {
+      assert_eq!(*pts, k as i64);
+      assert!((i32::from(*brightness) - 40 * (k as i32 + 1)).abs() <= 2, "frame {}: brightness {}", k, brightness);
+    }
+  }
+
+  #[test]
   fn raw_output_is_not_limited() {
     let params = ConverterParams {
       format: Some(VideoFormat::Image(ImageFormat::Gray)),
@@ -1499,6 +1760,8 @@ mod tests {
       mpeg4_quality: None,
       h264_quality: None,
       vp9_quality: None,
+      mjpeg_quality: None,
+      mpeg1_quality: None,
     };
     let source = ImageSource {
       format: ImageFormat::NV12,

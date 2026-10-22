@@ -54,18 +54,22 @@ def widgets():
     'MEDIA_CONVERTER': Factory(None, [
       UserData(UserDataType.COMBO_BOX, 'Source', '', get_node_names),
       UserData(UserDataType.COMBO_BOX, 'Video Format', 'RGB', [
-        'Passthrough', 'Decoded', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MPEG4', 'H264', 'VP9'
+        'Passthrough', 'Decoded', 'Gray', 'RGB', 'YUYV422', 'YUV420P', 'YUVJ420P', 'NV12', 'BGR', 'MJPEG', 'MPEG1', 'MPEG4', 'H264', 'VP9'
       ]),
+      # MPEG1 quantizer scale, 1-31, lower is better.
+      UserData(UserDataType.SPINBOX, 'MPEG1 Quality', 5, []),
       # MPEG4 quantizer scale, 1-31, lower is better.
       UserData(UserDataType.SPINBOX, 'MPEG4 Quality', 5, []),
       # H264 quantization parameter (QP), 1-51, lower is better.
       UserData(UserDataType.SPINBOX, 'H264 Quality', 18, []),
       # VP9 constant quality level (CRF), 0-63, lower is better.
       UserData(UserDataType.SPINBOX, 'VP9 Quality', 24, []),
+      # MJPEG quantizer scale, 1-31, lower is better.
+      UserData(UserDataType.SPINBOX, 'MJPEG Quality', 3, []),
       UserData(UserDataType.SPINBOX, 'Video Width', 0, []),
       UserData(UserDataType.SPINBOX, 'Video Height', 0, []),
       UserData(UserDataType.COMBO_BOX, 'Audio Format', 'Passthrough', [
-        'Passthrough', 'Decoded', 'Integer', 'Decimal', 'AAC', 'Opus'
+        'Passthrough', 'Decoded', 'Integer', 'Decimal', 'AAC', 'Opus', 'FLAC'
       ]),
       # kbit/s for the whole stream, 0 for 64 kbit/s
       UserData(UserDataType.SPINBOX, 'Audio Bit Rate', 0, []),

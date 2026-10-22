@@ -256,6 +256,8 @@ impl MediaConverterNode {
           "MPEG4" => Some(VideoFormat::Image(ImageFormat::MPEG4)),
           "H264" => Some(VideoFormat::Image(ImageFormat::H264)),
           "VP9" => Some(VideoFormat::Image(ImageFormat::VP9)),
+          "MJPEG" => Some(VideoFormat::Image(ImageFormat::MJPEG)),
+          "MPEG1" => Some(VideoFormat::Image(ImageFormat::MPEG1)),
           _ => None
         };
       },
@@ -273,6 +275,7 @@ impl MediaConverterNode {
           "DECIMAL" => Some(AudioFormat::Decimal),
           "AAC" => Some(AudioFormat::AAC),
           "OPUS" => Some(AudioFormat::Opus),
+          "FLAC" => Some(AudioFormat::FLAC),
           _ => None
         };
       },
@@ -319,6 +322,22 @@ impl MediaConverterNode {
           let mut lock = this.params.lock().unwrap();
           lock.dirty = true;
           lock.params.image.mpeg4_quality = if v > 0 { Some(v as i32) } else { None };
+        }
+      },
+      "MPEG1 Quality" => {
+        // MPEG1 quantizer scale, 1-31; 0 uses the default (5).
+        if let StateValue::Int(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.image.mpeg1_quality = if v > 0 { Some(v as i32) } else { None };
+        }
+      },
+      "MJPEG Quality" => {
+        // MJPEG quantizer scale, 1-31; 0 uses the default (3).
+        if let StateValue::Int(v) = value {
+          let mut lock = this.params.lock().unwrap();
+          lock.dirty = true;
+          lock.params.image.mjpeg_quality = if v > 0 { Some(v as i32) } else { None };
         }
       },
       "VP9 Quality" => {
@@ -422,7 +441,7 @@ impl MediaConverterNode {
       last_layout = Some(layout);
       let _ = signaler.ready(&stats);
       if let Some(image) = output.image() {
-        // Encoded (MPEG4, H264, VP9) output is dropped by the viewer.
+        // Encoded (MJPEG, MPEG1, MPEG4, H264, VP9) output is decoded by the viewer.
         viewer_sink.update(image);
       }
     };
@@ -458,6 +477,8 @@ impl Node for MediaConverterNode {
           mpeg4_quality: None,
           h264_quality: None,
           vp9_quality: None,
+          mjpeg_quality: None,
+          mpeg1_quality: None,
         },
         audio: AudioConverterParams::default(),
       },

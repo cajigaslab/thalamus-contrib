@@ -282,6 +282,7 @@ pub extern "C" fn c_node_analog_encoding(raw_node: *mut ThalamusNode) -> Thalamu
     crate::api::AnalogEncoding::None => ThalamusAnalogEncoding::ThalamusAnalogEncoding_None,
     crate::api::AnalogEncoding::AAC => ThalamusAnalogEncoding::ThalamusAnalogEncoding_AAC,
     crate::api::AnalogEncoding::Opus => ThalamusAnalogEncoding::ThalamusAnalogEncoding_Opus,
+    crate::api::AnalogEncoding::FLAC => ThalamusAnalogEncoding::ThalamusAnalogEncoding_FLAC,
   }
 }
 #[allow(non_snake_case)]

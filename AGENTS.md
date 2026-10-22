@@ -40,7 +40,8 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   says which). The source build enables every native FFmpeg codec plus three
   external encoders: libopenh264 (H.264), libvpx-vp9 (VP9) and libopus
   (Opus); no libx264, libfdk_aac, libmp3lame. Decoding uses FFmpeg's own
-  H.264, VP9 and Opus decoders.
+  H.264, VP9 and Opus decoders. AAC and FLAC use FFmpeg's own encoders and
+  decoders.
 - libopus (`cmake/opus.cmake`, its own CMake build) and libvpx
   (`cmake/vpx.cmake`, configure/make; on Windows its `x86_64-win64-gcc`
   target built with clang and the dynamic CRT, `libvpx.a` copied to
@@ -73,7 +74,9 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   MSYS2's `pkgconf` (`pacman -S make pkgconf`), not another pkg-config on
   `PATH` (pkg-config-lite, Strawberry Perl's). MSYS2's splits
   `PKG_CONFIG_PATH` on `:`, so drive-letter paths don't work; `ffmpeg.cmake`
-  passes OpenH264's `.pc` directory relative to FFmpeg's build directory.
+  passes OpenH264's `.pc` directory relative to FFmpeg's build directory. It
+  warns when `sh` finds no `pkg-config` or one through a drive mount
+  (`/c/...`), i.e. not MSYS2's.
 - Windows uses the dynamic CRT everywhere (Rust and skia's prebuilt library
   do); new native dependencies must too.
 - If FFmpeg rebuilds unexpectedly, run `ninja -n -d explain`: two different
@@ -213,6 +216,10 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   - `MPEG4 Quality` (MPEG4 quantizer scale, 1-31) and `H264 Quality` (H264
     QP, 1-51; libopenh264 has no quantizer-scale mode, so it's set as
     qmin = qmax); lower is better, 0 uses the codec default (5, 18).
+  - `MPEG1 Quality`: MPEG-1 quantizer scale, 1-31, lower is better (0 uses
+    the default, 5).
+  - `MJPEG Quality`: MJPEG quantizer scale, 1-31, lower is better (0 uses
+    the default, 3).
   - `VP9 Quality`: VP9 CRF, 0-63, lower is better (default 24). VP9 is
     encoded for live use: constant quality (no bit rate), `deadline`
     realtime, `cpu-used` 8, `lag-in-frames` 0 (one packet per frame, no
@@ -220,6 +227,17 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   - `Video Width` and `Video Height`.
   - Encoded input is assumed to arrive one whole frame per message (see
     below).
+  - `MPEG1` (FFmpeg's mpeg1video encoder and decoder): YUV420P, sizes up to
+    4095, and only MPEG-1's frame rates (the nearest is used). Its decoder
+    can't tell whether a stream has B-frames, so it holds every I and P
+    frame back a frame. That delay is accepted: MPEG1 isn't meant for
+    latency sensitive use.
+  - `MJPEG` (FFmpeg's encoder and decoder): one JPEG per message, every
+    frame a key frame. Output is full range YUV (YUVJ420P/422P/444P, chosen
+    by `pix_format_for_codec`): FFmpeg's encoder also lists limited range
+    YUV but won't open with it without non-standard JPEG, so swscale
+    converts the range. MJPEG input's nominal pixel format is YUVJ420P;
+    the decoder's (often YUVJ422P from webcams) decides the real one.
   - Encoded video formats: `MPEG4` (FFmpeg's encoder) and `H264` (FFmpeg's
     libopenh264 encoder on Cisco's binary, see above; decoded by FFmpeg's
     own h264 decoder). H264 is YUV420P only, frames up to 36864 macroblocks
@@ -247,6 +265,20 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   stereo only: more channels need an Opus header (extradata) a packet
   stream can't carry, so such inputs are rejected. The Opus decoder is
   opened with the input's channel count at 48 kHz.
+- FLAC output (FFmpeg's encoder) is the encoder's packets as is: FLAC frames
+  carry their own headers, and each one states the sample rate and bits per
+  sample, so the decoder needs no STREAMINFO. Rates are rounded to ones a
+  frame header can state (`flac_sample_rate`). i16 and double input are
+  encoded as 16-bit, i32 input as 32-bit (`strict_std_compliance`
+  experimental; without it FFmpeg keeps only the top 24 bits). Frames are
+  4608 samples at 44.1/48 kHz (~100 ms), and a message can hold several.
+  FFmpeg's FLAC parser only ends a frame once it has validated several
+  headers after it, so FLAC input is parsed with
+  `PARSER_FLAG_COMPLETE_FRAMES`: each message goes to the decoder as one
+  packet, which decodes every frame in it. Frames after the first come out
+  with no pts and are timed by the packet's seq (`CodecState::packet_seq`).
+- `ThalamusAnalogEncoding_FLAC` (3) needs a Thalamus that knows it: older
+  builds abort on encodings they don't know.
 - FFmpeg pitfalls hit here: call `swr_init` after `swr_alloc_set_opts2`;
   allocate buffers (`av_frame_get_buffer`) for frames you write into, and
   never call it on a frame that already has buffers (it leaks them); drain
@@ -269,12 +301,20 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 
 ## Image viewer and imgui windows
 
-- `ImageSink::update` may be called from any thread. It never waits: it
-  drops the frame if the pool is busy or no texture is free, copies raw
-  planes into a host-visible buffer and submits a compute shader
-  (`shaders/convert.comp`) that converts to RGBA. Formats: Gray, RGB, BGR,
-  YUYV422, YUV420P, YUVJ420P, NV12, Gray16, RGB16 (native byte order, full
-  16-bit range). MJPEG/MPEG1/MPEG4 are dropped.
+- `ImageSink::update` may be called from any thread. It never waits on the
+  render loop or GPU: it drops the frame if the pool is busy or no texture is
+  free, copies raw planes into a host-visible buffer and submits a compute
+  shader (`shaders/convert.comp`) that converts to RGBA. Formats: Gray, RGB,
+  BGR, YUYV422, YUV420P, YUVJ420P, NV12, Gray16, RGB16 (native byte order,
+  full 16-bit range).
+- Encoded frames (MJPEG, MPEG1, MPEG4, H264, VP9; `image_converter::is_compressed`)
+  are decoded synchronously in `update`, on the caller's thread, by an
+  `ImageConverter` in `Decoded` mode that the sink holds while a viewer is
+  open (created in `ViewerWindow::new`, dropped first in `ImageViewer`'s
+  drop). Every encoded frame is decoded, since inter-frame codecs need them
+  all; only the decoded frames go through the skip-if-replaced check. The
+  decoder has its own lock, so decoding never holds the pool lock the render
+  loop takes, but callers on two threads wait for each other.
 - Never touch an `ImguiWindow`'s in-flight fences from another thread: the
   render loop resets and submits them. Texture reuse is tracked with frame
   numbers instead.
@@ -304,7 +344,9 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 - `cd rust; cargo test` after a `hatch build` (from PowerShell on Windows).
 - Tests needing hardware are `#[ignore]`d, e.g.
   `cargo test capture_from_default_device -- --ignored --nocapture`.
-- The audio converter tests run real FFmpeg AAC encode/decode round trips;
+- The audio converter tests run real FFmpeg AAC and FLAC encode/decode round trips;
+  image converter tests can run a whole `ImageConverter` with `test_api()`
+  (a zeroed host API with only a clock);
   prefer that style (synthetic input through the real codec) for conversion
   code. Keep logic like channel selection or rate math in pure functions so
   it can be unit tested without a Thalamus API.

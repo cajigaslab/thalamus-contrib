@@ -388,6 +388,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       match encoding(self.node.node) {
         ThalamusAnalogEncoding::ThalamusAnalogEncoding_AAC => AnalogEncoding::AAC,
         ThalamusAnalogEncoding::ThalamusAnalogEncoding_Opus => AnalogEncoding::Opus,
+        ThalamusAnalogEncoding::ThalamusAnalogEncoding_FLAC => AnalogEncoding::FLAC,
         // Includes encodings from newer Thalamus builds this one doesn't know.
         _ => AnalogEncoding::None,
       }
@@ -3273,6 +3274,9 @@ pub enum AnalogEncoding {
   AAC,
   /// Opus packets, each preceded by an MPEG-TS Opus control header.
   Opus,
+  /// FLAC frames with no STREAMINFO; each frame header gives the sample rate
+  /// and bits per sample.
+  FLAC,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]

@@ -1,8 +1,8 @@
 //! The audio half of the converter: turns analog data into a target audio
-//! format. Raw formats are converted sample by sample; AAC and Opus are
-//! encoded with FFmpeg (swresample -> audio FIFO -> encoder, framed as ADTS or
-//! with MPEG-TS Opus control headers) and decoded with FFmpeg (parser ->
-//! decoder).
+//! format. Raw formats are converted sample by sample; AAC, Opus and FLAC are
+//! encoded with FFmpeg (swresample -> audio FIFO -> encoder, framed as ADTS,
+//! with MPEG-TS Opus control headers, or as FLAC frames, which frame
+//! themselves) and decoded with FFmpeg (parser -> decoder).
 //!
 //! Every output's time is when its last sample was acquired, through any
 //! encoding or decoding: an encoded message's packets hold audio from before
@@ -68,6 +68,9 @@ pub enum AudioFormat {
   /// Opus, mono or stereo, each packet preceded by an MPEG-TS Opus control
   /// header.
   Opus,
+  /// FLAC, lossless: 16-bit for Integer (i16) and Decimal input, 32-bit for
+  /// i32 input.
+  FLAC,
   /// Encoded input is output in the sample format its decoder produces (as
   /// doubles when Thalamus has no matching format); raw input passes
   /// through.
@@ -200,6 +203,7 @@ impl<'a> AnalogData for AudioOutput<'a> {
         match (*encoder).codec_id {
           ffi::AVCodecID::AV_CODEC_ID_AAC => AnalogEncoding::AAC,
           ffi::AVCodecID::AV_CODEC_ID_OPUS => AnalogEncoding::Opus,
+          ffi::AVCodecID::AV_CODEC_ID_FLAC => AnalogEncoding::FLAC,
           other => panic!("Unsupported codec {:?}", other)
         }
       }
@@ -233,7 +237,7 @@ struct InputChannels {
 }
 
 fn is_compressed_audio_format(encoding: AudioFormat) -> bool {
-  matches!(encoding, AudioFormat::AAC | AudioFormat::Opus)
+  matches!(encoding, AudioFormat::AAC | AudioFormat::Opus | AudioFormat::FLAC)
 }
 
 fn analog_to_audio_format(format: AnalogFormat, encoding: AnalogEncoding) -> AudioFormat {
@@ -243,6 +247,7 @@ fn analog_to_audio_format(format: AnalogFormat, encoding: AnalogEncoding) -> Aud
     AnalogFormat::Encoded => match encoding {
       AnalogEncoding::AAC => AudioFormat::AAC,
       AnalogEncoding::Opus => AudioFormat::Opus,
+      AnalogEncoding::FLAC => AudioFormat::FLAC,
       _ => panic!("Unexpected input encoding, {:?}", encoding),
     }
     _ => panic!("Unsupported analog format {:?}", format)
@@ -262,6 +267,7 @@ fn encoding_codec(encoding: AnalogEncoding) -> ffi::AVCodecID {
   match encoding {
     AnalogEncoding::AAC => ffi::AVCodecID::AV_CODEC_ID_AAC,
     AnalogEncoding::Opus => ffi::AVCodecID::AV_CODEC_ID_OPUS,
+    AnalogEncoding::FLAC => ffi::AVCodecID::AV_CODEC_ID_FLAC,
     _ => panic!("Unexpected format {:?}", encoding)
   }
 }
@@ -273,6 +279,7 @@ fn audio_format_to_encoding(format: AudioFormat) -> Option<ffi::AVCodecID> {
     AudioFormat::AAC => Some(ffi::AVCodecID::AV_CODEC_ID_AAC),
     // libopus, through FFmpeg's libopus wrapper.
     AudioFormat::Opus => Some(ffi::AVCodecID::AV_CODEC_ID_OPUS),
+    AudioFormat::FLAC => Some(ffi::AVCodecID::AV_CODEC_ID_FLAC),
     AudioFormat::Decoded => None,
   }
 }
@@ -311,13 +318,16 @@ pub(crate) fn get_codec_config<T>(codec: *const ffi::AVCodec, config: ffi::AVCod
   }
 }
 
+/// `src_format`, or its packed or planar version, when the codec takes it,
+/// so e.g. S32P input to FLAC (S16 and S32 only) stays 32-bit. Otherwise the
+/// codec's first format.
 fn sample_format_for_codec(src_format: ffi::AVSampleFormat, codec: *const ffi::AVCodec) -> ffi::AVSampleFormat {
   let formats: &[ffi::AVSampleFormat] = get_codec_config(codec, AV_CODEC_CONFIG_SAMPLE_FORMAT);
-  if formats.is_empty() || formats.contains(&src_format) {
-    src_format
-  } else {
-    formats[0]
+  if formats.is_empty() {
+    return src_format;
   }
+  let (packed, planar) = unsafe { (ffi::av_get_packed_sample_fmt(src_format), ffi::av_get_planar_sample_fmt(src_format)) };
+  [src_format, packed, planar].into_iter().find(|f| formats.contains(f)).unwrap_or(formats[0])
 }
 
 /// The supported rate nearest `src_frequency`, so e.g. 44101 Hz from a
@@ -369,6 +379,17 @@ fn samples_to_duration(samples: u64, rate: i32) -> Duration {
 /// The number of samples at `rate` in `duration`, rounded.
 fn duration_to_samples(duration: Duration, rate: i32) -> u64 {
   ((duration.as_nanos() * rate as u128 + NANOS_PER_SEC / 2) / NANOS_PER_SEC) as u64
+}
+
+/// The nearest rate a FLAC frame header can state, so frames decode without
+/// a STREAMINFO block. FFmpeg's encoder codes any rate below 65535 Hz and
+/// tens of Hz below 655350 Hz in the header.
+fn flac_sample_rate(rate: i32) -> i32 {
+  if rate < 65535 {
+    rate.max(1)
+  } else {
+    ((rate + 5) / 10 * 10).min(655340)
+  }
 }
 
 /// ADTS sampling_frequency_index values.
@@ -435,7 +456,7 @@ fn select_input_channels<K: PartialEq>(index: i32, num_channels: i32, kind: impl
 fn is_supported_input(channels: &InputChannels) -> bool {
   match channels.format {
     AnalogFormat::Double | AnalogFormat::Short | AnalogFormat::Int => true,
-    AnalogFormat::Encoded => matches!(channels.encoding, AnalogEncoding::AAC | AnalogEncoding::Opus),
+    AnalogFormat::Encoded => matches!(channels.encoding, AnalogEncoding::AAC | AnalogEncoding::Opus | AnalogEncoding::FLAC),
     AnalogFormat::ULong => false,
   }
 }
@@ -498,6 +519,7 @@ fn choose_output(params: &AudioConverterParams, input: &InputChannels,
   let sample_rate = codec
     .map(|codec| sample_rate_for_codec(requested_rate, codec))
     .unwrap_or(requested_rate);
+  let sample_rate = if codec_id == Some(ffi::AVCodecID::AV_CODEC_ID_FLAC) { flac_sample_rate(sample_rate) } else { sample_rate };
   // Report exactly the input's interval when the rate is unchanged.
   let sample_interval = if sample_rate == src_sample_rate && !input.sample_interval.is_zero() {
     input.sample_interval
@@ -616,6 +638,14 @@ impl InputState {
       let codec_id = encoding_codec(encoding);
       self.parser = ffi::av_parser_init(codec_id as i32);
       assert!(!self.parser.is_null(), "Failed to create parser");
+      // FLAC has no frame length or sync word the parser can trust on its
+      // own: it only ends a frame once it has seen several valid headers
+      // after it, which would hold up audio by several frames. Messages hold
+      // whole frames, so each one goes to the decoder as one packet, which
+      // decodes every frame in it.
+      if codec_id == ffi::AVCodecID::AV_CODEC_ID_FLAC {
+        (*self.parser).flags |= ffi::PARSER_FLAG_COMPLETE_FRAMES as i32;
+      }
       self.parser_packet = ffi::av_packet_alloc();
       assert!(!self.parser_packet.is_null(), "Failed to create parser_packet");
       self.in_buffer.resize(AV_INPUT_BUFFER_PADDING_SIZE as usize, 0);
@@ -924,6 +954,10 @@ pub struct CodecState {
   /// under it.
   decoded_seq: i64,
   decoded_times: VecDeque<(i64, Duration, Duration)>,
+  /// The seq of the last packet sent to the decoder. Frames decoded from the
+  /// rest of a packet (FLAC messages of several frames) come out with no pts,
+  /// and belong to it.
+  packet_seq: i64,
 
   // Encoded output
   encoder: Option<*mut ffi::AVCodecContext>,
@@ -960,6 +994,7 @@ impl CodecState {
       decoded_sampler: std::ptr::null_mut(),
       decoded_seq: 0,
       decoded_times: VecDeque::new(),
+      packet_seq: ffi::AV_NOPTS_VALUE,
       encoder: None,
       fifo: std::ptr::null_mut(),
       fifo_frame: std::ptr::null_mut(),
@@ -1025,6 +1060,13 @@ impl CodecState {
       (*context).sample_rate = output.sample_rate;
       (*context).time_base = ffi::AVRational { num: 1, den: output.sample_rate };
       (*context).bit_rate = output.bitrate;
+      // FFmpeg's FLAC encoder keeps only the top 24 bits of 32-bit samples
+      // unless allowed to write 32-bit FLAC (RFC 9639, which its decoder
+      // reads but older decoders may not).
+      if codec_id == ffi::AVCodecID::AV_CODEC_ID_FLAC && output.sample_format == ffi::AVSampleFormat::AV_SAMPLE_FMT_S32 {
+        (*context).bits_per_raw_sample = 32;
+        (*context).strict_std_compliance = ffi::FF_COMPLIANCE_EXPERIMENTAL;
+      }
       ffi::av_channel_layout_copy(&mut (*context).ch_layout, &self.layout);
       let ret = ffi::avcodec_open2(context, codec, std::ptr::null_mut());
       if ret < 0 {
@@ -1051,8 +1093,8 @@ impl CodecState {
   }
 
   /// Sends `frame`'s samples, the last acquired at `time`, through the FIFO
-  /// into the encoder and appends every packet it produces, framed (ADTS or
-  /// Opus control headers), to out_buffer. Frees `frame`. Returns when the
+  /// into the encoder and appends every packet it produces, framed (ADTS,
+  /// Opus control headers, or as is for FLAC), to out_buffer. Frees `frame`. Returns when the
   /// last sample in the packets was acquired and how many samples they hold,
   /// or None when the encoder holds everything in the FIFO or its own delay
   /// for now.
@@ -1113,11 +1155,14 @@ impl CodecState {
         self.out_last_sample = Some((*self.packet).pts + duration - 1);
 
         let size = (*self.packet).size as usize;
-        if (*encoder).codec_id == ffi::AVCodecID::AV_CODEC_ID_OPUS {
-          self.out_buffer.extend_from_slice(&opus_ts_header(size));
-        } else {
-          let header = adts_header(size, (*encoder).sample_rate, (*encoder).ch_layout.nb_channels);
-          self.out_buffer.extend_from_slice(&header);
+        match (*encoder).codec_id {
+          ffi::AVCodecID::AV_CODEC_ID_OPUS => self.out_buffer.extend_from_slice(&opus_ts_header(size)),
+          ffi::AVCodecID::AV_CODEC_ID_AAC => {
+            let header = adts_header(size, (*encoder).sample_rate, (*encoder).ch_layout.nb_channels);
+            self.out_buffer.extend_from_slice(&header);
+          }
+          // FLAC frames start with their own header.
+          _ => {}
         }
         self.out_buffer.extend_from_slice(std::slice::from_raw_parts((*self.packet).data, size));
         ffi::av_packet_unref(self.packet);
@@ -1288,6 +1333,7 @@ impl AudioConverter {
         }
       }
 
+      codec.packet_seq = (*codec.packet_in).pts;
       let ret = ffi::avcodec_send_packet(decoder, codec.packet_in);
       ffi::av_packet_unref(codec.packet_in);
       if ret < 0 {
@@ -1326,8 +1372,9 @@ impl AudioConverter {
       // Several frames can come from one message's packets, so frames are
       // timed here and get their own seq. The decoder passed the message's
       // seq through in pts.
+      let seq = if (*decoder_frame).pts == ffi::AV_NOPTS_VALUE { codec.packet_seq } else { (*decoder_frame).pts };
       let times = self.input.lock().unwrap()
-        .decoded_time((*decoder_frame).pts, nb_samples as u64, src_sample_rate)
+        .decoded_time(seq, nb_samples as u64, src_sample_rate)
         .unwrap_or_else(|| { let now = self.api.time(); (now, now) });
       let frame_seq = codec.decoded_seq;
       codec.decoded_seq += 1;
@@ -1575,7 +1622,12 @@ mod tests {
       sample_interval: samples_to_duration(1, RATE),
       names: vec!["Left".into(), "Right".into()],
     });
-    let params = AudioConverterParams { format: Some(if codec_id == ffi::AVCodecID::AV_CODEC_ID_OPUS { AudioFormat::Opus } else { AudioFormat::AAC }), ..Default::default() };
+    let format = match codec_id {
+      ffi::AVCodecID::AV_CODEC_ID_OPUS => AudioFormat::Opus,
+      ffi::AVCodecID::AV_CODEC_ID_FLAC => AudioFormat::FLAC,
+      _ => AudioFormat::AAC,
+    };
+    let params = AudioConverterParams { format: Some(format), ..Default::default() };
     let output = choose_output(&params, codec.input.as_ref().unwrap(), ffi::AVSampleFormat::AV_SAMPLE_FMT_S16, RATE);
     let encoder = codec.open_encoder(codec_id, &output);
     let mut outputs = vec![];
@@ -1685,6 +1737,134 @@ mod tests {
       assert_eq!(*count, 960);
       assert_close(*time, silence_sample_time(960 * (j as i64 + 1) - 313), j);
     }
+  }
+
+  #[test]
+  fn flac_outputs_are_timed_by_the_last_sample_in_their_packets() {
+    // FLAC has no delay: packet j holds input samples [n j, n (j + 1)) for
+    // the encoder's block size n, and comes out when they're all in.
+    let block = flac_block_size();
+    let outputs = encode_silence(ffi::AVCodecID::AV_CODEC_ID_FLAC, 40);
+    assert_eq!(outputs.len(), 40 * 480 / block as usize);
+    for (j, (time, count)) in outputs.iter().enumerate() {
+      assert_eq!(*count, block);
+      assert_close(*time, silence_sample_time(i64::from(block) * (j as i64 + 1) - 1), j);
+    }
+  }
+
+  /// The block size FFmpeg's FLAC encoder picks for 48 kHz stereo.
+  fn flac_block_size() -> i32 {
+    let mut codec = CodecState::new(0);
+    codec.input = Some(InputChannels {
+      range: 0..2,
+      format: AnalogFormat::Short,
+      encoding: AnalogEncoding::None,
+      sample_interval: samples_to_duration(1, 48000),
+      names: vec!["Left".into(), "Right".into()],
+    });
+    let params = AudioConverterParams { format: Some(AudioFormat::FLAC), ..Default::default() };
+    let output = choose_output(&params, codec.input.as_ref().unwrap(), ffi::AVSampleFormat::AV_SAMPLE_FMT_S16P, 48000);
+    let encoder = codec.open_encoder(ffi::AVCodecID::AV_CODEC_ID_FLAC, &output);
+    unsafe { (*encoder).frame_size }
+  }
+
+  #[test]
+  fn flac_round_trips_32_bit_samples_from_messages_of_several_frames() {
+    const RATE: i32 = 48000;
+    // Larger than a FLAC block, so some messages hold two frames.
+    const FRAME: i32 = 7000;
+    let input = InputChannels {
+      range: 0..2,
+      format: AnalogFormat::Int,
+      encoding: AnalogEncoding::None,
+      sample_interval: samples_to_duration(1, RATE),
+      names: vec!["Left".into(), "Right".into()],
+    };
+    let mut codec = CodecState::new(0);
+    codec.input = Some(input.clone());
+    let params = AudioConverterParams { format: Some(AudioFormat::FLAC), ..Default::default() };
+    let output = choose_output(&params, &input, ffi::AVSampleFormat::AV_SAMPLE_FMT_S32P, RATE);
+    assert_eq!(output.sample_format, ffi::AVSampleFormat::AV_SAMPLE_FMT_S32);
+    let encoder = codec.open_encoder(ffi::AVCodecID::AV_CODEC_ID_FLAC, &output);
+    let block = unsafe { (*encoder).frame_size } as usize;
+
+    // Interleaved stereo noise using all 32 bits.
+    let sample = |i: usize| (i as u32).wrapping_mul(2_654_435_761) as i32;
+    let mut messages = vec![];
+    unsafe {
+      for k in 0..10 {
+        let frame = ffi::av_frame_alloc();
+        (*frame).format = output.sample_format as i32;
+        (*frame).sample_rate = RATE;
+        (*frame).nb_samples = FRAME;
+        ffi::av_channel_layout_copy(&mut (*frame).ch_layout, &codec.layout);
+        assert!(ffi::av_frame_get_buffer(frame, 0) >= 0);
+        let data = std::slice::from_raw_parts_mut((*frame).data[0] as *mut i32, 2 * FRAME as usize);
+        for (n, value) in data.iter_mut().enumerate() {
+          *value = sample(2 * FRAME as usize * k + n);
+        }
+        codec.out_buffer.clear();
+        if let Some((_, count)) = codec.encode_frame(encoder, frame, Duration::from_millis(k as u64)) {
+          messages.push((codec.out_buffer.clone(), count));
+        }
+      }
+    }
+    assert!(messages.iter().any(|(_, count)| *count as usize == 2 * block), "no message of two frames");
+
+    let mut decoding = CodecState::new(0);
+    decoding.input = Some(InputChannels { encoding: AnalogEncoding::FLAC, format: AnalogFormat::Encoded, ..input });
+    let decoder = decoding.open_decoder();
+    let mut state = InputState::new(params, 0);
+    state.configure_parser(AnalogEncoding::FLAC);
+    for (m, (bytes, count)) in messages.iter().enumerate() {
+      state.queue_encoded(Duration::from_millis(m as u64), bytes, *count as u64);
+    }
+    let mut decoded: Vec<i32> = vec![];
+    let mut pts = vec![];
+    let mut packets = 0;
+    unsafe {
+      while state.parse_packet(decoder, decoding.packet_in) {
+        packets += 1;
+        assert!(ffi::avcodec_send_packet(decoder, decoding.packet_in) >= 0);
+        ffi::av_packet_unref(decoding.packet_in);
+        while ffi::avcodec_receive_frame(decoder, decoding.decoder_frame) >= 0 {
+          let frame = decoding.decoder_frame;
+          let format: ffi::AVSampleFormat = std::mem::transmute((*frame).format);
+          assert_eq!(ffi::av_get_packed_sample_fmt(format), ffi::AVSampleFormat::AV_SAMPLE_FMT_S32);
+          assert_eq!((*frame).sample_rate, RATE);
+          let n = (*frame).nb_samples as usize;
+          if ffi::av_sample_fmt_is_planar(format) == 1 {
+            let left = std::slice::from_raw_parts(*(*frame).extended_data.add(0) as *const i32, n);
+            let right = std::slice::from_raw_parts(*(*frame).extended_data.add(1) as *const i32, n);
+            decoded.extend(left.iter().zip(right).flat_map(|(l, r)| [*l, *r]));
+          } else {
+            decoded.extend_from_slice(std::slice::from_raw_parts((*frame).data[0] as *const i32, 2 * n));
+          }
+          pts.push((*frame).pts);
+          ffi::av_frame_unref(frame);
+        }
+      }
+    }
+    // One packet per message; the frames after the first in a packet have no
+    // pts, which is why pull times them by the packet's seq.
+    assert_eq!(packets, messages.len());
+    let expected_pts: Vec<i64> = messages.iter().enumerate()
+      .flat_map(|(m, (_, count))| (0..*count as usize / block).map(move |f| if f == 0 { m as i64 } else { ffi::AV_NOPTS_VALUE }))
+      .collect();
+    assert_eq!(pts, expected_pts);
+    let total: usize = messages.iter().map(|(_, count)| *count as usize).sum();
+    assert_eq!(decoded.len(), 2 * total);
+    assert!(decoded.iter().enumerate().all(|(n, value)| *value == sample(n)), "decoded samples differ");
+  }
+
+  #[test]
+  fn flac_rates_are_ones_a_frame_header_can_state() {
+    assert_eq!(flac_sample_rate(44100), 44100);
+    assert_eq!(flac_sample_rate(33332), 33332);
+    assert_eq!(flac_sample_rate(65534), 65534);
+    assert_eq!(flac_sample_rate(65535), 65540);
+    assert_eq!(flac_sample_rate(100004), 100000);
+    assert_eq!(flac_sample_rate(2_000_000), 655340);
   }
 
   #[test]
