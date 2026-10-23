@@ -2845,6 +2845,7 @@ dependencies = [
 name = "thalamus-contrib"
 version = "0.1.0"
 dependencies = [
+ "adler2",
  "ash",
  "bindgen 0.72.1",
  "btleplug",

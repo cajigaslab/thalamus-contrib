@@ -26,6 +26,7 @@ bytebuffer = "2.3.0"
 tokio-util = { version = "0.7.19", features = ["rt"] }
 nokhwa = { version = "0.10.0-rc.6", features = ["input-native"] }
 cpal = "0.18"
+adler2 = "2"
 bytes = "1"
 prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }

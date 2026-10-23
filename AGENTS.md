@@ -347,7 +347,7 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   are the prost-generated `storage_record::proto` messages
   (`Image.Format` values differ from `ThalamusImageFormat`'s), encoded and
   framed with an 8-byte big-endian length in `storage_record.rs`.
-- "Outputs" is a list of `{"URL": ..., "Main": bool}`. The node keeps
+- "Outputs" is a list of `{"URL": ..., "Main": bool, "Hash URL": ...}`. The node keeps
   exactly one Main (`normalize_main`, called from the state callback on any
   change in the list; its sets re-enter the callback, which converges): one just set Main, else the existing one, else the first. Plain paths and file:// URLs are
   files; http(s):// URLs get one streamed (chunked) POST lasting the whole
@@ -358,7 +358,15 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 - Names render like STORAGE2's: `{{rec}}`, strftime fields (left as they
   are if strftime can't parse the template), then `.YYYYMMDD.N`, with N the
   first recording number the Main output doesn't have yet (checked with HEAD
-  for HTTP), used for every output.
+  for HTTP), used for every output. Other outputs' names may be taken, so a
+  file output whose recording or `.json` already exists fails, like any
+  failed output, rather than overwrite; Thoth answers an existing path with
+  409.
+- An output's "Hash URL", if not empty, is a path or URL rendered like its
+  name. The output then computes its Adler-32 (`adler2`) as it writes, and
+  once it finishes successfully writes it (never overwriting) or POSTs it
+  as 8 hex digits, as Thoth's `/hashes/PATH` expects. An invalid Hash URL
+  makes its output invalid.
 - The metadata record gets the Metadata table, then Thalamus's "Build Type",
   "Version" and "Commit" (STORAGE2's keys; left out on a Thalamus without
   API slots 150-152) and this plugin's "Contrib Build Type", "Contrib

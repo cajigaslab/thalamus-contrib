@@ -25,8 +25,11 @@ class Storage3Widget(QWidget):
     sources = config['Sources']
 
     if 'Outputs' not in config:
-      config['Outputs'] = [{'URL': 'test.tha', 'Main': True}]
+      config['Outputs'] = [{'URL': 'test.tha', 'Main': True, 'Hash URL': ''}]
     outputs = config['Outputs']
+    for output in outputs:
+      if 'Hash URL' not in output:
+        output['Hash URL'] = ''
 
     if 'Metadata' not in config:
       config['Metadata'] = []
@@ -76,8 +79,11 @@ class Storage3Widget(QWidget):
       # https:// URL to stream the recording to with a POST, e.g. Thoth's
       # https://HOST/files/DATA_DIR/PATH. The recording number is chosen for
       # the Main output and used for all of them; the node keeps exactly one
-      # Main.
-      add_table(layout, 'Outputs:', outputs, ['URL', 'Main'], lambda: {'URL': '', 'Main': False}),
+      # Main. Hash URL: empty, or a path or URL (rendered like URL) that gets
+      # the output's Adler-32 once it finishes, e.g. Thoth's
+      # https://HOST/hashes/DATA_DIR/PATH.
+      add_table(layout, 'Outputs:', outputs, ['URL', 'Main', 'Hash URL'],
+                lambda: {'URL': '', 'Main': False, 'Hash URL': ''}),
       add_table(layout, 'Metadata:', metadata, ['Key', 'Value'], lambda: {'Key': 'Key', 'Value': 'Value'}),
     ]
     self.setLayout(layout)

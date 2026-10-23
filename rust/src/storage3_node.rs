@@ -10,8 +10,11 @@
 //! Like STORAGE2, the config is also written next to each output, with
 //! ".json" appended.
 //!
-//! Outputs are {"URL": ..., "Main": bool} objects, exactly one of them Main
-//! (the node keeps it that way). Output names are rendered like STORAGE2's:
+//! Outputs are {"URL": ..., "Main": bool, "Hash URL": ...} objects, exactly
+//! one of them Main (the node keeps it that way). A non-empty Hash URL (a
+//! path or URL, rendered like the output's name) receives the Adler-32 of
+//! the output, as 8 hex digits, once the output finishes: written to a file
+//! or POSTed, as Thoth's POST /hashes/PATH expects. Output names are rendered like STORAGE2's:
 //! {{rec}} becomes the zero padded recording number, strftime fields the
 //! start time, and ".YYYYMMDD.N" is appended, N being the first recording
 //! number for which the Main output doesn't exist yet. Every output gets
@@ -189,20 +192,41 @@ fn next_rec(main: &Output, time: &DateTime<Local>, exists: impl Fn(&Output, &str
 /// A buffer of framed records, shared by every output.
 type Chunk = Bytes;
 
+/// An output's running Adler-32, if it has a Hash URL.
+type Hasher = Arc<Mutex<Option<adler2::Adler32>>>;
+
+fn new_hasher(hash: bool) -> Hasher {
+  Arc::new(Mutex::new(hash.then(adler2::Adler32::new)))
+}
+
+fn hash_chunk(hasher: &Hasher, chunk: &[u8]) {
+  if let Some(adler) = hasher.lock().unwrap().as_mut() {
+    adler.write_slice(chunk);
+  }
+}
+
+fn checksum(hasher: &Hasher) -> Option<u32> {
+  hasher.lock().unwrap().as_ref().map(|adler| adler.checksum())
+}
+
 /// The body of an HTTP output: the chunks sent to it, until every sender is
 /// dropped or `stop` is cancelled. Either ends the stream and drops the
-/// receiver, so the writer stops sending to this output.
+/// receiver, so the writer stops sending to this output. Chunks are hashed
+/// as they're sent.
 fn chunk_stream(
   receiver: UnboundedReceiver<Chunk>,
   stop: CancellationToken,
+  hasher: Hasher,
 ) -> impl Stream<Item = Result<Chunk, std::io::Error>> + Send + 'static {
   futures::stream::unfold(receiver, move |mut receiver| {
     let stop = stop.clone();
+    let hasher = hasher.clone();
     async move {
       let chunk = tokio::select! {
         chunk = receiver.recv() => chunk?,
         _ = stop.cancelled() => return None,
       };
+      hash_chunk(&hasher, &chunk);
       Some((Ok(chunk), receiver))
     }
   })
@@ -218,28 +242,54 @@ async fn check_response(url: &str, response: reqwest::Result<reqwest::Response>)
   Err(format!("{url}: HTTP {status} {}", body.trim()))
 }
 
-fn write_file(path: &str, config: &str, mut receiver: UnboundedReceiver<Chunk>) -> Result<(), String> {
-  let path = Path::new(path);
-  if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-    std::fs::create_dir_all(parent).map_err(|error| format!("couldn't create {}: {error}", parent.display()))?;
+fn create_parent(path: &Path) -> Result<(), String> {
+  match path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+    Some(parent) => {
+      std::fs::create_dir_all(parent).map_err(|error| format!("couldn't create {}: {error}", parent.display()))
+    }
+    None => Ok(()),
   }
-  let mut config_path = path.as_os_str().to_owned();
-  config_path.push(".json");
-  std::fs::write(&config_path, config)
-    .map_err(|error| format!("couldn't write {}: {error}", Path::new(&config_path).display()))?;
-  let mut file = File::create(path).map_err(|error| format!("couldn't create {}: {error}", path.display()))?;
-  while let Some(chunk) = receiver.blocking_recv() {
-    file.write_all(&chunk).map_err(|error| format!("couldn't write {}: {error}", path.display()))?;
-  }
-  file.flush().map_err(|error| format!("couldn't write {}: {error}", path.display()))
 }
 
+/// Writes the recording to `path`, returning its Adler-32 if `hash`.
+fn write_file(
+  path: &str,
+  config: &str,
+  mut receiver: UnboundedReceiver<Chunk>,
+  hash: bool,
+) -> Result<Option<u32>, String> {
+  let path = Path::new(path);
+  create_parent(path)?;
+  let mut config_path = path.as_os_str().to_owned();
+  config_path.push(".json");
+  let config_path = Path::new(&config_path);
+  // Only the Main output was checked when choosing the recording number, so
+  // another output's name may be taken. Then this output fails rather than
+  // overwriting a recording.
+  if let Some(existing) = [path, config_path].into_iter().find(|path| path.exists()) {
+    return Err(format!("{} already exists", existing.display()));
+  }
+  std::fs::write(config_path, config).map_err(|error| format!("couldn't write {}: {error}", config_path.display()))?;
+  let mut file = File::create(path).map_err(|error| format!("couldn't create {}: {error}", path.display()))?;
+  let mut adler = hash.then(adler2::Adler32::new);
+  while let Some(chunk) = receiver.blocking_recv() {
+    file.write_all(&chunk).map_err(|error| format!("couldn't write {}: {error}", path.display()))?;
+    if let Some(adler) = adler.as_mut() {
+      adler.write_slice(&chunk);
+    }
+  }
+  file.flush().map_err(|error| format!("couldn't write {}: {error}", path.display()))?;
+  Ok(adler.map(|adler| adler.checksum()))
+}
+
+/// Streams the recording to `url`, returning its Adler-32 if `hash`.
 async fn post_http(
   client: reqwest::Client,
   url: &str,
   config: &str,
   receiver: UnboundedReceiver<Chunk>,
-) -> Result<(), String> {
+  hash: bool,
+) -> Result<Option<u32>, String> {
   let config_url = format!("{url}.json");
   let response = client
     .post(&config_url)
@@ -253,10 +303,43 @@ async fn post_http(
   // normally comes once the body ends; if it comes first (e.g. an error),
   // hyper would keep sending the body, so it's ended here.
   let stop = CancellationToken::new();
-  let body = reqwest::Body::wrap_stream(chunk_stream(receiver, stop.clone()));
+  let hasher = new_hasher(hash);
+  let body = reqwest::Body::wrap_stream(chunk_stream(receiver, stop.clone(), hasher.clone()));
   let response = client.post(url).header(CONTENT_TYPE, "application/octet-stream").body(body).send().await;
   stop.cancel();
-  check_response(url, response).await
+  check_response(url, response).await?;
+  Ok(checksum(&hasher))
+}
+
+/// Where an output's Adler-32 goes: a Hash URL and its rendered name.
+#[derive(Debug, Clone, PartialEq)]
+struct HashTarget {
+  target: Output,
+  name: String,
+}
+
+/// Thoth's format: 8 lowercase hex digits.
+fn hash_text(adler: u32) -> String {
+  format!("{adler:08x}")
+}
+
+/// Writes or POSTs `adler` to `hash`. A hash file isn't overwritten, like
+/// an output.
+async fn store_hash(client: &reqwest::Client, hash: &HashTarget, adler: u32) -> Result<(), String> {
+  match &hash.target {
+    Output::File(_) => {
+      let path = Path::new(&hash.name);
+      create_parent(path)?;
+      if path.exists() {
+        return Err(format!("{} already exists", path.display()));
+      }
+      std::fs::write(path, hash_text(adler)).map_err(|error| format!("couldn't write {}: {error}", path.display()))
+    }
+    Output::Http(_) => {
+      let request = client.post(&hash.name).header(CONTENT_TYPE, "text/plain").body(hash_text(adler));
+      check_response(&hash.name, request.send().await).await
+    }
+  }
 }
 
 /// What writes an output.
@@ -272,32 +355,56 @@ struct OutputWorker {
   worker: Worker,
 }
 
-fn log_result(name: &str, result: Result<(), String>) {
+/// Logs how output `name` finished. Returns its hash, if it succeeded and
+/// computed one.
+fn log_result(name: &str, result: Result<Option<u32>, String>) -> Option<u32> {
   match result {
-    Ok(()) => println!("STORAGE3: finished {name}"),
-    Err(error) => println!("STORAGE3: output failed, stopping it: {error}"),
+    Ok(adler) => {
+      println!("STORAGE3: finished {name}");
+      adler
+    }
+    Err(error) => {
+      println!("STORAGE3: output failed, stopping it: {error}");
+      None
+    }
+  }
+}
+
+fn log_hash(name: &str, hash: &HashTarget, result: Result<(), String>) {
+  match result {
+    Ok(()) => println!("STORAGE3: stored the hash of {name} at {}", hash.name),
+    Err(error) => println!("STORAGE3: couldn't store the hash of {name}: {error}"),
   }
 }
 
 fn start_output(
   output: &Output,
   name: String,
+  hash: Option<HashTarget>,
   config: Arc<String>,
   client: &reqwest::Client,
   runtime: &Handle,
 ) -> std::io::Result<OutputWorker> {
   let (sender, receiver) = unbounded_channel();
   let worker_name = name.clone();
+  let client = client.clone();
   let worker = match output {
-    Output::File(_) => Worker::Thread(thread::Builder::new().name("STORAGE3 output".to_string()).spawn(move || {
-      log_result(&worker_name, write_file(&worker_name, &config, receiver));
-    })?),
-    Output::Http(_) => {
-      let client = client.clone();
-      Worker::Task(runtime.spawn(async move {
-        log_result(&worker_name, post_http(client, &worker_name, &config, receiver).await);
-      }))
+    Output::File(_) => {
+      let runtime = runtime.clone();
+      Worker::Thread(thread::Builder::new().name("STORAGE3 output".to_string()).spawn(move || {
+        let adler = log_result(&worker_name, write_file(&worker_name, &config, receiver, hash.is_some()));
+        if let (Some(hash), Some(adler)) = (hash, adler) {
+          // Not a runtime thread, so it can block on one.
+          log_hash(&worker_name, &hash, runtime.block_on(store_hash(&client, &hash, adler)));
+        }
+      })?)
     }
+    Output::Http(_) => Worker::Task(runtime.spawn(async move {
+      let result = post_http(client.clone(), &worker_name, &config, receiver, hash.is_some()).await;
+      if let (Some(hash), Some(adler)) = (hash, log_result(&worker_name, result)) {
+        log_hash(&worker_name, &hash, store_hash(&client, &hash, adler).await);
+      }
+    })),
   };
   Ok(OutputWorker { name, sender, worker })
 }
@@ -449,6 +556,8 @@ fn read_sources(state: &State) -> Vec<Source> {
 struct OutputConfig {
   url: String,
   main: bool,
+  /// Empty for no hash.
+  hash_url: String,
 }
 
 fn output_rows(state: &State) -> Vec<State> {
@@ -467,7 +576,11 @@ fn output_rows(state: &State) -> Vec<State> {
 fn read_outputs(state: &State) -> Vec<OutputConfig> {
   output_rows(state)
     .iter()
-    .map(|row| OutputConfig { url: string_at(row, "URL").unwrap_or_default(), main: bool_at(row, "Main", false) })
+    .map(|row| OutputConfig {
+      url: string_at(row, "URL").unwrap_or_default(),
+      main: bool_at(row, "Main", false),
+      hash_url: string_at(row, "Hash URL").unwrap_or_default(),
+    })
     .collect()
 }
 
@@ -582,6 +695,8 @@ struct Recording {
   state: MainThreadOnly<State>,
   node_name: String,
   outputs: Vec<Output>,
+  /// Each output's Hash URL, if it has one.
+  hashes: Vec<Option<Output>>,
   /// Index in outputs of the Main output.
   main: usize,
   config: String,
@@ -589,7 +704,7 @@ struct Recording {
 }
 
 fn run_writer(recording: Recording) {
-  let Recording { shared, api, state, node_name, outputs, main, config, runtime } = recording;
+  let Recording { shared, api, state, node_name, outputs, hashes, main, config, runtime } = recording;
   let start = Local::now();
   let client = match http_client() {
     Ok(client) => client,
@@ -643,9 +758,10 @@ fn run_writer(recording: Recording) {
 
   let config = Arc::new(config);
   let mut output_workers: Vec<OutputWorker> = Vec::new();
-  for (output, name) in outputs.iter().zip(names) {
+  for ((output, name), hash) in outputs.iter().zip(names).zip(hashes) {
     println!("STORAGE3: recording to {name}");
-    match start_output(output, name, config.clone(), &client, &runtime) {
+    let hash = hash.map(|target| HashTarget { name: recording_name(target.template(), rec, &start), target });
+    match start_output(output, name, hash, config.clone(), &client, &runtime) {
       Ok(worker) => output_workers.push(worker),
       Err(error) => println!("STORAGE3: couldn't start an output thread: {error}"),
     }
@@ -855,14 +971,20 @@ fn start(inner: &Rc<RefCell<Inner>>) {
     return;
   };
   let mut outputs = Vec::new();
+  let mut hashes = Vec::new();
   let mut main = None;
   for (i, config) in configs.iter().enumerate() {
-    match parse_output(&config.url) {
-      Ok(output) => {
+    let hash = match config.hash_url.trim() {
+      "" => Ok(None),
+      url => parse_output(url).map(Some).map_err(|error| format!("Hash URL: {error}")),
+    };
+    match parse_output(&config.url).and_then(|output| Ok((output, hash?))) {
+      Ok((output, hash)) => {
         if i == main_config {
           main = Some(outputs.len());
         }
         outputs.push(output);
+        hashes.push(hash);
       }
       Err(error) if i == main_config => {
         fail_start(inner, &format!("The Main output is invalid: {error}"));
@@ -915,6 +1037,7 @@ fn start(inner: &Rc<RefCell<Inner>>) {
     state: MainThreadOnly::new(state, api, token),
     node_name,
     outputs,
+    hashes,
     main,
     config,
     runtime,
@@ -1192,7 +1315,7 @@ mod tests {
     sender.send(Bytes::from_static(b"pedia")).unwrap();
     drop(sender);
     let chunks: Vec<Chunk> =
-      futures::executor::block_on(chunk_stream(receiver, CancellationToken::new()).map(Result::unwrap).collect());
+      futures::executor::block_on(chunk_stream(receiver, CancellationToken::new(), new_hasher(false)).map(Result::unwrap).collect());
     assert_eq!(chunks.concat(), b"Wikipedia");
   }
 
@@ -1201,7 +1324,7 @@ mod tests {
     use futures::StreamExt;
     let (sender, receiver) = unbounded_channel();
     let stop = CancellationToken::new();
-    let mut stream = Box::pin(chunk_stream(receiver, stop.clone()));
+    let mut stream = Box::pin(chunk_stream(receiver, stop.clone(), new_hasher(false)));
     sender.send(Bytes::from_static(b"a")).unwrap();
     futures::executor::block_on(async {
       assert_eq!(stream.next().await.unwrap().unwrap(), Bytes::from_static(b"a"));
@@ -1219,9 +1342,76 @@ mod tests {
     sender.send(Bytes::from_static(&[1, 2])).unwrap();
     sender.send(Bytes::from_static(&[3])).unwrap();
     drop(sender);
-    write_file(path.to_str().unwrap(), "{}", receiver).unwrap();
+    assert_eq!(write_file(path.to_str().unwrap(), "{}", receiver, false).unwrap(), None);
     assert_eq!(std::fs::read(&path).unwrap(), vec![1, 2, 3]);
     assert_eq!(std::fs::read_to_string(dir.join("sub").join("test.tha.json")).unwrap(), "{}");
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn outputs_hash_what_they_write() {
+    let dir = std::env::temp_dir().join(format!("storage3_hash_test_{}", std::process::id()));
+    let path = dir.join("test.tha");
+    let (sender, receiver) = unbounded_channel();
+    sender.send(Bytes::from_static(b"Wiki")).unwrap();
+    sender.send(Bytes::from_static(b"pedia")).unwrap();
+    drop(sender);
+    // zlib.adler32(b"Wikipedia")
+    assert_eq!(write_file(path.to_str().unwrap(), "{}", receiver, true).unwrap(), Some(0x11e6_0398));
+    assert_eq!(hash_text(0x11e6_0398), "11e60398");
+    assert_eq!(hash_text(0xff), "000000ff");
+
+    let hash = HashTarget { target: Output::File(String::new()), name: dir.join("sub").join("hash").to_string_lossy().into_owned() };
+    let client = reqwest::Client::new();
+    futures::executor::block_on(store_hash(&client, &hash, 0x11e6_0398)).unwrap();
+    assert_eq!(std::fs::read_to_string(&hash.name).unwrap(), "11e60398");
+    // Not overwritten.
+    assert!(futures::executor::block_on(store_hash(&client, &hash, 1)).is_err());
+    assert_eq!(std::fs::read_to_string(&hash.name).unwrap(), "11e60398");
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[test]
+  fn http_bodies_are_hashed_as_sent() {
+    use futures::StreamExt;
+    let (sender, receiver) = unbounded_channel();
+    sender.send(Bytes::from_static(b"Wiki")).unwrap();
+    sender.send(Bytes::from_static(b"pedia")).unwrap();
+    drop(sender);
+    let hasher = new_hasher(true);
+    let chunks: Vec<Chunk> = futures::executor::block_on(
+      chunk_stream(receiver, CancellationToken::new(), hasher.clone()).map(Result::unwrap).collect(),
+    );
+    assert_eq!(chunks.concat(), b"Wikipedia");
+    assert_eq!(checksum(&hasher), Some(0x11e6_0398));
+    assert_eq!(checksum(&new_hasher(false)), None);
+  }
+
+  #[test]
+  fn file_outputs_never_overwrite() {
+    let dir = std::env::temp_dir().join(format!("storage3_overwrite_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let write = |path: &std::path::Path| {
+      let (sender, receiver) = unbounded_channel();
+      sender.send(Bytes::from_static(b"new")).unwrap();
+      drop(sender);
+      write_file(path.to_str().unwrap(), "{}", receiver, false)
+    };
+
+    // An existing recording is kept.
+    let recording = dir.join("a.tha");
+    std::fs::write(&recording, b"old").unwrap();
+    assert!(write(&recording).is_err());
+    assert_eq!(std::fs::read(&recording).unwrap(), b"old");
+    assert!(!dir.join("a.tha.json").exists());
+
+    // So is an existing config, and no recording is started beside it.
+    let recording = dir.join("b.tha");
+    std::fs::write(dir.join("b.tha.json"), b"old").unwrap();
+    assert!(write(&recording).is_err());
+    assert_eq!(std::fs::read(dir.join("b.tha.json")).unwrap(), b"old");
+    assert!(!recording.exists());
+
     std::fs::remove_dir_all(&dir).unwrap();
   }
 
