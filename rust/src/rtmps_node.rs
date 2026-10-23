@@ -4,7 +4,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 
 use crate::api::{
-  MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OnDrop, PredropToken,
+  MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OnDrop,
   State, StateAction, StateKey, StateValue, ThalamusAPI,
 };
 use crate::rtmps_publisher::{FrameBuf, RtmpsPublisher};
@@ -180,7 +180,7 @@ fn stop_publishing<F: FnOnce() + 'static>(inner: &Rc<RefCell<RtmpsNodeInner>>, o
 impl NodeConsts for RtmpsNode {}
 
 impl Node for RtmpsNode {
-  fn new(api: ThalamusAPI, _node_token: NodeToken, state: State, token: MainThreadToken) -> Self {
+  fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Self {
     let inner = Rc::new(RefCell::new(RtmpsNodeInner {
       api,
       state: state.clone(),
@@ -211,15 +211,15 @@ impl Node for RtmpsNode {
       };
 
     inner.borrow_mut().state_connection = Some(state.connect(state_callback));
+
+    let predrop_ref = Rc::downgrade(&inner);
+    node_token.set_predrop(move |token| match predrop_ref.upgrade() {
+      Some(inner) => stop_publishing(&inner, move || token.ready()),
+      None => token.ready(),
+    });
     state.recap();
 
     RtmpsNode { inner }
-  }
-
-  fn predrop(&self, token: PredropToken) {
-    stop_publishing(&self.inner, move || {
-      token.ready();
-    });
   }
 }
 

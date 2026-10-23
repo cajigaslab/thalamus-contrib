@@ -11,6 +11,7 @@ mod angular_scaling_node;
 pub mod api;
 mod audio_converter;
 mod block;
+mod build_info;
 mod bluetooth;
 mod ffi;
 mod ffmpeg_devices;
@@ -27,6 +28,8 @@ mod openh264;
 mod rtmps_node;
 mod rtmps_publisher;
 mod sleeve_node;
+mod storage3_node;
+mod storage_record;
 mod thorcam_node;
 mod wakers;
 mod webcam_node;
@@ -36,6 +39,7 @@ use media_converter_node::MediaConverterNode;
 use mic_node::MicNode;
 use rtmps_node::RtmpsNode;
 use sleeve_node::SleeveNode;
+use storage3_node::Storage3Node;
 use thorcam_node::ThorcamNode;
 use webcam_node::WebcamNode;
 
@@ -46,5 +50,6 @@ export_nodes!(
   ("ANGULAR_SCALING", AngularScalingNode),
   ("WEBCAM", WebcamNode),
   ("MEDIA_CONVERTER", MediaConverterNode),
-  ("MIC", MicNode)
+  ("MIC", MicNode),
+  ("STORAGE3", Storage3Node)
 );

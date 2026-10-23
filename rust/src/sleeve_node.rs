@@ -37,7 +37,8 @@ struct SleeveNodeInner {
 }
 
 pub struct SleeveNode {
-  inner: Arc<Mutex<SleeveNodeInner>>,
+  // Keeps the node's state alive; the callbacks hold weak references.
+  _inner: Arc<Mutex<SleeveNodeInner>>,
 }
 
 struct SleeveData<'a> {
@@ -751,6 +752,7 @@ impl Node for SleeveNode {
     state: State,
     main_thread_token: MainThreadToken,
   ) -> Self {
+    let predrop_token = node_token.clone();
     let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Mutex<SleeveNodeInner>>| {
       let weak2 = weak.clone();
       let state_callback =
@@ -773,18 +775,18 @@ impl Node for SleeveNode {
       })
     });
 
+    let predrop_ref = Arc::downgrade(&inner);
+    predrop_token.set_predrop(move |token| match predrop_ref.upgrade() {
+      Some(inner) => stop_bluetooth(inner, move || token.ready()),
+      None => token.ready(),
+    });
+
     state.recap_with(
       |source: State, action: StateAction, key: StateValue, value: StateValue| {
         SleeveNodeInner::on_state(inner.clone(), source, action, key, value);
       },
     );
 
-    SleeveNode { inner }
-  }
-
-  fn predrop(&self, token: api::PredropToken) {
-    stop_bluetooth(self.inner.clone(), move || {
-      token.ready();
-    });
+    SleeveNode { _inner: inner }
   }
 }

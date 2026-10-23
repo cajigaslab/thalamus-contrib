@@ -186,6 +186,10 @@ impl AnalogData for WithStats<'_> {
     self.analog.map_or(0, |a| a.encoded_count())
   }
 
+  fn remote_time(&self) -> Duration {
+    self.analog.map_or(Duration::ZERO, |a| a.remote_time())
+  }
+
   fn channels_changed(&self) -> bool {
     self.channels_changed
   }
@@ -466,7 +470,7 @@ impl MediaConverterNode {
 
 impl Node for MediaConverterNode {
   fn new(api: ThalamusAPI, node_token: NodeToken, state: State, token: MainThreadToken) -> Rc<RefCell<Self>> {
-    let signaler = OffMainSignaler::new(api, node_token);
+    let signaler = OffMainSignaler::new(api, node_token.clone());
     signaler.unblock();
     let params = ParamsHolder {
       params: MediaConverterParams {
@@ -530,12 +534,15 @@ impl Node for MediaConverterNode {
         viewer_sink,
       ));
     }
+    let (dropping, signaler, notify) = {
+      let borrow = result.borrow();
+      (borrow.dropping.clone(), borrow.signaler.clone(), borrow.notify.clone())
+    };
+    node_token.set_predrop(move |token| {
+      dropping.store(true, Ordering::SeqCst);
+      signaler.predrop(token);
+      notify.notify_one();
+    });
     result
-  }
-
-  fn predrop(&self, token: crate::api::PredropToken) {
-    self.dropping.store(true, Ordering::SeqCst);
-    self.signaler.predrop(token);
-    self.notify.notify_one();
   }
 }

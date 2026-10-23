@@ -275,7 +275,7 @@ impl<'a> NodeData for ExtNodeData<'a> {
       return None;
     }
     let has_data = unsafe { ((*mocap).has_motion_data.unwrap())(self.node.node) != 0 };
-    if has_data { None } else { Some(self) }
+    if has_data { Some(self) } else { None }
   }
 
   fn text(&self) -> Option<&dyn TextData> {
@@ -284,7 +284,21 @@ impl<'a> NodeData for ExtNodeData<'a> {
       return None;
     }
     let has_data = unsafe { ((*text).has_text_data.unwrap())(self.node.node) != 0 };
-    if has_data { None } else { Some(self) }
+    if has_data { Some(self) } else { None }
+  }
+
+  /// ThalamusNode::blob exists in every Thalamus with node_request (API
+  /// version 143), so older ones are treated as having no blobs.
+  fn blob(&self) -> Option<&dyn BlobData> {
+    if unsafe { (*self.node.api.raw).version } < 143 {
+      return None;
+    }
+    let blob = unsafe { (*self.node.node).blob };
+    if blob.is_null() {
+      return None;
+    }
+    let has_data = unsafe { ((*blob).has_blob_data.unwrap())(self.node.node) != 0 };
+    if has_data { Some(self) } else { None }
   }
 }
 
@@ -438,6 +452,15 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       (*analog).encoded_count.map_or(0, |encoded_count| encoded_count(self.node.node))
     }
   }
+  fn remote_time(&self) -> Duration {
+    if self.node.api.analog_node_version() < 6 {
+      return Duration::ZERO;
+    }
+    unsafe {
+      let analog = (*self.node.node).analog;
+      Duration::from_nanos((*analog).remote_time_ns.map_or(0, |remote_time| remote_time(self.node.node)))
+    }
+  }
   fn channels_changed(&self) -> bool {
     // Older Thalamus builds' ThalamusAnalogNode ends before `channels_changed`.
     if self.node.api.analog_node_version() < 5 {
@@ -510,6 +533,16 @@ impl<'a> AnalogData for ExtNodeData<'a> {
 }
 
 impl<'a> ImageData for ExtNodeData<'a> {
+  fn remote_time(&self) -> Duration {
+    if self.node.api.image_node_version() < 1 {
+      return Duration::ZERO;
+    }
+    unsafe {
+      let image = (*self.node.node).image;
+      Duration::from_nanos((*image).remote_time_ns.map_or(0, |remote_time| remote_time(self.node.node)))
+    }
+  }
+
   fn plane(&self, channel: i32) -> &[u8] {
     let mut span = ThalamusByteSpan {
       data: null(),
@@ -581,6 +614,16 @@ impl<'a> ImageData for ExtNodeData<'a> {
 }
 
 impl<'a> MocapData for ExtNodeData<'a> {
+  fn remote_time(&self) -> Duration {
+    if self.node.api.mocap_node_version() < 1 {
+      return Duration::ZERO;
+    }
+    unsafe {
+      let mocap = (*self.node.node).mocap;
+      Duration::from_nanos((*mocap).remote_time_ns.map_or(0, |remote_time| remote_time(self.node.node)))
+    }
+  }
+
   fn segments(&self) -> &[ThalamusMocapSegment] {
     let mut span = ThalamusMocapSegmentSpan {
       data: null(),
@@ -611,6 +654,16 @@ impl<'a> MocapData for ExtNodeData<'a> {
 }
 
 impl<'a> TextData for ExtNodeData<'a> {
+  fn remote_time(&self) -> Duration {
+    if self.node.api.text_node_version() < 1 {
+      return Duration::ZERO;
+    }
+    unsafe {
+      let text = (*self.node.node).text;
+      Duration::from_nanos((*text).remote_time_ns.map_or(0, |remote_time| remote_time(self.node.node)))
+    }
+  }
+
   fn text(&self) -> &str {
     let mut span = ThalamusCharSpan {
       data: null(),
@@ -625,6 +678,97 @@ impl<'a> TextData for ExtNodeData<'a> {
       std::str::from_utf8(slice).unwrap()
     }
   }
+}
+
+impl<'a> BlobData for ExtNodeData<'a> {
+  fn body(&self) -> &[u8] {
+    let mut span = ThalamusByteSpan { data: null(), size: 0 };
+    unsafe {
+      let blob = (*self.node.node).blob;
+      ((*blob).body.unwrap())(&mut span as *mut ThalamusByteSpan, self.node.node);
+      if span.data.is_null() {
+        return &[];
+      }
+      std::slice::from_raw_parts(span.data, span.size as usize)
+    }
+  }
+
+  fn mime(&self) -> &str {
+    let mut span = ThalamusCharSpan {
+      data: null(),
+      size: 0,
+      owns_data: 0,
+    };
+    unsafe {
+      let blob = (*self.node.node).blob;
+      ((*blob).mime.unwrap())(&mut span as *mut ThalamusCharSpan, self.node.node);
+      if span.data.is_null() {
+        return "";
+      }
+      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      std::str::from_utf8(slice).unwrap_or("")
+    }
+  }
+
+  fn stream(&self) -> u32 {
+    unsafe {
+      let blob = (*self.node.node).blob;
+      ((*blob).stream.unwrap())(self.node.node)
+    }
+  }
+}
+
+/// An event sent to Thalamus, passed to ThalamusAPI::subscribe_events.
+pub struct EventMessage<'a> {
+  pub payload: &'a [u8],
+  pub time: Duration,
+}
+
+/// A log message, passed to ThalamusAPI::subscribe_log.
+pub struct LogMessage<'a> {
+  pub text: &'a str,
+  pub time: Duration,
+  /// Its time on the Thalamus that first logged it, if it came from another
+  /// one (e.g. through a REMOTELOG node), else zero.
+  pub remote_time: Duration,
+}
+
+struct MessageArgs<T> {
+  callback: T,
+}
+
+unsafe extern "C" fn event_callback<T: FnMut(&EventMessage) + Send>(
+  event: *const ThalamusEvent,
+  data: *mut ::std::os::raw::c_void,
+) {
+  let args = unsafe { &mut *(data as *mut MessageArgs<T>) };
+  let event = unsafe { &*event };
+  let payload = if event.payload.data.is_null() {
+    &[][..]
+  } else {
+    unsafe { std::slice::from_raw_parts(event.payload.data, event.payload.size as usize) }
+  };
+  (args.callback)(&EventMessage { payload, time: Duration::from_nanos(event.time_ns) });
+}
+
+unsafe extern "C" fn log_callback<T: FnMut(&LogMessage) + Send>(
+  log: *const ThalamusLog,
+  data: *mut ::std::os::raw::c_void,
+) {
+  let args = unsafe { &mut *(data as *mut MessageArgs<T>) };
+  let log = unsafe { &*log };
+  let text = if log.text.data.is_null() {
+    ""
+  } else {
+    let bytes = unsafe { std::slice::from_raw_parts(log.text.data as *const u8, log.text.size as usize) };
+    // Protobuf strings are UTF-8, but a C++ sender isn't checked.
+    std::str::from_utf8(bytes).unwrap_or("")
+  };
+  (args.callback)(&LogMessage {
+    text,
+    time: Duration::from_nanos(log.time_ns),
+    remote_time: Duration::from_nanos(log.remote_time_ns),
+  });
 }
 
 unsafe extern "C" fn node_ready_callback<T: FnMut(ExtNode)>(
@@ -773,6 +917,27 @@ impl NodeToken {
     // Drop the old handler outside the token lock.
     drop(previous);
   }
+
+  /// Installs the node's predrop handler, called on the main thread before
+  /// the node is destroyed. It must eventually call PredropToken::ready (e.g.
+  /// once the node's threads have stopped signaling). Without one, the node
+  /// is ready to drop at once.
+  pub fn set_predrop(&self, predrop: impl FnMut(PredropToken) + 'static) {
+    assert!(
+      is_main_thread(),
+      "NodeToken::set_predrop must be called on the main thread"
+    );
+    let previous = self.with(|node| unsafe {
+      // SAFETY: as in set_process.
+      let plugin_impl = &*plugin_impl_ptr(node);
+      let mut slot = plugin_impl
+        .predrop
+        .try_borrow_mut()
+        .expect("NodeToken::set_predrop must not be called during a predrop call");
+      slot.replace(Box::new(predrop))
+    });
+    drop(previous);
+  }
 }
 
 pub struct OffMainSignaler {
@@ -873,8 +1038,12 @@ pub enum DialogType {
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
+/// The Thalamus API for the main thread. It isn't Send or Sync, and is only
+/// made on the main thread (by the node factory, or from a
+/// ThalamusAPIThreadSafe with a MainThreadToken), so holding one proves the
+/// caller is on the main thread.
 pub struct ThalamusAPI {
-  pub raw: *mut ThalamusAPIRaw,
+  raw: *mut ThalamusAPIRaw,
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -920,6 +1089,22 @@ impl ThalamusAPIThreadSafe {
       let time_ns = (&*self.raw).time_ns.unwrap();
       return Duration::from_nanos(time_ns());
     }
+  }
+
+  /// Thalamus's build type (e.g. "Debug" or "Release"), as STORAGE2 records
+  /// it, or None if Thalamus predates the query.
+  pub fn thalamus_build_type(&self) -> Option<&'static str> {
+    unsafe { static_text((*self.raw).build_type) }
+  }
+
+  /// Thalamus's version, or None if Thalamus predates the query.
+  pub fn thalamus_version(&self) -> Option<&'static str> {
+    unsafe { static_text((*self.raw).thalamus_version) }
+  }
+
+  /// Thalamus's git commit, or None if Thalamus predates the query.
+  pub fn thalamus_commit(&self) -> Option<&'static str> {
+    unsafe { static_text((*self.raw).commit) }
   }
 
   /// Begins a trace event named `name` (category "plugin") on this thread's
@@ -1023,7 +1208,30 @@ impl ThalamusAPIThreadSafe {
   }
 }
 
+/// The API table setup() made, for ThalamusAPI::global. Kept as the thread
+/// safe handle, since a ThalamusAPI can't be in a static (it isn't Sync).
+static GLOBAL_API: OnceLock<ThalamusAPIThreadSafe> = OnceLock::new();
+
 impl ThalamusAPI {
+  /// The plugin's ThalamusAPI, for code that has none at hand (e.g.
+  /// deferred!). Panics off the main thread, where a ThalamusAPI mustn't
+  /// exist, or before Thalamus has loaded the plugin.
+  pub fn global() -> ThalamusAPI {
+    assert!(is_main_thread(), "ThalamusAPI::global must be called on the main thread");
+    let api = GLOBAL_API.get().expect("ThalamusAPI::global called before the plugin was loaded");
+    ThalamusAPI { raw: api.raw }
+  }
+
+  /// # Safety
+  /// Must be called on the main thread, with the API table from setup().
+  pub(crate) unsafe fn from_raw(raw: *mut ThalamusAPIRaw) -> ThalamusAPI {
+    ThalamusAPI { raw }
+  }
+
+  pub(crate) fn raw(&self) -> *mut ThalamusAPIRaw {
+    self.raw
+  }
+
   /// The root of Thalamus's state tree (the whole config), from the host's
   /// state_root. None on a Thalamus without it; State::root finds the same
   /// root from any state in the tree.
@@ -1041,6 +1249,38 @@ impl ThalamusAPI {
   pub fn analog_node_version(&self) -> i32 {
     // copy_from_host leaves functions the host doesn't have as None.
     unsafe { (*self.raw).analog_node_version.map_or(0, |f| f()) }
+  }
+
+  /// The number of fields after `has_image_data` in the ThalamusImageNodes
+  /// Thalamus provides (1 once `remote_time_ns` exists), or 0 if the running
+  /// Thalamus predates the query.
+  pub fn image_node_version(&self) -> i32 {
+    unsafe { (*self.raw).image_node_version.map_or(0, |f| f()) }
+  }
+
+  /// Like image_node_version, for ThalamusTextNode after `has_text_data`.
+  pub fn text_node_version(&self) -> i32 {
+    unsafe { (*self.raw).text_node_version.map_or(0, |f| f()) }
+  }
+
+  /// Like image_node_version, for ThalamusMocapNode after `has_motion_data`.
+  pub fn mocap_node_version(&self) -> i32 {
+    unsafe { (*self.raw).mocap_node_version.map_or(0, |f| f()) }
+  }
+
+  /// See ThalamusAPIThreadSafe::thalamus_build_type.
+  pub fn thalamus_build_type(&self) -> Option<&'static str> {
+    self.thread_safe().thalamus_build_type()
+  }
+
+  /// See ThalamusAPIThreadSafe::thalamus_version.
+  pub fn thalamus_version(&self) -> Option<&'static str> {
+    self.thread_safe().thalamus_version()
+  }
+
+  /// See ThalamusAPIThreadSafe::thalamus_commit.
+  pub fn thalamus_commit(&self) -> Option<&'static str> {
+    self.thread_safe().thalamus_commit()
   }
 
   pub fn thread_safe(&self) -> ThalamusAPIThreadSafe {
@@ -1105,20 +1345,16 @@ impl ThalamusAPI {
     unsafe { dialog_show(&mut title, &mut message, dialog_type) };
   }
 
-  pub fn post_to_main<T: FnOnce(MainThreadToken) + Send + 'static>(&self, call: T) {
+  /// Runs `call` later on the main thread. Unlike
+  /// ThalamusAPIThreadSafe::post_to_main it needn't be Send: a ThalamusAPI
+  /// only exists on the main thread, so `call` never leaves it (e.g. it can
+  /// capture a State).
+  pub fn post_to_main<T: FnOnce(MainThreadToken) + 'static>(&self, call: T) {
     unsafe {
       let api = &*self.raw;
       let call_ptr = Box::into_raw(Box::new(PostArgs { call }));
       let void_ptr = call_ptr as *mut std::os::raw::c_void;
       (api.io_context_post.unwrap())(Some(post_callback::<T>), void_ptr);
-
-      //let call_ref =  &*call_ptr;
-      //let mut done = call_ref.mutex.lock().unwrap();
-      //while !*done {
-      //  done = call_ref.cond.wait(done).unwrap();
-      //}
-      //
-      //drop(Box::from_raw(call_ptr));
     }
   }
 
@@ -1144,6 +1380,37 @@ impl ThalamusAPI {
       println!("new timer {:?} {:?}", self, timer);
       Timer { api: *self, timer }
     }
+  }
+
+  /// Calls callback with every event sent to Thalamus, on any thread, until
+  /// the returned OnDrop is dropped. None if the running Thalamus predates
+  /// events_connect.
+  pub fn subscribe_events<T: FnMut(&EventMessage) + Send + 'static>(&self, callback: T) -> Option<OnDrop> {
+    let connect = unsafe { &*self.raw }.events_connect?;
+    let call_ptr = Box::into_raw(Box::new(MessageArgs { callback }));
+    let connection = unsafe { connect(Some(event_callback::<T>), call_ptr as *mut c_void) };
+    Some(self.disconnect_messages_on_drop(connection, call_ptr))
+  }
+
+  /// Like subscribe_events, for log messages.
+  pub fn subscribe_log<T: FnMut(&LogMessage) + Send + 'static>(&self, callback: T) -> Option<OnDrop> {
+    let connect = unsafe { &*self.raw }.log_connect?;
+    let call_ptr = Box::into_raw(Box::new(MessageArgs { callback }));
+    let connection = unsafe { connect(Some(log_callback::<T>), call_ptr as *mut c_void) };
+    Some(self.disconnect_messages_on_drop(connection, call_ptr))
+  }
+
+  fn disconnect_messages_on_drop<T: 'static>(
+    &self,
+    connection: *mut ThalamusMessageConnection,
+    call_ptr: *mut MessageArgs<T>,
+  ) -> OnDrop {
+    let api = self.raw;
+    OnDrop::new(move || unsafe {
+      // Once message_disconnect returns the callback isn't running.
+      ((&*api).message_disconnect.unwrap())(connection);
+      drop(Box::from_raw(call_ptr));
+    })
   }
 
   pub fn get_node<T: FnMut(ExtNode) + 'static>(
@@ -2160,6 +2427,20 @@ pub fn run_task<F: Future<Output = ()> + 'static>(future: F) -> TaskScope {
   TaskScope { task: task.clone() }
 }
 
+/// Calls an API function that sets a span to static text, or returns None
+/// if Thalamus doesn't have it (copy_from_host leaves it None).
+fn static_text(get: Option<unsafe extern "C" fn(*mut ThalamusCharSpan)>) -> Option<&'static str> {
+  let mut span = ThalamusCharSpan { data: null(), size: 0, owns_data: 0 };
+  unsafe {
+    get?(&mut span as *mut ThalamusCharSpan);
+    debug_assert!(span.owns_data == 0);
+    if span.data.is_null() {
+      return Some("");
+    }
+    std::str::from_utf8(std::slice::from_raw_parts(span.data as *const u8, span.size as usize)).ok()
+  }
+}
+
 pub fn time(api: *const ThalamusAPIRaw) -> Duration {
   unsafe {
     return Duration::from_nanos(((&*api).time_ns.unwrap())());
@@ -2626,6 +2907,18 @@ impl State {
   /// Appends an int to a list state built via `make_list()`. Fire-and-forget
   /// (no completion callback) -- fine for local plugin state, same as the
   /// existing scalar setters.
+  /// Appends `value` to this list.
+  pub fn push_state(&self, value: &State) {
+    unsafe {
+      (&*self.api.raw).state_push_state_with_callback.unwrap()(
+        self.state,
+        value.state,
+        None,
+        std::ptr::null_mut(),
+      );
+    }
+  }
+
   pub fn push_int(&self, value: i64) {
     unsafe {
       (&*self.api.raw).state_push_int_with_callback.unwrap()(
@@ -3053,7 +3346,7 @@ pub trait Node {
   /// Most nodes just return Self, which is freshly boxed by the framework.
   /// A node that needs to hand out a pointer it already shares elsewhere
   /// (e.g. with a background thread started during construction) can
-  /// instead return Arc<Self> or Rc<Self> -- Node dispatch (predrop etc.)
+  /// instead return Arc<Self> or Rc<Self> -- Node dispatch
   /// only ever happens on the main thread, so Rc is sound here even though
   /// it isn't Send.
   ///
@@ -3077,9 +3370,6 @@ pub trait Node {
   where
     Self: Sized,
   {
-  }
-  fn predrop(&self, token: PredropToken) {
-    token.ready()
   }
 }
 
@@ -3168,6 +3458,9 @@ pub trait NodeData {
   fn text(&self) -> Option<&dyn TextData> {
     None
   }
+  fn blob(&self) -> Option<&dyn BlobData> {
+    None
+  }
 }
 
 pub trait AnalogData {
@@ -3228,6 +3521,11 @@ pub trait AnalogData {
   /// output them yet.
   fn encoded_count(&self) -> u64 {
     0
+  }
+  /// The message's time on the Thalamus that first produced it, if it came
+  /// from another one (e.g. through a REMOTE node), else zero.
+  fn remote_time(&self) -> Duration {
+    Duration::ZERO
   }
   /// Whether this message's channels differ from the previous message's:
   /// their count, names, formats or sample intervals. Only the first message
@@ -3310,15 +3608,34 @@ pub trait ImageData {
   fn width(&self) -> u64;
   fn height(&self) -> u64;
   fn frame_interval(&self) -> Duration;
+  /// Like AnalogData::remote_time.
+  fn remote_time(&self) -> Duration {
+    Duration::ZERO
+  }
 }
 
 pub trait MocapData {
   fn segments(&self) -> &[ThalamusMocapSegment];
   fn pose_name(&self) -> &str;
+  /// Like AnalogData::remote_time.
+  fn remote_time(&self) -> Duration {
+    Duration::ZERO
+  }
 }
 
 pub trait TextData {
   fn text(&self) -> &str;
+  /// Like AnalogData::remote_time.
+  fn remote_time(&self) -> Duration {
+    Duration::ZERO
+  }
+}
+
+/// Arbitrary binary data from a node with the blob modality.
+pub trait BlobData {
+  fn body(&self) -> &[u8];
+  fn mime(&self) -> &str;
+  fn stream(&self) -> u32;
 }
 
 pub static OPERATION_ABORTED: OnceLock<i32> = OnceLock::<i32>::new();
@@ -3342,6 +3659,7 @@ pub fn setup(host_api: *const ThalamusAPIRaw) -> *mut ThalamusAPIRaw {
       .set((api.error_code_operation_aborted.unwrap())())
       .expect("Failed to initialize constant: OPERATION_ABORTED");
   }
+  let _ = GLOBAL_API.set(ThalamusAPIThreadSafe { raw: api_raw });
   let mut runtime = TOKIO_RUNTIME.lock().unwrap();
   assert!(runtime.is_none(), "Tokio runtime already initialized");
   *runtime = Some(
@@ -3357,6 +3675,22 @@ pub fn setup(host_api: *const ThalamusAPIRaw) -> *mut ThalamusAPIRaw {
 pub extern "C" fn thalamus_teardown() {
   println!("thalamus_teardown");
   *TOKIO_RUNTIME.lock().unwrap() = None;
+}
+
+/// Runs `expr` later on the main thread, with ThalamusAPI::global's
+/// post_to_main, e.g. `deferred!(state.set("Running", false))` from a state
+/// callback, where setting state directly would call the callback again
+/// before it returns. Like a `move` closure, it takes what `expr` uses by
+/// value (clone a State first to keep using it), and its value is dropped.
+/// Must be used on the main thread, so `expr` may use values that aren't
+/// Send.
+#[macro_export]
+macro_rules! deferred {
+  ($expr:expr) => {
+    $crate::api::ThalamusAPI::global().post_to_main(move |_| {
+      let _ = $expr;
+    })
+  };
 }
 
 #[macro_export]

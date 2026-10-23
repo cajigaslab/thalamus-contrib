@@ -14,6 +14,7 @@ from thalamus.pipeline.thalamus_window import Factory, UserData, UserDataType, g
 from .thorcam_widget import ThorcamWidget
 from .webcam_widget import WebcamWidget
 from .mic_widget import MicWidget
+from .storage3_widget import Storage3Widget
 
 print(__package__, type(__package__))
 print(type(importlib.resources.files(__package__)))
@@ -79,6 +80,9 @@ def widgets():
       # first channel forwards, -1, -2, ... from the last channel backwards
       UserData(UserDataType.SPINBOX, 'Audio Index', -1, []),
       UserData(UserDataType.CHECK_BOX, 'View', False, []),
+    ]),
+    'STORAGE3': Factory(lambda c, s: Storage3Widget(c, s), [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
     ]),
     'SLEEVE': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),

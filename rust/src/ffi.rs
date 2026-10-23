@@ -68,22 +68,8 @@ pub enum NodeHandle {
   LocalLocked(std::rc::Rc<std::cell::RefCell<dyn crate::api::Node>>),
 }
 
-impl NodeHandle {
-  /// Calls f with a reference to the underlying Node. Takes a closure
-  /// rather than returning &dyn Node because the locked variants can only
-  /// hand out a reference for the duration of a lock()/borrow() call.
-  fn with_node<R>(&self, f: impl FnOnce(&dyn crate::api::Node) -> R) -> R {
-    match self {
-      NodeHandle::Owned(b) => f(b.as_ref()),
-      NodeHandle::Shared(a) => f(a.as_ref()),
-      NodeHandle::Local(r) => f(r.as_ref()),
-      NodeHandle::SharedLocked(m) => f(&*m.lock().unwrap()),
-      NodeHandle::LocalLocked(c) => f(&*c.borrow()),
-    }
-  }
-}
-
 pub(crate) type ProcessHandler = Box<dyn FnMut(crate::api::Request, crate::api::Json)>;
+pub(crate) type PredropHandler = Box<dyn FnMut(PredropToken)>;
 
 pub(crate) struct PluginImpl {
   api: crate::api::ThalamusAPI,
@@ -93,6 +79,9 @@ pub(crate) struct PluginImpl {
   /// Installed via NodeToken::set_process. Mutably borrowed while the handler
   /// runs, so it can't be replaced during a process call.
   pub(crate) process: std::cell::RefCell<ProcessHandler>,
+  /// Installed via NodeToken::set_predrop; without one the node is ready to
+  /// drop at once. Mutably borrowed while it runs.
+  pub(crate) predrop: std::cell::RefCell<Option<PredropHandler>>,
   pub(crate) data: Option<&'static dyn NodeData>,
 }
 
@@ -260,6 +249,30 @@ pub extern "C" fn c_node_analog_format(raw_node: *mut ThalamusNode, channel: i32
   }
 }
 
+pub extern "C" fn c_node_analog_remote_time_ns(raw_node: *mut ThalamusNode) -> u64 {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let remote_time = deref_plugin_impl(c_node).data.and_then(|data| data.analog()).map(|analog| analog.remote_time());
+  remote_time.unwrap_or_default().as_nanos() as u64
+}
+
+pub extern "C" fn c_node_image_remote_time_ns(raw_node: *mut ThalamusNode) -> u64 {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let remote_time = deref_plugin_impl(c_node).data.and_then(|data| data.image()).map(|image| image.remote_time());
+  remote_time.unwrap_or_default().as_nanos() as u64
+}
+
+pub extern "C" fn c_node_mocap_remote_time_ns(raw_node: *mut ThalamusNode) -> u64 {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let remote_time = deref_plugin_impl(c_node).data.and_then(|data| data.mocap()).map(|mocap| mocap.remote_time());
+  remote_time.unwrap_or_default().as_nanos() as u64
+}
+
+pub extern "C" fn c_node_text_remote_time_ns(raw_node: *mut ThalamusNode) -> u64 {
+  let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
+  let remote_time = deref_plugin_impl(c_node).data.and_then(|data| data.text()).map(|text| text.remote_time());
+  remote_time.unwrap_or_default().as_nanos() as u64
+}
+
 pub extern "C" fn c_node_analog_channels_changed(raw_node: *mut ThalamusNode) -> c_char {
   let c_node = unsafe { &*(raw_node as *const ThalamusNode) };
   let changed = deref_plugin_impl(c_node)
@@ -313,11 +326,13 @@ pub extern "C" fn c_node_predrop(raw_node: *mut ThalamusNode) {
   let _impl = deref_plugin_impl(c_node);
 
   let token = PredropToken {
-    api: _impl.api.raw,
+    api: _impl.api.raw(),
     node: raw_node,
   };
-  if let Some(node) = &_impl.node {
-    node.with_node(|node| node.predrop(token));
+  let mut predrop = _impl.predrop.borrow_mut();
+  match predrop.as_mut() {
+    Some(predrop) => predrop(token),
+    None => token.ready(),
   }
 }
 
@@ -460,6 +475,7 @@ fn wrap_analog(c_node: &mut ThalamusNode) {
     (*c_node.analog).format = Some(c_node_analog_format);
     (*c_node.analog).encoded_count = Some(c_node_analog_encoded_count);
     (*c_node.analog).channels_changed = Some(c_node_analog_channels_changed);
+    (*c_node.analog).remote_time_ns = Some(c_node_analog_remote_time_ns);
   }
 }
 
@@ -473,6 +489,7 @@ fn wrap_image(c_node: &mut ThalamusNode) {
     (*c_node.image).height = Some(c_node_image_height);
     (*c_node.image).frame_interval_ns = Some(c_node_image_frame_interval_ns);
     (*c_node.image).has_image_data = Some(c_node_image_has_image_data);
+    (*c_node.image).remote_time_ns = Some(c_node_image_remote_time_ns);
   }
 }
 
@@ -482,6 +499,7 @@ fn wrap_mocap(c_node: &mut ThalamusNode) {
     (*c_node.mocap).segments = Some(c_node_mocap_segments);
     (*c_node.mocap).pose_name = Some(c_node_mocap_pose_name);
     (*c_node.mocap).has_motion_data = Some(c_node_mocap_has_motion_data);
+    (*c_node.mocap).remote_time_ns = Some(c_node_mocap_remote_time_ns);
   }
 }
 
@@ -490,6 +508,7 @@ fn wrap_text(c_node: &mut ThalamusNode) {
   unsafe {
     (*c_node.text).text = Some(c_node_text_text);
     (*c_node.text).has_text_data = Some(c_node_text_has_text_data);
+    (*c_node.text).remote_time_ns = Some(c_node_text_remote_time_ns);
   }
 }
 
@@ -527,7 +546,8 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
     blob: ptr::null_mut() as *mut ThalamusBlobNode,
   }));
   let c_node_ref = unsafe { &mut *c_node };
-  let api = ThalamusAPI { raw: api_raw };
+  // Node factories are called on the main thread.
+  let api = unsafe { ThalamusAPI::from_raw(api_raw) };
   let node_token = crate::api::NodeToken::new(c_node);
 
   // Allocated before T::new so NodeToken::set_process can reach it during
@@ -541,6 +561,7 @@ extern "C" fn create2_node_template<T: crate::api::Node + crate::api::NodeConsts
         handle.respond(&crate::api::Json::from_string(api, "null"));
       },
     )),
+    predrop: std::cell::RefCell::new(None),
     data: None,
   }));
   c_node_ref.plugin_impl = plugin_impl as *mut ::std::os::raw::c_void;
@@ -629,10 +650,32 @@ impl ThalamusNodeFactory {
 }
 
 /// The number of fields after `name` in this plugin's ThalamusAnalogNodes:
-/// `buffer`, `encoding`, `format`, `encoded_count` and `channels_changed`.
+/// `buffer`, `encoding`, `format`, `encoded_count`, `channels_changed` and
+/// `remote_time_ns`.
 #[unsafe(no_mangle)]
 pub extern "C" fn thalamus_get_analog_node_version() -> i32 {
-  5
+  6
+}
+
+/// The number of fields after `has_image_data` in this plugin's
+/// ThalamusImageNodes: `remote_time_ns`.
+#[unsafe(no_mangle)]
+pub extern "C" fn thalamus_get_image_node_version() -> i32 {
+  1
+}
+
+/// The number of fields after `has_text_data` in this plugin's
+/// ThalamusTextNodes: `remote_time_ns`.
+#[unsafe(no_mangle)]
+pub extern "C" fn thalamus_get_text_node_version() -> i32 {
+  1
+}
+
+/// The number of fields after `has_motion_data` in this plugin's
+/// ThalamusMocapNodes: `remote_time_ns`.
+#[unsafe(no_mangle)]
+pub extern "C" fn thalamus_get_mocap_node_version() -> i32 {
+  1
 }
 
 #[unsafe(no_mangle)]

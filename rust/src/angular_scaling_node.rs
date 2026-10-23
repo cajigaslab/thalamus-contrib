@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::api::{
   AnalogData, ImageData, MainThreadToken, MocapData, Node, NodeConsts, NodeData,
-  NodeSelector, NodeToken, OnDrop, PredropToken, State, StateAction, StateKey, StateValue,
+  NodeSelector, NodeToken, OnDrop, State, StateAction, StateKey, StateValue,
   THALAMUS_MODALITY_ANALOG, ThalamusAPI,
 };
 
@@ -312,7 +312,8 @@ struct Inner {
 }
 
 pub struct AngularScalingNode {
-  inner: Rc<RefCell<Inner>>,
+  // Keeps the node's state alive; the callbacks hold weak references.
+  _inner: Rc<RefCell<Inner>>,
 }
 
 fn resolve_source(inner: &Rc<RefCell<Inner>>) {
@@ -436,18 +437,21 @@ impl Node for AngularScalingNode {
       };
 
     inner.borrow_mut().state_connection = Some(state.connect(state_callback));
+
+    let predrop_ref = Rc::downgrade(&inner);
+    let node_token = inner.borrow().node_token.clone();
+    node_token.set_predrop(move |token| {
+      // Stop reacting to the source node before signaling ready, so no more
+      // samples arrive while this node is being torn down.
+      if let Some(inner) = predrop_ref.upgrade() {
+        let mut borrow = inner.borrow_mut();
+        borrow.source_connection = None;
+        borrow.data_connection = None;
+      }
+      token.ready();
+    });
     state.recap();
 
-    AngularScalingNode { inner }
-  }
-
-  fn predrop(&self, token: PredropToken) {
-    // Stop reacting to the source node before signaling ready, so no more
-    // samples arrive while this node is being torn down.
-    let mut borrow = self.inner.borrow_mut();
-    borrow.source_connection = None;
-    borrow.data_connection = None;
-    drop(borrow);
-    token.ready();
+    AngularScalingNode { _inner: inner }
   }
 }

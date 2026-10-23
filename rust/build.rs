@@ -90,9 +90,45 @@ fn compile_shaders() {
   }
 }
 
+/// Generates prost messages for Thalamus's thalamus.proto (vendored under
+/// proto from the Thalamus devel branch) into OUT_DIR/thalamus_grpc.rs.
+/// prost-build skips the gRPC service.
+fn generate_protobuf() {
+  let files = protox::compile(["proto/thalamus.proto"], ["proto"]).expect("failed to parse proto/thalamus.proto");
+  prost_build::Config::new().compile_fds(files).expect("failed to generate protobuf code");
+  println!("cargo:rerun-if-changed=proto/thalamus.proto");
+}
+
+/// This build's version (from __about__.py, as the wheel's), git commit and
+/// build type, for build_info.
+fn export_build_info() {
+  let about = std::fs::read_to_string("../src/thalamus/contrib/__about__.py").expect("failed to read __about__.py");
+  let version = about
+    .lines()
+    .find_map(|line| line.trim().strip_prefix("__version__")?.trim().strip_prefix('=')?.trim().strip_prefix('"')?.split('"').next())
+    .expect("no __version__ in __about__.py");
+  println!("cargo:rustc-env=THALAMUS_CONTRIB_VERSION={version}");
+  println!("cargo:rerun-if-changed=../src/thalamus/contrib/__about__.py");
+
+  // Like Thalamus's CMakeLists.txt.
+  let commit = std::process::Command::new("git")
+    .args(["log", "-1", "--format=%h"])
+    .output()
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    .unwrap_or_default();
+  println!("cargo:rustc-env=THALAMUS_CONTRIB_COMMIT={commit}");
+  // HEAD's reflog changes on every commit and checkout.
+  println!("cargo:rerun-if-changed=../.git/HEAD");
+  println!("cargo:rerun-if-changed=../.git/logs/HEAD");
+}
+
 fn main() {
+  export_build_info();
   generate_thalamus_api();
   compile_shaders();
+  generate_protobuf();
 
   let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 

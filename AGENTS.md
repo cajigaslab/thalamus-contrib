@@ -24,6 +24,8 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     owned copies of node data for using it after a callback returns.
   - `src/shaders/*.comp`: GLSL compute shaders, compiled by `build.rs`.
   - `include/thalamus/`: `plugin.h` and `modalities.h` vendored from Thalamus.
+  - `proto/thalamus.proto`: vendored from Thalamus's `proto/`; `build.rs`
+    generates prost messages from it (parsed with protox, so no `protoc`).
 - `src/thalamus/contrib/`: the Python package; `__init__.py` declares each
   node's UI (`Factory`, `UserData`), plus custom widgets (`*_widget.py`).
 - `cmake/`: native dependencies (FFmpeg, OpenCV, ...), driven by
@@ -92,7 +94,8 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 ## The C API and versioning
 
 - Keep `include/thalamus/plugin.h` and `modalities.h` identical to Thalamus's
-  `src/thalamus/` copies; copy them over whenever Thalamus changes them.
+  `src/thalamus/` copies, and `proto/thalamus.proto` to its
+  `proto/thalamus.proto`; copy them over whenever Thalamus changes them.
 - Structs in `plugin.h` are append-only ABIs and every appended field is
   versioned. Never read a field the other side may not have:
   - `ThalamusAPI` is copied with `copy_from_host`, which only copies the
@@ -105,12 +108,34 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     callback gets `Result<serde_json::Value, NodeRequestError>` exactly once,
     later on the main thread; on a Thalamus without the slot it gets
     `Err(Unsupported)`, also posted.
+  - `ThalamusAPI::subscribe_events`/`subscribe_log` (slots 144-146) call back
+    with every event (`EventMessage`: payload and time) or log message
+    (`LogMessage`: text, time and remote time) Thalamus receives, on any
+    thread; the host passes them as `ThalamusEvent`/`ThalamusLog`. They return
+    None on an older Thalamus. Dropping the returned `OnDrop` disconnects; the
+    host guarantees the callback isn't running once that returns.
+  - `ThalamusAPI`/`ThalamusAPIThreadSafe::thalamus_build_type`,
+    `thalamus_version` and `thalamus_commit` (slots 150-152, any thread;
+    the host sets a static `ThalamusCharSpan`) return what STORAGE2 records,
+    or None on an older Thalamus.
+  - `NodeData::blob()` reads the blob modality (`BlobData`) of host nodes. It
+    is gated on API version 143, since every Thalamus with node_request has
+    `ThalamusNode::blob`.
   - Fields of structs Thalamus provides (e.g. `ThalamusAnalogNode` of a C++
-    node) are gated on `ThalamusAPI::analog_node_version()`.
+    node) are gated on `ThalamusAPI::analog_node_version()`,
+    `image_node_version()`, `text_node_version()` and `mocap_node_version()`.
   - This plugin reports its own struct versions through the
-    `thalamus_get_node_factory_version`, `thalamus_get_analog_node_version`
-    (and, when blob nodes are supported, `thalamus_get_node_version`) exports
-    in `ffi.rs`; bump them when filling new fields.
+    `thalamus_get_node_factory_version`, `thalamus_get_analog_node_version`,
+    `thalamus_get_image_node_version`, `thalamus_get_text_node_version`,
+    `thalamus_get_mocap_node_version` (and,
+    when blob nodes are supported, `thalamus_get_node_version`) exports in
+    `ffi.rs`; bump them when filling new fields.
+  - `AnalogData`/`ImageData`/`TextData`/`MocapData::remote_time()` (default
+    zero) is the message's time on the Thalamus that first produced it, if it
+    came from another one (analog node version 6, image, text and mocap node
+    version 1).
+    Wrappers that forward another node's data (`node_copy`, the media
+    converter's stats) forward it too; converted frames don't carry it.
 - Enum values from Thalamus may be newer than this build: match them with a
   fallback arm instead of assuming they're known.
 
@@ -123,10 +148,25 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   that aren't thread safe. Move them to other threads in `MainThreadOnly`
   (`new(value, api, token)`); one dropped off the main thread without being
   taken posts its value to the main thread to be dropped there.
+- `ThalamusAPI` (not `Send`, only made on the main thread) is proof of being
+  on the main thread, so its `post_to_main` takes closures that aren't
+  `Send`: posting from the main thread can capture a `State` directly. Use
+  `MainThreadOnly` only when the value really goes through another thread
+  (and `ThalamusAPIThreadSafe::post_to_main` from there).
+- `deferred!(expr)` posts `expr` to the main thread with
+  `ThalamusAPI::global()` (the API table `setup()` stores; panics off the main
+  thread), e.g. `deferred!(state.set("Running", false))` to change state
+  from a state callback without re-entering it. It moves what `expr` uses,
+  like a `move` closure.
 - Node objects live on the main thread (`MainThreadToken`, `MainThreadOnly`).
   Data produced on other threads goes out through an `OffMainSignaler`
   (`ready`), whose `predrop`/`block` must be called before the node goes
   away.
+- Work that must happen before a node is destroyed goes in a handler
+  installed with `NodeToken::set_predrop` in `new()`, which must eventually
+  call `PredropToken::ready` (e.g. `OffMainSignaler::predrop(token)` or once a
+  stop completes). Without a handler the node is ready to drop at once. The
+  handler should hold a `Weak` to the node's state, not an `Rc`/`Arc`.
 - State callbacks are synchronous and re-entrant: `state.set(...)` inside a
   callback calls the callback again. Borrow the node inside each match arm
   rather than for the whole callback, and release the borrow before calling
@@ -298,6 +338,40 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 - Encoded image streams carry their nominal frame rate (the encoder's time
   base, from the source's frame interval), which webcams don't keep; use
   message times, not the stream's rate, for timing.
+
+## STORAGE3
+
+- `storage3_node.rs` records like Thalamus's STORAGE2 (events, log, and the
+  Sources' analog, image, motion, text and blob data, plus its metrics as
+  analog data), without file copying, Simple Copy or compression. Records
+  are the prost-generated `storage_record::proto` messages
+  (`Image.Format` values differ from `ThalamusImageFormat`'s), encoded and
+  framed with an 8-byte big-endian length in `storage_record.rs`.
+- "Outputs" is a list of `{"URL": ..., "Main": bool}`. The node keeps
+  exactly one Main (`normalize_main`, called from the state callback on any
+  change in the list; its sets re-enter the callback, which converges): one just set Main, else the existing one, else the first. Plain paths and file:// URLs are
+  files; http(s):// URLs get one streamed (chunked) POST lasting the whole
+  recording, as Thoth's POST /files/PATH expects (no checksum is posted).
+  If the response comes before the body ends (e.g. an error), the body
+  stream is cancelled so the output stops at once. The root config goes to
+  the output's name plus `.json`, as with STORAGE2.
+- Names render like STORAGE2's: `{{rec}}`, strftime fields (left as they
+  are if strftime can't parse the template), then `.YYYYMMDD.N`, with N the
+  first recording number the Main output doesn't have yet (checked with HEAD
+  for HTTP), used for every output.
+- The metadata record gets the Metadata table, then Thalamus's "Build Type",
+  "Version" and "Commit" (STORAGE2's keys; left out on a Thalamus without
+  API slots 150-152) and this plugin's "Contrib Build Type", "Contrib
+  Version" and "Contrib Commit" (`build_info.rs`: version from
+  `__about__.py`, commit from git at build time in `build.rs`).
+- The writer thread sorts each sweep's records by time and sends one shared
+  buffer (`bytes::Bytes`) to each output over a tokio unbounded channel:
+  files are written by their own thread (`blocking_recv`), HTTP outputs by a
+  reqwest task on the plugin's tokio runtime, whose body streams from the
+  channel. A failed output logs and drops its receiver; the writer then
+  stops sending to it, so the others aren't affected. The writer isn't a
+  runtime thread, so it uses `Handle::block_on` for the HEAD probes and to
+  wait for HTTP tasks when recording stops.
 
 ## Image viewer and imgui windows
 

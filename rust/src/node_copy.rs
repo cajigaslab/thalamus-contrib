@@ -35,6 +35,7 @@ pub struct AnalogDataCopy {
   encoding: AnalogEncoding,
   encoded_count: u64,
   channels_changed: bool,
+  remote_time: Duration,
   is_short_data: bool,
   is_int_data: bool,
   is_ulong_data: bool,
@@ -65,6 +66,7 @@ impl AnalogDataCopy {
       encoding: original.encoding(),
       encoded_count: original.encoded_count(),
       channels_changed: original.channels_changed(),
+      remote_time: original.remote_time(),
       is_short_data: original.is_short_data(),
       is_int_data: original.is_int_data(),
       is_ulong_data: original.is_ulong_data(),
@@ -160,6 +162,10 @@ impl AnalogData for AnalogDataCopy {
     self.channels_changed
   }
 
+  fn remote_time(&self) -> Duration {
+    self.remote_time
+  }
+
   fn scale(&self, channel: i32) -> f64 {
     self.channels[channel as usize].scale
   }
@@ -176,6 +182,7 @@ pub struct ImageDataCopy {
   width: u64,
   height: u64,
   frame_interval: Duration,
+  remote_time: Duration,
 }
 
 impl ImageDataCopy {
@@ -186,6 +193,7 @@ impl ImageDataCopy {
       width: original.width(),
       height: original.height(),
       frame_interval: original.frame_interval(),
+      remote_time: original.remote_time(),
     }
   }
 }
@@ -213,6 +221,10 @@ impl ImageData for ImageDataCopy {
 
   fn frame_interval(&self) -> Duration {
     self.frame_interval
+  }
+
+  fn remote_time(&self) -> Duration {
+    self.remote_time
   }
 }
 
