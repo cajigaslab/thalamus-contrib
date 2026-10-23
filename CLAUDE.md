@@ -16,6 +16,14 @@ Most users should only contribute rust code in rust/src/*_node.rs file which pro
 ImageNode, and MocapNode.  These nodes need to be declared in the export_nodes! macro in lib.rs in order to be loaded
 by Thalamus.  The *_node.rs files should include no unsafe code.
 
+C#
+==
+
+A second shared library, thalamus_contrib_cs, holds nodes written in C#.  It's built with .NET NativeAOT by the same
+hatch hook (skipped with a warning when the .NET SDK isn't installed) and loaded by Thalamus alongside the Rust
+library.  Nodes go in csharp/ThalamusContribCs/*Node.cs and must be listed in Plugin.cs.  That project doesn't allow
+unsafe code; the C ABI lives in csharp/Thalamus.Plugin.
+
 Thalamus Versions
 =================
 

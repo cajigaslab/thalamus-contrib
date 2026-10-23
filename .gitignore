@@ -4,3 +4,5 @@ __pycache__
 *.pdb
 *.dylib
 /.cargo/
+csharp/*/bin/
+csharp/*/obj/

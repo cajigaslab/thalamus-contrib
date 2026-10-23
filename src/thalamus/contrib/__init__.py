@@ -91,13 +91,17 @@ def widgets():
   }
 
 def library():
+  # The Rust nodes, then the C# nodes (csharp/), which are only built when
+  # hatch_build.py finds the .NET SDK.
+  files = importlib.resources.files(__package__)
   if platform.system() == 'Windows':
-    return importlib.resources.files(__package__) / 'thalamus_contrib.dll'
+    rust, csharp = files / 'thalamus_contrib.dll', files / 'thalamus_contrib_cs.dll'
     #return pathlib.Path('C:/thalamus-contrib/rust/target/debug/thalamus_contrib.dll')
   elif platform.system() == 'Darwin':
-    return importlib.resources.files(__package__) / 'libthalamus_contrib.dylib'
+    rust, csharp = files / 'libthalamus_contrib.dylib', files / 'thalamus_contrib_cs.dylib'
   else:
-    return importlib.resources.files(__package__) / 'libthalamus_contrib.so'
+    rust, csharp = files / 'libthalamus_contrib.so', files / 'thalamus_contrib_cs.so'
+  return [rust] + ([csharp] if csharp.is_file() else [])
 
 def tasks():
   return []

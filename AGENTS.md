@@ -26,6 +26,7 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   - `include/thalamus/`: `plugin.h` and `modalities.h` vendored from Thalamus.
   - `proto/thalamus.proto`: vendored from Thalamus's `proto/`; `build.rs`
     generates prost messages from it (parsed with protox, so no `protoc`).
+- `csharp/`: a second plugin library for nodes written in C# (see "C# nodes").
 - `src/thalamus/contrib/`: the Python package; `__init__.py` declares each
   node's UI (`Factory`, `UserData`), plus custom widgets (`*_widget.py`).
 - `cmake/`: native dependencies (FFmpeg, OpenCV, ...), driven by
@@ -411,6 +412,64 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   compute support; SPIR-V must stay valid for Vulkan 1.0 +
   `SPV_KHR_storage_buffer_storage_class`. Avoid arrays in push constant
   blocks (naga lays them out with a 16-byte stride).
+
+## C# nodes
+
+- `csharp/` builds a second plugin library, `thalamus_contrib_cs.so`/`.dll`/
+  `.dylib`, with .NET 10 NativeAOT: the .NET runtime is compiled into it, so
+  users need no .NET installed. `hatch_build.py` (`build_csharp`) runs `dotnet
+  publish` after cargo and copies the library and the native drivers its
+  packages P/Invoke (Linux `libSiUSBXp.so`; Windows `SiUSBXp_64.dll`,
+  `CentroUSB_64.dll`) next to the Rust library. Without the .NET SDK it's
+  skipped with a warning; `THALAMUS_CSHARP=ON` (set in CI) makes that an
+  error. `DOTNET` overrides the `dotnet` on `PATH`.
+  `__init__.py`'s `library()` returns both libraries (Thalamus's `--ext`
+  takes a list) and leaves the C# one out when it wasn't built.
+- `csharp/Thalamus.Plugin`: the only project allowing unsafe code.
+  - `Native.cs`: the `plugin.h` structs and the ThalamusAPI slot table,
+    copied like Rust's `copy_from_host` (slots past the host's `version` read
+    as zero; check `Api.Has` before using a slot newer than 143).
+  - `Host.cs`: factories, node callbacks and the `thalamus_get_*` exports
+    (factory version 1, analog node version 6, text node version 1).
+  - `State.cs`, `Node.cs`, `MainThread.cs`, `NativeLibraries.cs`: the safe
+    API.
+- `csharp/ThalamusContribCs`: the nodes, published as `thalamus_contrib_cs`
+  (unsafe code not allowed). `Plugin.cs` lists the node types, like
+  `export_nodes!`, and exports `thalamus_get_node_factories`; Thalamus.Plugin's
+  exports come along through `UnmanagedEntryPointsAssembly`.
+- Writing nodes: subclass `Node`, implement `IAnalogNode`/`ITextNode`, and
+  call `Ready()` after each message; the data must stay unchanged until it
+  returns (Host copies samples and strings into native buffers that stay
+  valid until the next call). Override `Process` (async; an exception
+  responds `{"error": message}`), `Predrop` (awaited before destruction) and
+  `Dispose` (disconnect state callbacks there).
+- Threading: node callbacks run on Thalamus's main thread, which is installed
+  as the `SynchronizationContext`, so `await` resumes there (like the
+  sidecar's `AsyncContext`). Get back to it from other threads with
+  `MainThread.Post`/`MainThread.Run`. `State` and `Ready` throw off the main
+  thread. A `State` dropped without use is released on the main thread by
+  its finalizer.
+- Exceptions must never cross into Thalamus (that aborts it): every callback
+  catches and reports them with `ThalamusHost.Report` (stderr, plus
+  Thalamus's log on hosts with slot 153).
+- NativeAOT: avoid reflection-based APIs (System.Text.Json's reflection
+  serializer, `JsonArray.Add<T>`; use `JsonNode` and `JsonValue.Create`).
+  Third-party assemblies that aren't trim annotated are kept whole with
+  `TrimmerRootAssembly`; check `dotnet publish` for new IL2xxx/IL3xxx
+  warnings from our code. `InvariantGlobalization` avoids an ICU dependency.
+- Packages that P/Invoke native libraries by file name need
+  `NativeLibraries.ResolveFromPluginDirectory(assembly)`: the OS loader
+  searches Thalamus's directory, not the plugin's.
+- DELSYS (`DelsysNode.cs`) was moved from Thalamus's dotnet sidecar
+  (`dotnet/dotnet/DelsysNode.cs`) with the same state keys and requests
+  (`connect`, `scan`, `pair`, `get_sample_modes`), so Thalamus's
+  `DelsysWidget` drives it. Plugin factories replace Thalamus's built-in
+  ones of the same name, so it takes over from the C++ DELSYS proxy. DelsysAPI
+  is a process-wide singleton (`PipelineController.Instance`); one DELSYS
+  node at a time. Its packages are vendored in `csharp/packages`.
+- Testing without hardware: the end-to-end recipe below works; with dummy
+  Key/License files, `connect` reaches DelsysAPI's licensing and reports
+  "Delsys Error: Error, product not licensed." on the node's text stream.
 
 ## Python widgets
 

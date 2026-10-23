@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The C# nodes, published with NativeAOT as a second plugin library
+       (thalamus_contrib_cs.so/.dll/.dylib) that Thalamus loads like the Rust
+       one. Unsafe code isn't allowed here; it belongs in Thalamus.Plugin. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>thalamus_contrib_cs</AssemblyName>
+    <RootNamespace>Thalamus.Contrib</RootNamespace>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <!-- No ICU dependency on Linux. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Thalamus.Plugin\Thalamus.Plugin.csproj" />
+    <!-- Export Thalamus.Plugin's thalamus_get_*_version and thalamus_teardown too. -->
+    <UnmanagedEntryPointsAssembly Include="Thalamus.Plugin" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DelsysAPI" Version="2.8.1.1051-Main" />
+    <PackageReference Include="Delsys.Drivers" Version="1.2.2.110-main" />
+    <PackageReference Include="Delsys.Signals" Version="2.0.0.17-main" />
+    <!-- Delsys's assemblies aren't trim annotated; keep all of them rather
+         than let the trimmer drop what they reach by reflection. -->
+    <TrimmerRootAssembly Include="DelsysAPI" />
+    <TrimmerRootAssembly Include="Signals" />
+    <TrimmerRootAssembly Include="CoreCompat.Portable.Licensing" />
+    <TrimmerRootAssembly Include="Newtonsoft.Json" />
+  </ItemGroup>
+
+</Project>

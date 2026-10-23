@@ -17,6 +17,10 @@ jobs:
       run: git config --global user.name "Github Actions"
     - name: Set Git email 
       run: git config --global user.email "no@email.com"
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -35,6 +39,9 @@ jobs:
         git tag -a "v$VERSION" -m "[skip ci] v$VERSION"
         echo version=$VERSION >> "$GITHUB_OUTPUT"
     - run: hatch build
+      env:
+        # Fail rather than ship a wheel without the C# nodes.
+        THALAMUS_CSHARP: 'ON'
     - name: Archive Distribution
       uses: actions/upload-artifact@v4
       with:
@@ -47,6 +54,10 @@ jobs:
     runs-on: macos-latest
     steps:
     - uses: actions/checkout@v4
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -54,6 +65,9 @@ jobs:
     - run: pip install hatch
     - run: hatch version patch
     - run: hatch build
+      env:
+        # Fail rather than ship a wheel without the C# nodes.
+        THALAMUS_CSHARP: 'ON'
     - name: Archive Distribution
       uses: actions/upload-artifact@v4
       with:
@@ -77,6 +91,10 @@ jobs:
         Get-Command cmake
         Get-Command nasm
         Get-Command pkg-config
+    - name: Set up .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '10.0.x'
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -84,6 +102,9 @@ jobs:
     - run: pip install hatch ninja
     - run: hatch version patch
     - run: hatch build
+      env:
+        # Fail rather than ship a wheel without the C# nodes.
+        THALAMUS_CSHARP: 'ON'
     - name: Archive Distribution
       uses: actions/upload-artifact@v4
       with:

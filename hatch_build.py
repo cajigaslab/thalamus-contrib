@@ -149,3 +149,40 @@ class CustomBuildHook(BuildHookInterface):
     if system == 'Windows':
       shutil.copy2(lib_src.with_suffix('.pdb'), lib_dst.with_suffix('.pdb'))
 
+    self.build_csharp(build_path, debug)
+
+  def build_csharp(self, build_path, debug):
+    """
+    Publishes csharp/ThalamusContribCs with NativeAOT as a second plugin
+    library, thalamus_contrib_cs.<so|dll|dylib>, next to the Rust one, plus
+    the native drivers its packages P/Invoke. Skipped, with a warning, when
+    the .NET SDK isn't installed; THALAMUS_CSHARP=ON makes that an error.
+    """
+    dotnet = os.environ.get('DOTNET') or shutil.which('dotnet')
+    if dotnet is None:
+      if os.environ.get('THALAMUS_CSHARP', 'OFF') == 'ON':
+        raise RuntimeError('THALAMUS_CSHARP=ON but the .NET SDK (dotnet) was not found')
+      print('WARNING: dotnet not found, skipping the C# nodes (csharp/)', file=sys.stderr)
+      return
+
+    system = platform.system()
+    machine = platform.machine().lower()
+    arch = 'arm64' if machine in ('arm64', 'aarch64') else 'x64'
+    if system == 'Windows':
+      rid, lib_name, drivers = f'win-{arch}', 'thalamus_contrib_cs.dll', ['SiUSBXp_64.dll', 'CentroUSB_64.dll']
+    elif system == 'Darwin':
+      rid, lib_name, drivers = f'osx-{arch}', 'thalamus_contrib_cs.dylib', []
+    else:
+      rid, lib_name, drivers = f'linux-{arch}', 'thalamus_contrib_cs.so', ['libSiUSBXp.so']
+
+    publish_dir = build_path / 'csharp'
+    project = pathlib.Path(self.root) / 'csharp' / 'ThalamusContribCs' / 'ThalamusContribCs.csproj'
+    dotnet_command = [dotnet, 'publish', str(project), '-c', 'Debug' if debug else 'Release', '-r', rid, '-o', str(publish_dir)]
+    print('dotnet_command', dotnet_command)
+    env = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_NOLOGO='1')
+    subprocess.run(dotnet_command, check=True, env=env)
+
+    package_dir = pathlib.Path(self.root) / 'src' / 'thalamus' / 'contrib'
+    for name in [lib_name] + drivers:
+      shutil.copy2(publish_dir / name, package_dir / name)
+

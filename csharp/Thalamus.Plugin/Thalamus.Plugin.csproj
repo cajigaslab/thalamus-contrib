@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The C ABI and safe API that C# nodes build on. It's the only project
+       allowed unsafe code; nodes live in ThalamusContribCs. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <IsAotCompatible>true</IsAotCompatible>
+    <RootNamespace>Thalamus.Plugin</RootNamespace>
+  </PropertyGroup>
+
+</Project>
