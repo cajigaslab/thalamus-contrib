@@ -1,4 +1,3 @@
-use core::slice;
 use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -316,7 +315,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
         self.node.node,
         channel,
       );
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -329,7 +328,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       let analog = (*self.node.node).analog;
       let data = (*analog).short_data.unwrap();
       data(&mut span as *mut ThalamusShortSpan, self.node.node, channel);
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -342,7 +341,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       let analog = (*self.node.node).analog;
       let data = (*analog).int_data.unwrap();
       data(&mut span as *mut ThalamusIntSpan, self.node.node, channel);
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -355,7 +354,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       let analog = (*self.node.node).analog;
       let data = (*analog).ulong_data.unwrap();
       data(&mut span as *mut ThalamusULongSpan, self.node.node, channel);
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -385,7 +384,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       if span.data.is_null() {
         return &[];
       }
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -490,7 +489,7 @@ impl<'a> AnalogData for ExtNodeData<'a> {
       name_func(&mut span as *mut ThalamusCharSpan, self.node.node, channel);
       // The returned &str borrows from the node, so the name must be owned by it.
       debug_assert!(span.owns_data == 0);
-      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      let slice = host_slice(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap()
     }
   }
@@ -552,7 +551,7 @@ impl<'a> ImageData for ExtNodeData<'a> {
       let image = (*self.node.node).image;
       let plane = (*image).plane.unwrap();
       plane(&mut span as *mut ThalamusByteSpan, self.node.node, channel);
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -633,7 +632,7 @@ impl<'a> MocapData for ExtNodeData<'a> {
       let mocap = (*self.node.node).mocap;
       let segments = (*mocap).segments.unwrap();
       segments(&mut span as *mut ThalamusMocapSegmentSpan, self.node.node);
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -647,7 +646,7 @@ impl<'a> MocapData for ExtNodeData<'a> {
       let mocap = (*self.node.node).mocap;
       let pose_name = (*mocap).pose_name.unwrap();
       pose_name(&mut span as *mut ThalamusCharSpan, self.node.node);
-      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      let slice = host_slice(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap()
     }
   }
@@ -674,7 +673,7 @@ impl<'a> TextData for ExtNodeData<'a> {
       let text_node = (*self.node.node).text;
       let text_func = (*text_node).text.unwrap();
       text_func(&mut span as *mut ThalamusCharSpan, self.node.node);
-      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      let slice = host_slice(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap()
     }
   }
@@ -689,7 +688,7 @@ impl<'a> BlobData for ExtNodeData<'a> {
       if span.data.is_null() {
         return &[];
       }
-      std::slice::from_raw_parts(span.data, span.size as usize)
+      host_slice(span.data, span.size as usize)
     }
   }
 
@@ -705,7 +704,7 @@ impl<'a> BlobData for ExtNodeData<'a> {
       if span.data.is_null() {
         return "";
       }
-      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      let slice = host_slice(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap_or("")
     }
   }
@@ -746,7 +745,7 @@ unsafe extern "C" fn event_callback<T: FnMut(&EventMessage) + Send>(
   let payload = if event.payload.data.is_null() {
     &[][..]
   } else {
-    unsafe { std::slice::from_raw_parts(event.payload.data, event.payload.size as usize) }
+    unsafe { host_slice(event.payload.data, event.payload.size as usize) }
   };
   (args.callback)(&EventMessage { payload, time: Duration::from_nanos(event.time_ns) });
 }
@@ -760,7 +759,7 @@ unsafe extern "C" fn log_callback<T: FnMut(&LogMessage) + Send>(
   let text = if log.text.data.is_null() {
     ""
   } else {
-    let bytes = unsafe { std::slice::from_raw_parts(log.text.data as *const u8, log.text.size as usize) };
+    let bytes = unsafe { host_slice(log.text.data as *const u8, log.text.size as usize) };
     // Protobuf strings are UTF-8, but a C++ sender isn't checked.
     std::str::from_utf8(bytes).unwrap_or("")
   };
@@ -1653,7 +1652,7 @@ impl ThalamusAPI {
       if span.data.is_null() || span.size == 0 {
         return String::new();
       }
-      let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+      let slice = host_slice(span.data as *const u8, span.size as usize);
       std::str::from_utf8(slice).unwrap_or("").to_string()
     }
   }
@@ -1698,7 +1697,7 @@ impl ThalamusAPI {
       let result = if span.data.is_null() || span.size == 0 {
         String::new()
       } else {
-        let slice = std::slice::from_raw_parts(span.data as *const u8, span.size as usize);
+        let slice = host_slice(span.data as *const u8, span.size as usize);
         std::str::from_utf8(slice).unwrap_or("").to_string()
       };
       if span.owns_data != 0 {
@@ -1941,7 +1940,7 @@ impl Json {
       };
       ((&*self.api.raw).json_to_string.unwrap())(&mut span as *mut ThalamusCharSpan, self.handle);
 
-      let slice = slice::from_raw_parts(span.data as *mut u8, span.size as usize);
+      let slice = host_slice(span.data as *mut u8, span.size as usize);
       let text = str::from_utf8(slice).unwrap();
       let result = text.to_string();
 
@@ -2161,7 +2160,7 @@ impl StreamBuf {
         owns_data: 0,
       };
       (api.streambuf_to_span.unwrap())(&mut span as *mut ThalamusCharSpan, self.buffer);
-      let slice = slice::from_raw_parts(span.data as *mut u8, span.size as usize);
+      let slice = host_slice(span.data as *mut u8, span.size as usize);
       let text = str::from_utf8(slice).unwrap();
       let result = text.to_string();
       (api.charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
@@ -2427,6 +2426,20 @@ pub fn run_task<F: Future<Output = ()> + 'static>(future: F) -> TaskScope {
   TaskScope { task: task.clone() }
 }
 
+/// A slice over `size` elements Thalamus handed over. An empty span may
+/// have a null pointer (e.g. an empty std::span's data()), which
+/// slice::from_raw_parts doesn't allow even for length 0.
+///
+/// # Safety
+/// Unless null, `data` must be valid for `size` elements for 'a.
+unsafe fn host_slice<'a, T>(data: *const T, size: usize) -> &'a [T] {
+  if data.is_null() || size == 0 {
+    &[]
+  } else {
+    unsafe { std::slice::from_raw_parts(data, size) }
+  }
+}
+
 /// Calls an API function that sets a span to static text, or returns None
 /// if Thalamus doesn't have it (copy_from_host leaves it None).
 fn static_text(get: Option<unsafe extern "C" fn(*mut ThalamusCharSpan)>) -> Option<&'static str> {
@@ -2437,7 +2450,7 @@ fn static_text(get: Option<unsafe extern "C" fn(*mut ThalamusCharSpan)>) -> Opti
     if span.data.is_null() {
       return Some("");
     }
-    std::str::from_utf8(std::slice::from_raw_parts(span.data as *const u8, span.size as usize)).ok()
+    std::str::from_utf8(host_slice(span.data as *const u8, span.size as usize)).ok()
   }
 }
 
@@ -2576,7 +2589,7 @@ fn wrap_state(api: ThalamusAPI, arg: *mut ThalamusState) -> StateValue {
         owns_data: 0,
       };
       ((&*raw).state_get_string.unwrap())(&mut span, arg);
-      let text = std::str::from_utf8(std::slice::from_raw_parts(
+      let text = std::str::from_utf8(host_slice(
         span.data as *const u8,
         span.size as usize,
       ))
@@ -2738,7 +2751,7 @@ impl ErrorCode {
         };
         ((&(*api.raw)).error_code_message.unwrap())(&mut span as *mut ThalamusCharSpan, error);
 
-        let slice = slice::from_raw_parts(span.data as *mut u8, span.size as usize);
+        let slice = host_slice(span.data as *mut u8, span.size as usize);
         let text = str::from_utf8(slice).unwrap().to_string();
         ((&(*api.raw)).charspan_release.unwrap())(&mut span as *mut ThalamusCharSpan);
         text

@@ -24,6 +24,9 @@ class ThorcamComboBox(QComboBox):
     current_camera = self.config.get('Camera', None)
 
     response = await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=name, type=self.config['type']), json="\"get_cameras\""))
+    # The widget was closed while the request was in flight
+    if isdeleted(self):
+      return
     cameras = json.loads(response.json)
     LOGGER.debug('asyncShowPopup %s', cameras)
     self.clear()

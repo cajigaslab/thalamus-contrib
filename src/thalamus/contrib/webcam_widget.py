@@ -51,8 +51,9 @@ class FormatComboBox(QComboBox):
       request = json.dumps({'type': 'get_formats', 'index': index})
       response = await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=self.config['name'], type=self.config['type']), json=request))
       formats = json.loads(response.json) or []
-    # The camera changed again while this request was in flight
-    if request_id != self.request_id:
+    # The widget was closed, or the camera changed again, while this request
+    # was in flight
+    if isdeleted(self) or request_id != self.request_id:
       return
 
     self.blockSignals(True)
@@ -99,6 +100,9 @@ class WebcamComboBox(QComboBox):
 
     response = await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=name, type=self.config['type']), json="\"get_cameras\""))
     print('get_cameras', response)
+    # The widget was closed while the request was in flight
+    if isdeleted(self):
+      return
     cameras = json.loads(response.json)
     LOGGER.debug('asyncShowPopup %s', cameras)
     self.clear()

@@ -38,8 +38,9 @@ class FormatComboBox(QComboBox):
     request = json.dumps({'type': 'get_formats', 'id': device_id})
     response = await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=self.config['name'], type=self.config['type']), json=request))
     formats = json.loads(response.json) or []
-    # The device changed again while this request was in flight
-    if request_id != self.request_id:
+    # The widget was closed, or the device changed again, while this request
+    # was in flight
+    if isdeleted(self) or request_id != self.request_id:
       return
 
     self.blockSignals(True)
@@ -83,6 +84,9 @@ class DeviceComboBox(QComboBox):
       return
 
     response = await self.stub.node_request(thalamus_pb2.NodeRequest(selector=thalamus_pb2.NodeSelector(name=self.config['name'], type=self.config['type']), json='"get_devices"'))
+    # The widget was closed while the request was in flight
+    if isdeleted(self):
+      return
     devices = json.loads(response.json) or []
     current_device = self.config.get('Device', DEFAULT_DEVICE)
     self.blockSignals(True)
