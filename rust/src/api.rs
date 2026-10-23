@@ -1106,6 +1106,19 @@ impl ThalamusAPIThreadSafe {
     unsafe { static_text((*self.raw).commit) }
   }
 
+  /// Sends `text` to Thalamus's log, like the log gRPC call: subscribe_log
+  /// callbacks, the log view and recordings get it. Returns false if
+  /// Thalamus predates plugin logging.
+  pub fn log(&self, text: &str) -> bool {
+    let Some(log) = (unsafe { (*self.raw).log }) else {
+      return false;
+    };
+    let span = ThalamusCharSpan { data: text.as_ptr() as *const std::os::raw::c_char, size: text.len() as u64, owns_data: 0 };
+    // Thalamus copies the text before returning.
+    unsafe { log(&span) };
+    true
+  }
+
   /// Begins a trace event named `name` (category "plugin") on this thread's
   /// track in Thalamus's Perfetto trace; it ends when the returned guard is
   /// dropped. Begin and end must happen on the same thread, so the guard isn't
@@ -1280,6 +1293,11 @@ impl ThalamusAPI {
   /// See ThalamusAPIThreadSafe::thalamus_commit.
   pub fn thalamus_commit(&self) -> Option<&'static str> {
     self.thread_safe().thalamus_commit()
+  }
+
+  /// See ThalamusAPIThreadSafe::log.
+  pub fn log(&self, text: &str) -> bool {
+    self.thread_safe().log(text)
   }
 
   pub fn thread_safe(&self) -> ThalamusAPIThreadSafe {

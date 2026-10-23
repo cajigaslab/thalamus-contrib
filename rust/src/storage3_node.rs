@@ -168,16 +168,30 @@ fn error_chain(error: &dyn std::error::Error) -> String {
   message
 }
 
+/// Prints `message` and sends it to Thalamus's log, so it's in the log view
+/// and recordings too (on a Thalamus with plugin logging).
+fn report(api: ThalamusAPIThreadSafe, message: &str) {
+  let text = format!("STORAGE3: {message}");
+  println!("{text}");
+  api.log(&text);
+}
+
 /// Whether recording `name` of `output` already exists. A server that
 /// can't be asked counts as not having it: the output will fail on its own.
 /// Called from the writer thread, which isn't a runtime thread.
-fn output_exists(output: &Output, name: &str, client: &reqwest::Client, runtime: &Handle) -> bool {
+fn output_exists(
+  api: ThalamusAPIThreadSafe,
+  output: &Output,
+  name: &str,
+  client: &reqwest::Client,
+  runtime: &Handle,
+) -> bool {
   match output {
     Output::File(_) => Path::new(name).exists(),
     Output::Http(_) => match runtime.block_on(client.head(name).send()) {
       Ok(response) => response.status().is_success(),
       Err(error) => {
-        println!("STORAGE3: couldn't check whether {name} exists: {}", error_chain(&error));
+        report(api, &format!("couldn't check whether {name} exists: {}", error_chain(&error)));
         false
       }
     },
@@ -357,27 +371,28 @@ struct OutputWorker {
 
 /// Logs how output `name` finished. Returns its hash, if it succeeded and
 /// computed one.
-fn log_result(name: &str, result: Result<Option<u32>, String>) -> Option<u32> {
+fn log_result(api: ThalamusAPIThreadSafe, name: &str, result: Result<Option<u32>, String>) -> Option<u32> {
   match result {
     Ok(adler) => {
-      println!("STORAGE3: finished {name}");
+      report(api, &format!("finished {name}"));
       adler
     }
     Err(error) => {
-      println!("STORAGE3: output failed, stopping it: {error}");
+      report(api, &format!("output failed, stopping it: {error}"));
       None
     }
   }
 }
 
-fn log_hash(name: &str, hash: &HashTarget, result: Result<(), String>) {
+fn log_hash(api: ThalamusAPIThreadSafe, name: &str, hash: &HashTarget, result: Result<(), String>) {
   match result {
-    Ok(()) => println!("STORAGE3: stored the hash of {name} at {}", hash.name),
-    Err(error) => println!("STORAGE3: couldn't store the hash of {name}: {error}"),
+    Ok(()) => report(api, &format!("stored the hash of {name} at {}", hash.name)),
+    Err(error) => report(api, &format!("couldn't store the hash of {name}: {error}")),
   }
 }
 
 fn start_output(
+  api: ThalamusAPIThreadSafe,
   output: &Output,
   name: String,
   hash: Option<HashTarget>,
@@ -392,17 +407,17 @@ fn start_output(
     Output::File(_) => {
       let runtime = runtime.clone();
       Worker::Thread(thread::Builder::new().name("STORAGE3 output".to_string()).spawn(move || {
-        let adler = log_result(&worker_name, write_file(&worker_name, &config, receiver, hash.is_some()));
+        let adler = log_result(api, &worker_name, write_file(&worker_name, &config, receiver, hash.is_some()));
         if let (Some(hash), Some(adler)) = (hash, adler) {
           // Not a runtime thread, so it can block on one.
-          log_hash(&worker_name, &hash, runtime.block_on(store_hash(&client, &hash, adler)));
+          log_hash(api, &worker_name, &hash, runtime.block_on(store_hash(&client, &hash, adler)));
         }
       })?)
     }
     Output::Http(_) => Worker::Task(runtime.spawn(async move {
       let result = post_http(client.clone(), &worker_name, &config, receiver, hash.is_some()).await;
-      if let (Some(hash), Some(adler)) = (hash, log_result(&worker_name, result)) {
-        log_hash(&worker_name, &hash, store_hash(&client, &hash, adler).await);
+      if let (Some(hash), Some(adler)) = (hash, log_result(api, &worker_name, result)) {
+        log_hash(api, &worker_name, &hash, store_hash(&client, &hash, adler).await);
       }
     })),
   };
@@ -410,14 +425,15 @@ fn start_output(
 }
 
 /// Sends `chunk` to every output, dropping those that have failed (their
-/// worker logged why and dropped its receiver).
-fn send_to_outputs(outputs: &mut Vec<OutputWorker>, chunk: Chunk) {
+/// worker logged why and dropped its receiver). Returns whether this left
+/// none.
+fn send_to_outputs(outputs: &mut Vec<OutputWorker>, chunk: Chunk) -> bool {
   let before = outputs.len();
   outputs.retain(|output| output.sender.send(chunk.clone()).is_ok());
-  if outputs.is_empty() && before > 0 {
-    println!("STORAGE3: every output has failed, nothing more will be recorded");
-  }
+  outputs.is_empty() && before > 0
 }
+
+const ALL_FAILED: &str = "every output has failed, nothing more will be recorded";
 
 /// A metric's key: the index of its group (0 for the queue stats, 1 for
 /// events and log, 2 + i for source i) and what in the group it counts.
@@ -709,11 +725,11 @@ fn run_writer(recording: Recording) {
   let client = match http_client() {
     Ok(client) => client,
     Err(error) => {
-      println!("STORAGE3: {error}");
+      report(api, &error);
       return;
     }
   };
-  let rec = next_rec(&outputs[main], &start, |output, name| output_exists(output, name, &client, &runtime));
+  let rec = next_rec(&outputs[main], &start, |output, name| output_exists(api, output, name, &client, &runtime));
   let names: Vec<String> = outputs.iter().map(|output| recording_name(output.template(), rec, &start)).collect();
   // The Main output: a file's absolute path, or a URL.
   let current_file = match &outputs[main] {
@@ -759,18 +775,20 @@ fn run_writer(recording: Recording) {
   let config = Arc::new(config);
   let mut output_workers: Vec<OutputWorker> = Vec::new();
   for ((output, name), hash) in outputs.iter().zip(names).zip(hashes) {
-    println!("STORAGE3: recording to {name}");
+    report(api, &format!("recording to {name}"));
     let hash = hash.map(|target| HashTarget { name: recording_name(target.template(), rec, &start), target });
-    match start_output(output, name, hash, config.clone(), &client, &runtime) {
+    match start_output(api, output, name, hash, config.clone(), &client, &runtime) {
       Ok(worker) => output_workers.push(worker),
-      Err(error) => println!("STORAGE3: couldn't start an output thread: {error}"),
+      Err(error) => report(api, &format!("couldn't start an output thread: {error}")),
     }
   }
 
   let mut buffer = Vec::new();
   let time_ns = api.time().as_nanos() as u64;
   storage_record::frame(&mut buffer, &storage_record::metadata(&node_name, time_ns, &pairs));
-  send_to_outputs(&mut output_workers, Bytes::from(buffer));
+  if send_to_outputs(&mut output_workers, Bytes::from(buffer)) {
+    report(api, ALL_FAILED);
+  }
 
   let sweep = |records: Vec<(u64, Vec<u8>)>, output_workers: &mut Vec<OutputWorker>| {
     if records.is_empty() {
@@ -784,7 +802,9 @@ fn run_writer(recording: Recording) {
       storage_record::frame(&mut buffer, record);
     }
     let bytes = buffer.len() as u64;
-    send_to_outputs(output_workers, Bytes::from(buffer));
+    if send_to_outputs(output_workers, Bytes::from(buffer)) {
+      report(api, ALL_FAILED);
+    }
     let mut counters = shared.counters.lock().unwrap();
     counters.written_bytes += bytes;
     counters.sweeps += 1;
@@ -826,7 +846,7 @@ fn run_writer(recording: Recording) {
       Worker::Task(task) => runtime.block_on(task).is_err(),
     };
     if panicked {
-      println!("STORAGE3: output for {name} panicked");
+      report(api, &format!("output for {name} panicked"));
     }
   }
 }
@@ -949,7 +969,7 @@ fn stop(inner: &Rc<RefCell<Inner>>, join: bool) {
 
 fn fail_start(inner: &Rc<RefCell<Inner>>, message: &str) {
   let borrow = inner.borrow();
-  println!("STORAGE3: {message}");
+  report(borrow.api.thread_safe(), message);
   borrow.api.show_dialog("STORAGE3", message, DialogType::Error);
   // Not from inside the state callback that started it.
   let state = borrow.state.clone();
@@ -990,7 +1010,7 @@ fn start(inner: &Rc<RefCell<Inner>>) {
         fail_start(inner, &format!("The Main output is invalid: {error}"));
         return;
       }
-      Err(error) => println!("STORAGE3: skipping output: {error}"),
+      Err(error) => report(api.thread_safe(), &format!("skipping output: {error}")),
     }
   }
   let Some(main) = main else {
@@ -1178,7 +1198,7 @@ impl Node for Storage3Node {
     });
     match (events, log) {
       (Some(events), Some(log)) => message_connections.extend([events, log]),
-      _ => println!("STORAGE3: this Thalamus can't share events and log messages, so they won't be recorded"),
+      _ => report(api.thread_safe(), "this Thalamus can't share events and log messages, so they won't be recorded"),
     }
     inner.borrow_mut().message_connections = message_connections;
 

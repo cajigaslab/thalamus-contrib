@@ -118,6 +118,9 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
     `thalamus_version` and `thalamus_commit` (slots 150-152, any thread;
     the host sets a static `ThalamusCharSpan`) return what STORAGE2 records,
     or None on an older Thalamus.
+  - `ThalamusAPI`/`ThalamusAPIThreadSafe::log` (slot 153, any thread) sends
+    text to Thalamus's log (log view, `subscribe_log`, recordings); false
+    on an older Thalamus. STORAGE3's `report` prints and logs its messages.
   - `NodeData::blob()` reads the blob modality (`BlobData`) of host nodes. It
     is gated on API version 143, since every Thalamus with node_request has
     `ThalamusNode::blob`.
