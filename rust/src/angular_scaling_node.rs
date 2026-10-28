@@ -422,8 +422,8 @@ impl Node for AngularScalingNode {
 
     let change_ref = Rc::clone(&inner);
     let state_callback =
-      move |_source: State, _action: StateAction, key: StateValue, _value: StateValue| {
-        let StateValue::String(key_str) = key else {
+      move |_source: State, _action: StateAction, key: StateKey, _value: StateValue| {
+        let StateKey::String(key_str) = key else {
           return;
         };
         if key_str == "Source" {

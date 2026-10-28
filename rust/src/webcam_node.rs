@@ -8,7 +8,7 @@ use std::{
 
 use crate::api::{
   self, ImageData, Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken,
-  OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_IMAGE,
+  OffMainSignaler, OnDrop, Request, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE,
   ThalamusAPI, ThalamusAPIThreadSafe,
 };
 use crate::image_viewer::{ImageSink, ImageViewer};
@@ -371,8 +371,8 @@ impl WebcamNode {
 
   /// Borrows the node only in the arms that need it: opening the viewer
   /// writes view_geometry to the state, which calls back into this.
-  fn on_state(rc: &Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
-    let StateValue::String(key_str) = key else {
+  fn on_state(rc: &Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateKey, value: StateValue) {
+    let StateKey::String(key_str) = key else {
       return;
     };
     match key_str.as_str() {

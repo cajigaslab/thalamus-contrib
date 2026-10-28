@@ -194,8 +194,8 @@ impl Node for RtmpsNode {
 
     let change_ref = Rc::clone(&inner);
     let state_callback =
-      move |_source: State, _action: StateAction, key: StateValue, value: StateValue| {
-        let StateValue::String(key_str) = key else {
+      move |_source: State, _action: StateAction, key: StateKey, value: StateValue| {
+        let StateKey::String(key_str) = key else {
           return;
         };
         match key_str.as_str() {

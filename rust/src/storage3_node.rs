@@ -1204,7 +1204,7 @@ impl Node for Storage3Node {
 
     let weak = Rc::downgrade(&inner);
     let own_state = state.clone();
-    let state_connection = state.connect(move |source: State, _action: StateAction, key: StateValue, value: StateValue| {
+    let state_connection = state.connect(move |source: State, _action: StateAction, key: StateKey, value: StateValue| {
       let Some(inner) = weak.upgrade() else {
         return;
       };
@@ -1219,13 +1219,13 @@ impl Node for Storage3Node {
           return;
         }
         let made_main = source != outputs
-          && matches!(&key, StateValue::String(key) if key == "Main")
+          && matches!(&key, StateKey::String(key) if key == "Main")
           && matches!(value, StateValue::Bool(true));
         // Its sets re-enter this callback, which normalizes again; that
         // converges, since each pass only sets rows that differ.
         normalize_main(&own_state, made_main.then_some(&source));
       }
-      if !matches!(&key, StateValue::String(key) if key == "Running") {
+      if !matches!(&key, StateKey::String(key) if key == "Running") {
         return;
       }
       if matches!(value, StateValue::Bool(true)) {

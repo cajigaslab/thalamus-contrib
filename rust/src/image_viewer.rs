@@ -1323,7 +1323,7 @@ impl ImageViewer {
     let pending = new_title.clone();
     let node_state = state.clone();
     let name_connection = state.connect(move |source, _action, key, value| {
-      if source == node_state && key == StateValue::String("name".to_string()) {
+      if source == node_state && key == StateKey::String("name".to_string()) {
         if let StateValue::String(name) = value {
           *pending.borrow_mut() = Some(name);
         }

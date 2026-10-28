@@ -2627,7 +2627,7 @@ fn wrap_state_key(api: ThalamusAPI, arg: *mut ThalamusState) -> StateKey {
   }
 }
 
-unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateValue, StateValue)>(
+unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateKey, StateValue)>(
   source_raw: *mut ThalamusState,
   action: ThalamusStateAction,
   key_raw: *mut ThalamusState,
@@ -2641,7 +2641,7 @@ unsafe extern "C" fn state_on_change<T: FnMut(State, StateAction, StateValue, St
     StateAction::Delete
   };
 
-  let key = wrap_state(args.api, key_raw);
+  let key = wrap_state_key(args.api, key_raw);
   let value = wrap_state(args.api, value_raw);
   let source = State::new(args.api, source_raw);
 
@@ -2782,7 +2782,7 @@ impl ErrorCode {
   }
 }
 
-struct StateConnectionCallbackArgs<T: FnMut(State, StateAction, StateValue, StateValue)> {
+struct StateConnectionCallbackArgs<T: FnMut(State, StateAction, StateKey, StateValue)> {
   pub callback: T,
   pub api: ThalamusAPI,
 }
@@ -3192,7 +3192,7 @@ impl State {
     }
   }
 
-  pub fn recap_with<T: FnMut(State, StateAction, StateValue, StateValue)>(&self, callback: T) {
+  pub fn recap_with<T: FnMut(State, StateAction, StateKey, StateValue)>(&self, callback: T) {
     let callback_args = Box::new(StateConnectionCallbackArgs {
       callback,
       api: self.api,
@@ -3212,7 +3212,7 @@ impl State {
     }
   }
 
-  pub fn connect<'a, T: FnMut(State, StateAction, StateValue, StateValue) + 'static>(
+  pub fn connect<'a, T: FnMut(State, StateAction, StateKey, StateValue) + 'static>(
     &self,
     callback: T,
   ) -> OnDrop {

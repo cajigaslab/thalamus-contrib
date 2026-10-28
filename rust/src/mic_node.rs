@@ -9,7 +9,7 @@ use std::{
 
 use crate::api::{
   self, AnalogData, Json, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken,
-  OffMainSignaler, OnDrop, Request, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG,
+  OffMainSignaler, OnDrop, Request, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_ANALOG,
   ThalamusAPI,
 };
 
@@ -504,8 +504,8 @@ impl MicNode {
     });
   }
 
-  fn on_state(&mut self, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
-    let StateValue::String(key_str) = key else {
+  fn on_state(&mut self, _source: State, _action: StateAction, key: StateKey, value: StateValue) {
+    let StateKey::String(key_str) = key else {
       return;
     };
     if key_str == "Running" {

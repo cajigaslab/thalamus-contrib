@@ -9,7 +9,7 @@ use tokio::sync::Notify;
 
 use crate::api::{
   AnalogData, AnalogEncoding, AnalogFormat, ImageData, ImageFormat,
-  MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OffMainSignaler, OnDrop, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
+  MainThreadToken, Node, NodeConsts, NodeData, NodeSelector, NodeToken, OffMainSignaler, OnDrop, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_ANALOG, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
 use crate::audio_converter::{AudioConverterParams, AudioFormat};
@@ -233,8 +233,8 @@ impl NodeConsts for MediaConverterNode {
 }
 
 impl MediaConverterNode {
-  fn on_state(rc: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
-    let StateValue::String(key_str) = key else {
+  fn on_state(rc: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateKey, value: StateValue) {
+    let StateKey::String(key_str) = key else {
       return;
     };
 

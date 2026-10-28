@@ -1,6 +1,6 @@
 use crate::api::{
   self, AnalogData, MainThreadOnly, MainThreadToken, Node, NodeConsts, NodeData, NodeToken,
-  OnDrop, OnDropSend, State, StateAction, StateValue, THALAMUS_MODALITY_ANALOG,
+  OnDrop, OnDropSend, State, StateAction, StateKey, StateValue, THALAMUS_MODALITY_ANALOG,
   ThalamusAPI,
 };
 use crate::block as blk;
@@ -698,10 +698,10 @@ impl SleeveNodeInner {
     me: Arc<Mutex<SleeveNodeInner>>,
     _source: State,
     _action: StateAction,
-    key: StateValue,
+    key: StateKey,
     value: StateValue,
   ) {
-    let StateValue::String(key_str) = key else {
+    let StateKey::String(key_str) = key else {
       return;
     };
     match key_str.as_str() {
@@ -756,7 +756,7 @@ impl Node for SleeveNode {
     let inner = Arc::new_cyclic(|weak: &std::sync::Weak<Mutex<SleeveNodeInner>>| {
       let weak2 = weak.clone();
       let state_callback =
-        move |source: State, action: StateAction, key: StateValue, value: StateValue| {
+        move |source: State, action: StateAction, key: StateKey, value: StateValue| {
           if let Some(strong) = weak2.upgrade() {
             SleeveNodeInner::on_state(strong, source, action, key, value);
           }
@@ -782,7 +782,7 @@ impl Node for SleeveNode {
     });
 
     state.recap_with(
-      |source: State, action: StateAction, key: StateValue, value: StateValue| {
+      |source: State, action: StateAction, key: StateKey, value: StateValue| {
         SleeveNodeInner::on_state(inner.clone(), source, action, key, value);
       },
     );

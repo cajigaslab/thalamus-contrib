@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::api::{
   AnalogData, DialogType, ImageData, ImageFormat, Json, MainThreadOnly, MainThreadToken, MocapData, Node,
   NodeConsts, NodeData, NodeToken, OffMainSignaler, OnDrop, Request, State,
-  StateAction, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
+  StateAction, StateKey, StateValue, THALAMUS_MODALITY_IMAGE, ThalamusAPI,
   ThalamusAPIThreadSafe,
 };
 use crate::image_viewer::{ImageSink, ImageViewer};
@@ -857,8 +857,8 @@ impl ThorcamNode {
     }
   }
 
-  fn on_state(rc_this: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateValue, value: StateValue) {
-    let StateValue::String(key_str) = key else {
+  fn on_state(rc_this: Rc<RefCell<Self>>, _source: State, _action: StateAction, key: StateKey, value: StateValue) {
+    let StateKey::String(key_str) = key else {
       return;
     };
 
