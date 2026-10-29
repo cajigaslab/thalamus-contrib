@@ -275,28 +275,23 @@ async fn serve(
   result
 }
 
-struct GarminNodeInner {
+pub struct GarminNode {
   api: ThalamusAPI,
   main_thread_token: MainThreadToken,
   state: State,
   _state_connection: Option<OnDrop>,
   signaler: Arc<OffMainSignaler>,
-  name: String,
+  ble_name: String,
   // The last run's task. It may still be shutting down after stop(); the
   // next run waits for it so two peripherals never serve the same service.
   task: Option<JoinHandle<()>>,
   cancel_token: Option<CancellationToken>,
 }
 
-pub struct GarminNode {
-  // Keeps the node's state alive; the callbacks hold weak references.
-  _inner: Rc<RefCell<GarminNodeInner>>,
-}
-
 // Cancels the current run and blocks the signaler, then calls on_stopped on
 // the main thread once no ready() is in progress. The run's task may still be
 // releasing the adapter; start() waits for it.
-fn stop<F: FnOnce() + 'static>(inner: &Rc<RefCell<GarminNodeInner>>, on_stopped: F) {
+fn stop<F: FnOnce() + 'static>(inner: &Rc<RefCell<GarminNode>>, on_stopped: F) {
   let borrow = inner.borrow();
   if let Some(cancel) = &borrow.cancel_token {
     cancel.cancel();
@@ -304,11 +299,11 @@ fn stop<F: FnOnce() + 'static>(inner: &Rc<RefCell<GarminNodeInner>>, on_stopped:
   borrow.signaler.block_then(borrow.main_thread_token, on_stopped);
 }
 
-fn start(inner: &Rc<RefCell<GarminNodeInner>>) {
+fn start(inner: &Rc<RefCell<GarminNode>>) {
   let mut borrow = inner.borrow_mut();
   let api = borrow.api.thread_safe();
   let signaler = borrow.signaler.clone();
-  let name = borrow.name.clone();
+  let ble_name = borrow.ble_name.clone();
   let previous = borrow.task.take();
   let wrapped_state = MainThreadOnly::new(borrow.state.clone(), borrow.api, borrow.main_thread_token);
   let cancel_token = CancellationToken::new();
@@ -321,7 +316,7 @@ fn start(inner: &Rc<RefCell<GarminNodeInner>>) {
     if let Some(previous) = previous {
       let _ = previous.await;
     }
-    if let Err(e) = serve(api, &signaler, &name, &cancel_token).await {
+    if let Err(e) = serve(api, &signaler, &ble_name, &cancel_token).await {
       report(&api, &e);
     }
     if !cancel_token.is_cancelled() {
@@ -333,7 +328,7 @@ fn start(inner: &Rc<RefCell<GarminNodeInner>>) {
   }));
 }
 
-fn on_state(inner: &Rc<RefCell<GarminNodeInner>>, key: StateKey, value: StateValue) {
+fn on_state(inner: &Rc<RefCell<GarminNode>>, key: StateKey, value: StateValue) {
   let StateKey::String(key_str) = key else {
     return;
   };
@@ -352,9 +347,9 @@ fn on_state(inner: &Rc<RefCell<GarminNodeInner>>, key: StateKey, value: StateVal
         }
       });
     }
-    "Name" => {
-      if let StateValue::String(name) = value {
-        inner.borrow_mut().name = name;
+    "BLE Name" => {
+      if let StateValue::String(ble_name) = value {
+        inner.borrow_mut().ble_name = ble_name;
       }
     }
     _ => {}
@@ -372,20 +367,20 @@ impl Node for GarminNode {
     node_token: NodeToken,
     state: State,
     main_thread_token: MainThreadToken,
-  ) -> Self {
-    let inner = Rc::new(RefCell::new(GarminNodeInner {
+  ) -> Rc<RefCell<Self>> {
+    let inner = Rc::new(RefCell::new(GarminNode {
       api,
       main_thread_token,
       state: state.clone(),
       _state_connection: None,
       // Created blocked; start() unblocks it.
       signaler: OffMainSignaler::new(api, node_token.clone()),
-      name: "Thalamus".to_string(),
+      ble_name: "Thalamus".to_string(),
       task: None,
       cancel_token: None,
     }));
 
-    let callback_ref: Weak<RefCell<GarminNodeInner>> = Rc::downgrade(&inner);
+    let callback_ref: Weak<RefCell<GarminNode>> = Rc::downgrade(&inner);
     let connection = state.connect(
       move |source: State, _action: StateAction, key: StateKey, value: StateValue| {
         if let Some(inner) = callback_ref.upgrade() {
@@ -413,7 +408,7 @@ impl Node for GarminNode {
 
     state.recap();
 
-    GarminNode { _inner: inner }
+    inner
   }
 }
 

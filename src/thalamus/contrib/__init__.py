@@ -90,7 +90,7 @@ def widgets():
     ]),
     'GARMIN': Factory(None, [
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
-      UserData(UserDataType.DEFAULT, 'Name', 'Thalamus', []),
+      UserData(UserDataType.DEFAULT, 'BLE Name', 'Thalamus', []),
     ]),
   }
 
