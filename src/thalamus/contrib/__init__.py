@@ -88,6 +88,10 @@ def widgets():
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.DEFAULT, 'Address', '', []),
     ]),
+    'GARMIN': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.DEFAULT, 'Name', 'Thalamus', []),
+    ]),
   }
 
 def library():

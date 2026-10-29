@@ -164,7 +164,10 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 - Node objects live on the main thread (`MainThreadToken`, `MainThreadOnly`).
   Data produced on other threads goes out through an `OffMainSignaler`
   (`ready`), whose `predrop`/`block` must be called before the node goes
-  away.
+  away. `block_then(token, callback)` blocks and posts `callback` to the
+  main thread once every `ready` already in progress has returned; `predrop`
+  does the same wait but calls `PredropToken::ready` from a threadpool
+  thread.
 - Work that must happen before a node is destroyed goes in a handler
   installed with `NodeToken::set_predrop` in `new()`, which must eventually
   call `PredropToken::ready` (e.g. `OffMainSignaler::predrop(token)` or once a
@@ -217,6 +220,18 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   output and common rates within 10 ns) and sample counts to durations with
   `samples_to_duration` (integer math); never add a rounded interval once per
   sample.
+
+## GARMIN
+
+- `garmin_node.rs` receives data from the Connect IQ app in `garmin/`.
+  Connect IQ apps are BLE centrals only, and btleplug (SLEEVE) is central
+  only, so this node is a peripheral built on ble-peripheral-rust (BlueZ via
+  bluer, WinRT `GattServiceProvider`, CoreBluetooth). Windows ignores the
+  advertised name, so the watch finds the node by service UUID.
+- The UUIDs and packet format must match between `garmin_node.rs` and
+  `garmin/source/ThalamusProfile.mc`/`BleLink.mc`. Packets are at most 20
+  bytes (default MTU) and the watch has one write in flight at a time, so
+  keep the format compact.
 
 ## Image and audio conversion
 
