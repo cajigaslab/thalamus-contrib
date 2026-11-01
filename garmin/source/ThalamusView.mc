@@ -19,7 +19,7 @@ class ThalamusView extends WatchUi.View {
         var heartRate = _sensors.heartRate;
         var lines = [
             "Thalamus",
-            _link.status,
+            _sensors.error != null ? _sensors.error : _link.status,
             "HR " + (heartRate != null ? heartRate.toString() : "--"),
             "Sent " + _link.sent,
             "Dropped " + (_link.dropped + _link.failed)

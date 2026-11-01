@@ -15,6 +15,7 @@ mod build_info;
 mod bluetooth;
 mod ffi;
 mod ffmpeg_devices;
+mod file_node;
 mod frame_pool;
 mod garmin_node;
 mod image_converter;
@@ -28,6 +29,7 @@ mod node_copy;
 mod openh264;
 mod rtmps_node;
 mod rtmps_publisher;
+mod serial_config;
 mod sleeve_node;
 mod storage3_node;
 mod storage_record;
@@ -36,6 +38,7 @@ mod wakers;
 mod webcam_node;
 
 use angular_scaling_node::AngularScalingNode;
+use file_node::FileNode;
 use garmin_node::GarminNode;
 use media_converter_node::MediaConverterNode;
 use mic_node::MicNode;
@@ -54,5 +57,6 @@ export_nodes!(
   ("MEDIA_CONVERTER", MediaConverterNode),
   ("MIC", MicNode),
   ("STORAGE3", Storage3Node),
-  ("GARMIN", GarminNode)
+  ("GARMIN", GarminNode),
+  ("FILE", FileNode)
 );

@@ -32,6 +32,11 @@ adler2 = "2"
 bytes = "1"
 prost = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# No default features: they only add libudev for enumerating ports.
+serialport = { version = "4", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [build-dependencies]
 bindgen = "0.72"

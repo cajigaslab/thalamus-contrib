@@ -1,6 +1,7 @@
 # Thalamus Garmin app
 
-A Connect IQ watch app that streams heart rate and 25 Hz accelerometer data to
+A Connect IQ watch app that streams heart rate and 25 Hz
+accelerometer, gyroscope and magnetometer data to
 Thalamus's `GARMIN` node (`rust/src/garmin_node.rs`) over Bluetooth LE.
 
 Connect IQ apps can only be BLE centrals, so the PC running Thalamus is the
@@ -30,5 +31,9 @@ to `manifest.xml` as needed.
 2. Open the Thalamus app on the watch. It shows `Scanning`, then `Connected`.
    Data only flows while the app is open.
 
-The node outputs `HR` (bpm, 1 s interval) and `ACC_X`, `ACC_Y`, `ACC_Z` (g,
-40 ms interval), timestamped on arrival.
+The node outputs `HR` (bpm, 1 s interval),
+`ACC_X`, `ACC_Y`, `ACC_Z` (g), `GYR_X`, `GYR_Y`, `GYR_Z` (deg/s) and `MAG_X`,
+`MAG_Y`, `MAG_Z` (milli-gauss, all at 40 ms intervals), timestamped on arrival.
+
+To use a PC without a suitable adapter, the sketch in `arduino/` takes the
+PC's place and forwards the packets over serial: set the node's `Serial Port`.

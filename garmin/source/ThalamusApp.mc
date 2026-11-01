@@ -2,8 +2,8 @@ import Toybox.Application;
 import Toybox.Lang;
 import Toybox.WatchUi;
 
-// Streams heart rate and accelerometer data to Thalamus's GARMIN node over
-// BLE while the app is open.
+// Streams motion and heart rate data to Thalamus's GARMIN node over BLE while
+// the app is open.
 class ThalamusApp extends Application.AppBase {
     private var _link as BleLink;
     private var _sensors as SensorSource;

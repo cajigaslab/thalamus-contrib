@@ -8,15 +8,20 @@ import Toybox.WatchUi;
 //
 // Packets are at most 20 bytes (the ATT payload at the default MTU), little
 // endian:
-//   byte 0: type (1 = heart rate, 2 = accelerometer)
+//   byte 0: type (1 = heart rate, 2 = accelerometer, 3 = gyroscope,
+//           4 = magnetometer)
 //   byte 1: sequence number, incremented per packet of any type, wrapping
 //   heart rate:    byte 2 = bpm (0 = no reading)
 //   accelerometer: 1 to 3 samples of int16 x, y, z in milli-g
+//   gyroscope:     1 to 3 samples of int16 x, y, z in 0.1 deg/s
+//   magnetometer:  1 to 3 samples of int16 x, y, z in milli-gauss
 class BleLink extends BluetoothLowEnergy.BleDelegate {
     const PACKET_HEART_RATE = 1;
-    const PACKET_ACCEL = 2;
-    const MAX_ACCEL_SAMPLES = 3;
-    // About 5 s of data. Older packets are dropped when it fills up, which
+    static const PACKET_ACCEL = 2;
+    static const PACKET_GYRO = 3;
+    static const PACKET_MAG = 4;
+    const MAX_VECTOR_SAMPLES = 3;
+    // About 2 s of data. Older packets are dropped when it fills up, which
     // the node sees as a gap in sequence numbers.
     const MAX_QUEUE = 50;
 
@@ -118,17 +123,17 @@ class BleLink extends BluetoothLowEnergy.BleDelegate {
         enqueue(packet);
     }
 
-    // Sends x, y and z (milli-g, equal lengths) in packets of up to
-    // MAX_ACCEL_SAMPLES samples.
-    function sendAccel(x as Array<Number>, y as Array<Number>, z as Array<Number>) as Void {
+    // Sends x, y and z (equal lengths) in packets of up to MAX_VECTOR_SAMPLES
+    // samples.
+    function sendVectors(type as Number, x as Array<Number>, y as Array<Number>, z as Array<Number>) as Void {
         var total = x.size();
-        for (var first = 0; first < total; first += MAX_ACCEL_SAMPLES) {
+        for (var first = 0; first < total; first += MAX_VECTOR_SAMPLES) {
             var count = total - first;
-            if (count > MAX_ACCEL_SAMPLES) {
-                count = MAX_ACCEL_SAMPLES;
+            if (count > MAX_VECTOR_SAMPLES) {
+                count = MAX_VECTOR_SAMPLES;
             }
             var packet = new [2 + 6 * count]b;
-            packet[0] = PACKET_ACCEL;
+            packet[0] = type;
             packet[1] = nextSeq();
             for (var i = 0; i < count; i++) {
                 var offset = 2 + 6 * i;
@@ -146,10 +151,10 @@ class BleLink extends BluetoothLowEnergy.BleDelegate {
     }
 
     private function advertisesService(result as BluetoothLowEnergy.ScanResult) as Boolean {
-        var wanted = ThalamusProfile.serviceUuid();
+        var wanted = ThalamusProfile.serviceUuid().toString();
         var uuids = result.getServiceUuids();
         for (var uuid = uuids.next(); uuid != null; uuid = uuids.next()) {
-            if (wanted.equals(uuid)) {
+            if (wanted.equals(uuid.toString())) {
                 return true;
             }
         }
