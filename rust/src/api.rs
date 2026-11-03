@@ -1007,13 +1007,31 @@ impl OffMainSignaler {
     unsafe { ((*self.api.raw).node_offmain_signaler_unblock.unwrap())(self.signaler) }
   }
 
-  pub fn predrop(&self, predrop_token: PredropToken) {
+  /// Blocks the signaler, then calls `callback` on a threadpool thread once
+  /// every ready() already in progress on other threads has returned. Waiting
+  /// for the token lock that ready() holds is the barrier; it happens off the
+  /// main thread so the main thread never stalls on a signaling thread.
+  fn block_then_offmain<F: FnOnce() + Send + 'static>(&self, callback: F) {
     self.block();
     let node_token = self.token.clone();
     self.api.post_to_threadpool(move || {
       let _ = node_token.with(|_n| ());
-      predrop_token.ready();
+      callback();
     });
+  }
+
+  /// Blocks the signaler, then posts `callback` to the main thread once every
+  /// ready() already in progress on other threads has returned.
+  pub fn block_then<F: FnOnce() + 'static>(&self, token: MainThreadToken, callback: F) {
+    let api = self.api.thread_safe();
+    let callback = MainThreadOnly::new(callback, self.api, token);
+    self.block_then_offmain(move || {
+      api.post_to_main(move |token| callback.take(token)());
+    });
+  }
+
+  pub fn predrop(&self, predrop_token: PredropToken) {
+    self.block_then_offmain(move || predrop_token.ready());
   }
 }
 unsafe impl Send for OffMainSignaler {}

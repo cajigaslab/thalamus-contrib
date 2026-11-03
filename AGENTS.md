@@ -164,7 +164,10 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 - Node objects live on the main thread (`MainThreadToken`, `MainThreadOnly`).
   Data produced on other threads goes out through an `OffMainSignaler`
   (`ready`), whose `predrop`/`block` must be called before the node goes
-  away.
+  away. `block_then(token, callback)` blocks and posts `callback` to the
+  main thread once every `ready` already in progress has returned; `predrop`
+  does the same wait but calls `PredropToken::ready` from a threadpool
+  thread.
 - Work that must happen before a node is destroyed goes in a handler
   installed with `NodeToken::set_predrop` in `new()`, which must eventually
   call `PredropToken::ready` (e.g. `OffMainSignaler::predrop(token)` or once a
@@ -190,6 +193,8 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
 
 ## Analog data
 
+- A channel without a consistent sample interval reports a sample interval
+  of zero.
 - `AnalogData` sample types: `data` (f64), `short_data` (i16), `int_data`
   (i32), `ulong_data` (u64), selected by the `is_*` functions, or per channel
   with `analog_format(channel)`. `AnalogFormat::Encoded` channels carry no
@@ -217,6 +222,51 @@ its `devel` branch, releases on `main`). CLAUDE.md has the short version.
   output and common rates within 10 ns) and sample counts to durations with
   `samples_to_duration` (integer math); never add a rounded interval once per
   sample.
+
+## GARMIN
+
+- `garmin_node.rs` receives data from the Connect IQ app in `garmin/`.
+  Connect IQ apps are BLE centrals only, and btleplug (SLEEVE) is central
+  only, so this node is a peripheral built on ble-peripheral-rust (BlueZ via
+  bluer, WinRT `GattServiceProvider`, CoreBluetooth). Windows ignores the
+  advertised name, so the watch finds the node by service UUID.
+- The UUIDs and packet format must match between `garmin_node.rs` and
+  `garmin/source/ThalamusProfile.mc`/`BleLink.mc`. Packets are at most 20
+  bytes (default MTU) and the watch has one write in flight at a time, so
+  keep the format compact. Nine axes at 25 Hz is about 26 packets a second;
+  the sketch asks for a 15 to 30 ms connection interval to fit that, which
+  the watch can refuse (it picked 250 ms on its own).
+- `arduino/thalamus_bridge` is the same peripheral on a board: it forwards the
+  watch's packets over serial, and the node reads them when `Serial Port` is
+  set (empty means Bluetooth). The sketch doesn't parse packets; only the
+  UUIDs in its `garmin.h` must match. Each packet is framed by `serial_frame.h`
+  (length, packet, 0xa5), which `Deframer` reads and which has no Arduino
+  dependencies: the `#[ignore]`d `decodes_bridge_frames` test reads frames
+  written to `BRIDGE_FRAMES`. Serial carries only frames, so the sketch sends
+  status messages as packets of type 0x7f, which the node logs.
+
+## FILE
+
+- `file_node.rs` publishes framed StorageRecords (`storage_record.rs`) from a
+  regular file, character device or serial port. Zero `time` publishes at
+  once; other records are paced from the first non-zero `time`
+  (`Pacer`). The published time is `api.time()`; the recorded time becomes
+  `remote_time` unless the body has its own.
+- A reader thread feeds a bounded channel, and the node's tokio task paces and
+  publishes. It's a plain thread since a character device read can't be
+  interrupted: the task only waits `READER_EXIT_TIMEOUT` for it.
+- `is_serial_port` picks serial handling: `COMn` on Windows, a terminal on
+  Unix. The serial settings and `File` are read at start, so changes apply
+  the next time the node runs. It uses the `serialport` crate since the
+  host's `SerialPort` only sets the baud rate.
+- Size prefixed records have no sync marker, so a serial source assumes the
+  sender writes each record in one go and pauses between records. The line
+  going idle for `SERIAL_TIMEOUT` inside a record (a size read from the wrong
+  offset can look valid), a bad size or an undecodable record lose that
+  record, and reading restarts once the line is idle. A file fails instead.
+- Analog, image, mocap and text records are published, whichever node they
+  came from. Other bodies are skipped (reported once per kind): plugin nodes
+  have no blob modality, and events and metadata aren't node data.
 
 ## Image and audio conversion
 

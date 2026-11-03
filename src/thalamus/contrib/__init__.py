@@ -88,6 +88,31 @@ def widgets():
       UserData(UserDataType.CHECK_BOX, 'Running', False, []),
       UserData(UserDataType.DEFAULT, 'Address', '', []),
     ]),
+    'GARMIN': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      UserData(UserDataType.DEFAULT, 'BLE Name', 'Thalamus', []),
+      # A port with arduino/thalamus_bridge on it, or empty to use Bluetooth
+      UserData(UserDataType.OPEN_FILE, 'Serial Port', '', []),
+      # The rest only apply to serial ports
+      UserData(UserDataType.SPINBOX, 'Baud Rate', 115200, []),
+      UserData(UserDataType.COMBO_BOX, 'Data Bits', '8', ['5', '6', '7', '8']),
+      UserData(UserDataType.COMBO_BOX, 'Parity', 'None', ['None', 'Odd', 'Even']),
+      UserData(UserDataType.COMBO_BOX, 'Stop Bits', '1', ['1', '2']),
+      UserData(UserDataType.COMBO_BOX, 'Flow Control', 'None', ['None', 'Software', 'Hardware']),
+      UserData(UserDataType.CHECK_BOX, 'DTR', True, []),
+    ]),
+    'FILE': Factory(None, [
+      UserData(UserDataType.CHECK_BOX, 'Running', False, []),
+      # A file, character device or serial port (COM3, /dev/ttyACM0)
+      UserData(UserDataType.OPEN_FILE, 'File', '', []),
+      # The rest only apply to serial ports
+      UserData(UserDataType.SPINBOX, 'Baud Rate', 115200, []),
+      UserData(UserDataType.COMBO_BOX, 'Data Bits', '8', ['5', '6', '7', '8']),
+      UserData(UserDataType.COMBO_BOX, 'Parity', 'None', ['None', 'Odd', 'Even']),
+      UserData(UserDataType.COMBO_BOX, 'Stop Bits', '1', ['1', '2']),
+      UserData(UserDataType.COMBO_BOX, 'Flow Control', 'None', ['None', 'Software', 'Hardware']),
+      UserData(UserDataType.CHECK_BOX, 'DTR', True, []),
+    ]),
   }
 
 def library():
